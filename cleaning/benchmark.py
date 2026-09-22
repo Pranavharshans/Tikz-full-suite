@@ -371,6 +371,7 @@ def worker(args):
 
 def run_config(args, cfg, manifest):
     fingerprint = digest(dict(config=cfg, manifest=manifest, context=args.context,
+                              nccl_p2p=args.nccl_p2p,
                               request_timeout=args.request_timeout, config_timeout=args.config_timeout,
                               script=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
                               vllm=args.vllm_sif, sglang=args.sglang_sif))
@@ -400,6 +401,7 @@ def run_config(args, cfg, manifest):
             folder.mkdir(exist_ok=True)
             concurrency = cfg["concurrency"]//cfg["replicas"] + (index < cfg["concurrency"]%cfg["replicas"])
             spec = dict(config=cfg, manifest=manifest, rows=shard, output=str(folder),
+                        nccl_p2p=args.nccl_p2p,
                         concurrency=concurrency, context=args.context, port=19000+index,
                         startup_timeout=args.startup_timeout, request_timeout=args.request_timeout)
             dump(folder / "job.json", spec)
@@ -467,6 +469,8 @@ def main():
     parser.add_argument("--prepare-python", default="python3",
                         help="Python inside vLLM container for initial preparation (e.g. preparation-env/bin/python)")
     parser.add_argument("--candidates", type=int, default=1000)
+    parser.add_argument("--nccl-p2p", choices=("disabled", "auto"), default="disabled",
+                        help="Disable NCCL P2P for the tested Alex A40 workaround; auto restores NCCL selection")
     parser.add_argument("--context", type=int, default=32768)
     parser.add_argument("--startup-timeout", type=int, default=1800)
     parser.add_argument("--request-timeout", type=int, default=1800)
@@ -487,6 +491,7 @@ def main():
         reuse = shlex.join(["python3", script, "--prepare", "--work", work])
         run = shlex.join(["python3", script, "--run", "--work", work,
                           "--vllm-sif", vllm, "--sglang-sif", sglang,
+                          "--nccl-p2p", args.nccl_p2p,
                           "--context", str(args.context), "--startup-timeout", str(args.startup_timeout),
                           "--request-timeout", str(args.request_timeout), "--config-timeout", str(args.config_timeout)])
         print("#!/bin/bash -l\n#SBATCH --job-name=tikz-bench\n#SBATCH --partition=a40\n"
@@ -512,6 +517,11 @@ def main():
         return
     if not os.environ.get("SLURM_JOB_ID") or len(os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")) != 4:
         raise SystemExit("Run only inside a Slurm allocation exposing exactly four GPUs")
+    # Explicit container override is necessary even when the host variable is set.
+    p2p_disable = "1" if args.nccl_p2p == "disabled" else "0"
+    os.environ["NCCL_P2P_DISABLE"] = p2p_disable
+    os.environ["APPTAINERENV_NCCL_P2P_DISABLE"] = p2p_disable
+    print(f"NCCL_P2P_DISABLE={p2p_disable} (mode={args.nccl_p2p})", flush=True)
     for attr in ("vllm_sif", "sglang_sif"):
         path = Path(getattr(args, attr)).resolve()
         if not path.is_file():

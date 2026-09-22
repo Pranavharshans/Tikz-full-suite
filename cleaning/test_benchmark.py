@@ -6,6 +6,8 @@ import tempfile
 import argparse
 import builtins
 import unittest
+import subprocess
+import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
 
@@ -15,6 +17,15 @@ spec.loader.exec_module(b)
 
 
 class Tests(unittest.TestCase):
+    def test_slurm_p2p_workaround(self):
+        command = [sys.executable, str(Path(b.__file__)), "--slurm-script",
+                   "--vllm-sif", "/tmp/vllm.sif", "--sglang-sif", "/tmp/sglang.sif"]
+        for extra, expected in [([], "disabled"), (["--nccl-p2p", "auto"], "auto")]:
+            script = subprocess.check_output(command + extra, text=True)
+            self.assertIn(f"--nccl-p2p {expected}", script)
+            self.assertIn("python3", script)
+            subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
     def test_resume_without_dataset_dependencies(self):
         original_import = builtins.__import__
         def guarded(name, *args, **kwargs):
