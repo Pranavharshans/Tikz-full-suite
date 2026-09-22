@@ -1,3 +1,3 @@
 # Cleaning
 
-cleaning dataset preaprion for trianing
+Cleaning dataset preparation for training

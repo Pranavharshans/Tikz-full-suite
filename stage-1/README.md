@@ -1,3 +1,3 @@
 # Stage 1
 
-sft trining over cleaned data
+SFT training over cleaned data
