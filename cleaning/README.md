@@ -97,3 +97,9 @@ python3 cleaning/benchmark.py --plan
 
 GPU/container execution must still be validated on Alex. Local tests cover the
 matrix, winner selection, streamed reasoning separation and truncation detection.
+
+Resuming an existing `dataset.json` uses only host Python's standard library to
+validate image hashes; it does not require `datasets` or reinstall dependencies.
+For first-time preparation in a separate container virtual environment, pass
+`--prepare-python /absolute/path/preparation-env/bin/python` when generating the
+Slurm script. The generator binds that environment into the container.

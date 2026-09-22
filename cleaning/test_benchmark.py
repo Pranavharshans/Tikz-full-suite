@@ -2,6 +2,9 @@ import importlib.util
 import json
 from pathlib import Path
 import threading
+import tempfile
+import argparse
+import builtins
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import patch
@@ -12,6 +15,23 @@ spec.loader.exec_module(b)
 
 
 class Tests(unittest.TestCase):
+    def test_resume_without_dataset_dependencies(self):
+        original_import = builtins.__import__
+        def guarded(name, *args, **kwargs):
+            if name in ("datasets", "huggingface_hub"):
+                raise ModuleNotFoundError(name)
+            return original_import(name, *args, **kwargs)
+        with tempfile.TemporaryDirectory() as directory:
+            image = Path(directory) / "image.png"
+            image.write_bytes(b"fixture")
+            rows = [dict(image=str(image), image_sha256=b.hashlib.sha256(b"fixture").hexdigest()) for _ in range(100)]
+            b.dump(Path(directory) / "dataset.json", dict(rows=rows))
+            with patch("builtins.__import__", side_effect=guarded):
+                b.prepare(argparse.Namespace(work=directory))
+            image.write_bytes(b"changed")
+            with self.assertRaisesRegex(ValueError, "Image hash mismatch"):
+                b.prepare(argparse.Namespace(work=directory))
+
     def test_matrix_constraints(self):
         counts = {"engines":9, "mtp":32, "topology":14, "scheduling":12}
         for phase, count in counts.items():

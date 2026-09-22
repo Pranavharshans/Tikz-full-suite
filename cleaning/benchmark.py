@@ -76,8 +76,6 @@ def best(results, require_mtp=False):
 
 
 def prepare(args):
-    from datasets import load_dataset, Image
-    from huggingface_hub import HfApi, snapshot_download
     root = Path(args.work).resolve()
     manifest = root / "dataset.json"
     if manifest.exists():
@@ -87,7 +85,10 @@ def prepare(args):
         for row in data["rows"]:
             if hashlib.sha256(Path(row["image"]).read_bytes()).hexdigest() != row["image_sha256"]:
                 raise ValueError("Image hash mismatch")
+        print(f"Reusing prepared dataset: {manifest}", flush=True)
         return
+    from datasets import load_dataset, Image
+    from huggingface_hub import HfApi, snapshot_download
     root.mkdir(parents=True, exist_ok=True)
     api = HfApi()
     revision = api.dataset_info(DATASET).sha
@@ -463,6 +464,8 @@ def main():
     parser.add_argument("--worker", help=argparse.SUPPRESS)
     parser.add_argument("--vllm-sif", default="")
     parser.add_argument("--sglang-sif", default="")
+    parser.add_argument("--prepare-python", default="python3",
+                        help="Python inside vLLM container for initial preparation (e.g. preparation-env/bin/python)")
     parser.add_argument("--candidates", type=int, default=1000)
     parser.add_argument("--context", type=int, default=32768)
     parser.add_argument("--startup-timeout", type=int, default=1800)
@@ -476,9 +479,12 @@ def main():
         work = str(Path(args.work).resolve())
         vllm = str(Path(args.vllm_sif).resolve())
         sglang = str(Path(args.sglang_sif).resolve())
-        prep = shlex.join(["apptainer", "exec", "--bind", work, "--bind", str(Path(script).parent),
-                           vllm, "python3", script, "--prepare", "--work", work,
+        prep_cmd = ["apptainer", "exec", "--bind", work, "--bind", str(Path(script).parent)]
+        if Path(args.prepare_python).is_absolute():
+            prep_cmd += ["--bind", str(Path(args.prepare_python).parent.parent)]
+        prep = shlex.join(prep_cmd + [vllm, args.prepare_python, script, "--prepare", "--work", work,
                            "--candidates", str(args.candidates)])
+        reuse = shlex.join(["python3", script, "--prepare", "--work", work])
         run = shlex.join(["python3", script, "--run", "--work", work,
                           "--vllm-sif", vllm, "--sglang-sif", sglang,
                           "--context", str(args.context), "--startup-timeout", str(args.startup_timeout),
@@ -490,7 +496,9 @@ def main():
               "command -v apptainer >/dev/null || module load apptainer\n"
               "export http_proxy=http://proxy.nhr.fau.de:80\nexport https_proxy=$http_proxy\n"
               "export no_proxy=localhost,127.0.0.1,::1\nexport NO_PROXY=$no_proxy\n"
-              f"mkdir -p {shlex.quote(work)}\n{prep}\n{run}")
+              f"mkdir -p {shlex.quote(work)}\n"
+              f"if [ -f {shlex.quote(str(Path(work) / 'dataset.json'))} ]; then\n"
+              f"  {reuse}\nelse\n  {prep}\nfi\n{run}")
         return
     if args.worker:
         return worker(args)
