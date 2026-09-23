@@ -11,3 +11,6 @@ The production captioning system prompt lives here as a versioned text file.
   version and hash). Do not edit `caption-v1.txt` after a production run starts.
 - The prompt file is wrapped for readability only; normalization makes the hash
   insensitive to line wrapping.
+- `caption-v2` produces a natural imperative user request rather than a detached
+  caption. The image supplies composition while the TikZ source is authoritative
+  for visible labels, colors, styles and relationships. Its limit is 300 words.

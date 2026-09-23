@@ -227,6 +227,43 @@ output goes to the Slurm job output (`slurm-tikz-prod-%j.out` by default).
 
 ## 3. Validated production baseline
 
+### 3.1 Twenty-row, one-GPU prompt-quality pilot
+
+Before the 100K run, use a separate work directory to freeze and caption exactly
+source rows 0-19. `caption-v2` produces imperative, natural user requests; it
+uses the image for composition and treats the TikZ source as authoritative for
+visible labels, colors, styles and relationships. The pilot allows 300 words,
+reserves 512 output tokens, and retries truncation once at 768 tokens.
+
+```bash
+python3 cleaning/build_dataset.py slurm-script \
+  --work /home/atuin/v123be/v123be62/tikz-caption-benchmark/pilot-v2-first-20 \
+  --vllm-sif /home/atuin/v123be/v123be62/tikz-caption-benchmark/containers/vllm.sif \
+  --model-cache-dir /home/atuin/v123be/v123be62/tikz-caption-benchmark/benchmark-data-nvfp4/hf \
+  --wall-time 00:20:00 \
+  --max-runtime-minutes 15 \
+  --gpus 1 --replicas 1 \
+  --row-limit 20 --start-index 0 --end-index 19 \
+  --prompt-version caption-v2 \
+  --concurrency 20 \
+  --max-output-tokens 512 --truncation-retry-tokens 768 \
+  --max-instruction-words 300 --max-instruction-chars 4000 \
+  --job-name tikz-caption-v2-pilot \
+  --log-prefix slurm-tikz-caption-v2-pilot \
+  > tikz-caption-v2-pilot.sbatch
+
+bash -n tikz-caption-v2-pilot.sbatch
+sbatch tikz-caption-v2-pilot.sbatch
+```
+
+This is an isolated pilot identity and cannot be resumed as the 100K production
+run. Exported rows retain `source_row_index` 0-19 for direct comparison with the
+same Hugging Face dataset rows.
+
+---
+
+### 3.2 Production configuration
+
 The baseline is the measured winner from `cleaning/results/`
 (`rtxpro6000-decoding-comparison-2026-09-23.csv`): NVFP4, greedy, two total
 TP1 replicas at aggregate concurrency 64, 16K batch budget —

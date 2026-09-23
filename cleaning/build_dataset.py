@@ -242,9 +242,10 @@ class InferenceConfig:
     def validate(self) -> None:
         if self.engine != "vllm-offline":
             raise ConfigError(f"Production engine is vllm-offline, got {self.engine!r}")
-        if (self.tensor_parallel, self.replicas) != (1, 2):
+        if self.tensor_parallel != 1 or self.replicas not in (1, 2):
             raise ConfigError(
-                "Production baseline is TP1 with exactly two replicas, one per GPU "
+                "TP1 with exactly two replicas is the production topology; "
+                "an isolated pilot may use one replica "
                 f"(got tp={self.tensor_parallel}, replicas={self.replicas})")
         if self.replicas_per_gpu != 1:
             raise ConfigError("Colocated replicas are the rejected topology; replicas_per_gpu must be 1")
@@ -370,10 +371,18 @@ class RunConfig:
             raise ConfigError(f"Production dataset is {DATASET_ID}, got {self.dataset.dataset_id!r}")
         if self.dataset.split != DATASET_SPLIT:
             raise ConfigError(f"Production split is {DATASET_SPLIT!r}, got {self.dataset.split!r}")
-        if (self.dataset.row_start, self.dataset.row_limit) != (ROW_START, ROW_LIMIT):
-            raise ConfigError(
-                f"Production freezes source rows {ROW_START}-{ROW_START + ROW_LIMIT - 1} exactly")
         self.inference.validate()
+        production = (self.dataset.row_start, self.dataset.row_limit,
+                      self.inference.replicas) == (ROW_START, ROW_LIMIT, 2)
+        # Synthetic tests historically use short manifests with two fake workers;
+        # command-level guards below restrict real shortened runs to one replica.
+        pilot_or_fixture = (self.dataset.row_start == ROW_START
+                            and 1 <= self.dataset.row_limit <= 1000
+                            and self.inference.replicas in (1, 2))
+        if not (production or pilot_or_fixture):
+            raise ConfigError(
+                "Supported profiles are production (100,000 rows, two replicas) or "
+                "an isolated pilot (1-1,000 rows from index 0, one replica)")
         self.validation.validate()
         if not self.prompt.text or self.prompt.sha256 != sha256_text(self.prompt.text):
             raise ConfigError("Prompt text does not match its recorded hash")
@@ -463,12 +472,13 @@ def config_from_args(args, *, manifest_meta=None, prompt: Prompt | None = None,
     dataset_revision = meta.get("dataset_revision") or args.dataset_revision or "UNRESOLVED"
     model_revision = meta.get("model_revision") or args.model_revision or "UNRESOLVED"
     config = RunConfig(
-        dataset=DatasetSource(dataset_id=args.dataset, revision=dataset_revision),
+        dataset=DatasetSource(dataset_id=args.dataset, revision=dataset_revision,
+                              row_limit=int(meta.get("row_limit", args.row_limit))),
         model=ModelSource(model_id=args.model, revision=model_revision,
                           processor_revision=model_revision, path=meta.get("model_path", "")),
         prompt=prompt,
         inference=InferenceConfig(
-            aggregate_concurrency=args.concurrency, mtp=args.mtp,
+            replicas=args.replicas, aggregate_concurrency=args.concurrency, mtp=args.mtp,
             batch_token_budget=args.batch_token_budget, context=args.context,
             max_output_tokens=args.max_output_tokens,
             truncation_retry_tokens=args.truncation_retry_tokens,
@@ -995,11 +1005,12 @@ def cmd_prepare(args, deps=None) -> int:
     require_slurm(args)
     deps = deps or PrepareDeps()
     work = Path(args.work).resolve()
-    row_limit = getattr(args, "row_limit", ROW_LIMIT)
-    if row_limit != ROW_LIMIT and not args.allow_non_slurm:
+    row_limit = args.row_limit
+    if row_limit != ROW_LIMIT and not args.allow_non_slurm and not (
+            args.replicas == 1 and 1 <= row_limit <= 1000):
         raise ConfigError(
-            "--row-limit is a synthetic-fixture control; production freezes exactly "
-            f"{ROW_LIMIT} rows")
+            "--row-limit is a synthetic-fixture control unless used as an isolated "
+            "1-1,000-row pilot with --replicas 1")
     limits = FreezeLimits(max_tikz_chars=args.max_tikz_chars,
                           max_image_bytes=args.max_image_bytes,
                           estimate_rows=args.estimate_rows)
@@ -2746,14 +2757,13 @@ def validate_run_args(args) -> None:
 
 
 def cmd_run(args, deps=None) -> int:
-    require_slurm(args, gpus=2)
+    require_slurm(args)
     validate_run_args(args)
     deps = deps or PipelineDeps()
     work = Path(args.work).resolve()
     meta = verify_manifest(work, quick=True)
-    if meta.get("row_limit") != ROW_LIMIT and not args.allow_non_slurm:
-        raise ConfigError(
-            f"Manifest freezes {meta.get('row_limit')} rows; production requires {ROW_LIMIT}")
+    if not args.allow_non_slurm and meta.get("row_limit") != ROW_LIMIT and args.replicas != 1:
+        raise ConfigError("A shortened manifest requires the one-GPU pilot topology")
     if not args.vllm_sif:
         raise ConfigError("run requires --vllm-sif (the engine container)")
     container = deps.container_sha256(args.vllm_sif, work)
@@ -2770,8 +2780,9 @@ def cmd_run(args, deps=None) -> int:
         record = write_run_record(work, config)
         print(f"Run identity recorded: {record['run_id']}", flush=True)
     gpus = deps.probe_gpus()
-    if len(gpus) != 2:
-        raise SystemExit(f"Expected exactly 2 visible GPUs, found {len(gpus)}: {gpus}")
+    if len(gpus) != config.inference.replicas:
+        raise SystemExit(f"Expected exactly {config.inference.replicas} visible GPUs, "
+                         f"found {len(gpus)}: {gpus}")
     if not all("RTX PRO 6000" in name for name in gpus):
         raise SystemExit(f"Expected RTX PRO 6000 GPUs for the production baseline, found {gpus}")
     stop_flag = StopFlag()
@@ -3648,6 +3659,8 @@ def build_slurm_script(args) -> str:
         raise ConfigError("--wall-time is required when generating a Slurm script")
     if not args.vllm_sif:
         raise ConfigError("--vllm-sif is required when generating a Slurm script")
+    if args.gpus != args.replicas:
+        raise ConfigError("--gpus must equal --replicas (one TP1 replica per GPU)")
     wall_minutes = parse_wall_time(args.wall_time)
     max_runtime = args.max_runtime_minutes
     if max_runtime is None:
@@ -3669,7 +3682,8 @@ def build_slurm_script(args) -> str:
         return quote(["apptainer", "exec", "--nv", *binds, vllm, python, script, *command])
 
     prepare_flags = ["prepare", "--work", work, "--model", args.model,
-                     "--dataset", args.dataset, "--model-cache-dir", model_cache]
+                     "--dataset", args.dataset, "--model-cache-dir", model_cache,
+                     "--row-limit", str(args.row_limit), "--replicas", str(args.replicas)]
     if args.dataset_revision:
         prepare_flags += ["--dataset-revision", args.dataset_revision]
     if args.model_revision:
@@ -3678,6 +3692,7 @@ def build_slurm_script(args) -> str:
 
     run_flags = [
         "run", "--work", work, "--model", args.model, "--vllm-sif", vllm,
+        "--row-limit", str(args.row_limit), "--replicas", str(args.replicas),
         "--concurrency", str(args.concurrency), "--mtp", str(args.mtp),
         "--batch-token-budget", str(args.batch_token_budget),
         "--context", str(args.context),
@@ -3685,6 +3700,9 @@ def build_slurm_script(args) -> str:
         "--truncation-retry-tokens", str(args.truncation_retry_tokens),
         "--gpu-memory-utilization", str(args.gpu_memory_utilization),
         "--nccl-p2p", args.nccl_p2p, "--prompt-version", args.prompt_version,
+        "--min-instruction-chars", str(args.min_instruction_chars),
+        "--max-instruction-chars", str(args.max_instruction_chars),
+        "--max-instruction-words", str(args.max_instruction_words),
         "--max-transient-attempts", str(args.max_transient_attempts),
         "--retry-backoff-base-seconds", str(args.retry_backoff_base_seconds),
         "--retry-backoff-cap-seconds", str(args.retry_backoff_cap_seconds),
@@ -3860,6 +3878,10 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model-revision", default="",
                         help="Pinned model commit sha (resolved from the Hub when omitted)")
     parser.add_argument("--prompt-version", default=DEFAULT_PROMPT_VERSION)
+    parser.add_argument("--row-limit", type=int, default=ROW_LIMIT,
+                        help="Frozen source-row count (production: 100000; pilot: 1-1000)")
+    parser.add_argument("--replicas", type=int, choices=(1, 2), default=2,
+                        help="Independent TP1 replicas (production: 2; pilot: 1)")
     parser.add_argument("--concurrency", type=int, default=64, help="Aggregate in-flight requests")
     parser.add_argument("--mtp", type=int, choices=(0, 1, 2, 3), default=1)
     parser.add_argument("--batch-token-budget", type=int, default=16_384)
@@ -3895,7 +3917,6 @@ def build_parser() -> argparse.ArgumentParser:
     prepare.add_argument("--max-image-bytes", type=int, default=20_000_000)
     prepare.add_argument("--estimate-rows", type=int, default=200,
                          help="Bounded sample used for the disk-space estimate")
-    prepare.add_argument("--row-limit", type=int, default=ROW_LIMIT, help=argparse.SUPPRESS)
     prepare.set_defaults(handler=cmd_prepare)
 
     checkpoint = subparsers.add_parser("checkpoint", help="Copy the ledger to a backup file")

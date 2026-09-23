@@ -74,6 +74,13 @@ class PromptTests(unittest.TestCase):
         self.assertIn("under 120 words", prompt.text)
         self.assertNotIn("\n", prompt.text)
 
+    def test_caption_v2_is_registered_as_instruction_style_300_word_prompt(self):
+        prompt = b.load_prompt("caption-v2")
+        self.assertTrue(b.is_sha256(prompt.sha256))
+        self.assertIn("imperative creation request", prompt.text)
+        self.assertIn("authoritative ground truth", prompt.text)
+        self.assertIn("Do not exceed 300 words", prompt.text)
+
     def test_normalization_is_wrap_insensitive(self):
         with tempfile.TemporaryDirectory() as directory:
             directory = Path(directory)
@@ -1467,6 +1474,27 @@ class SlurmScriptTests(unittest.TestCase):
         self.assertTrue(all("sbatch" not in line or line.startswith("#")
                             for line in script.splitlines() if "sbatch" in line))
         subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
+    def test_script_supports_an_isolated_one_gpu_twenty_row_pilot(self):
+        script = self.build(
+            "--gpus", "1", "--replicas", "1", "--row-limit", "20",
+            "--end-index", "19", "--prompt-version", "caption-v2",
+            "--concurrency", "20", "--max-output-tokens", "512",
+            "--truncation-retry-tokens", "768", "--max-instruction-words", "300")
+        self.assertIn("#SBATCH --gres=gpu:rtxpro6k:1", script)
+        self.assertIn("prepare --work", script)
+        self.assertIn("--row-limit 20 --replicas 1", script)
+        self.assertIn("--end-index 19", script)
+        self.assertIn("--prompt-version caption-v2", script)
+        self.assertIn("--max-instruction-words 300", script)
+        subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
+    def test_script_rejects_gpu_replica_mismatch(self):
+        args = b.build_parser().parse_args([
+            "slurm-script", "--work", "/tmp/w", "--vllm-sif", "/tmp/v.sif",
+            "--wall-time", "00:20:00", "--gpus", "1", "--replicas", "2"])
+        with self.assertRaisesRegex(b.ConfigError, "gpus must equal"):
+            b.build_slurm_script(args)
 
     def test_script_stages_prepare_run_export_and_audit(self):
         script = self.build()
