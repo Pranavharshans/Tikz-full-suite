@@ -200,6 +200,11 @@ def split_reasoning(text):
     return "", text.strip()
 
 
+def warmup_passed(record):
+    """Warmup validates engine health; measured truncation remains a failure."""
+    return bool(record.get("final")) and record.get("finish_reason") in ("stop", "length")
+
+
 def generation_settings(job):
     if job["enable_thinking"]:
         return dict(temperature=1.0, top_p=.95, top_k=20,
@@ -354,8 +359,8 @@ def worker(args):
                 return records
             print("Starting untimed offline warmup", flush=True)
             warmup = offline(items[:min(job.get("warmup_samples", 5), len(items))])
-            if not all(r["ok"] for r in warmup):
-                raise RuntimeError("Offline warmup failed or hit context limit")
+            if not all(warmup_passed(r) for r in warmup):
+                raise RuntimeError("Offline warmup failed to produce output")
             def offline_metrics(name):
                 try:
                     (out / name).write_text(repr(llm.get_metrics()))
@@ -411,7 +416,7 @@ def worker(args):
                 time.sleep(2)
         for row, _, length in items[:job.get("warmup_samples", 5)]:
             result = http_request(port, row, job["context"]-length, job["request_timeout"], job)
-            if not result["ok"]:
+            if not warmup_passed(result):
                 raise RuntimeError(f"Warmup failed: {result}")
         def metrics(name):
             try:

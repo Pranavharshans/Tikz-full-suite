@@ -155,6 +155,12 @@ class Tests(unittest.TestCase):
     def test_reasoning_separation(self):
         self.assertEqual(b.split_reasoning("<think>private reasoning</think>Draw A"), ("private reasoning", "Draw A"))
 
+    def test_warmup_accepts_bounded_output_but_not_missing_output(self):
+        self.assertTrue(b.warmup_passed({"final": "caption", "finish_reason": "stop"}))
+        self.assertTrue(b.warmup_passed({"final": "caption", "finish_reason": "length"}))
+        self.assertFalse(b.warmup_passed({"final": "", "finish_reason": "length"}))
+        self.assertFalse(b.warmup_passed({"final": "caption", "finish_reason": None}))
+
     def test_sse_completion_and_truncation(self):
         class Handler(BaseHTTPRequestHandler):
             def log_message(self, *args):

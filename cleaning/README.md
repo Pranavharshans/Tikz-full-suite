@@ -163,6 +163,9 @@ with unique request IDs; these are 512 requests, not 512 unique dataset samples.
 Prefix caching remains disabled. This isolates capacity saturation without a
 new dataset download and writes `rtx-concurrency-results.json` plus
 `rtx-concurrency-summary.csv`. Use it for throughput, not quality statistics.
+Warmup validates that the engine returns non-empty output and therefore accepts
+either `stop` or the configured `length` boundary. Measured responses that end
+at the boundary remain failures, so this does not inflate production throughput.
 
 ### Tests
 
