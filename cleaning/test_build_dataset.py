@@ -916,10 +916,13 @@ class FakeEngine:
 
     def __init__(self, job, *, crash_rows=(), fail_rows=(), prompt_mismatch=False,
                  short_batch=False, log_path=None, truncate_rows=(), invalid_rows=(),
-                 reverse_outputs=False, fail_first_call=False, no_prompt_echo=False):
+                 reverse_outputs=False, fail_first_call=False, no_prompt_echo=False,
+                 fail_once_rows=()):
         self.job = job
         self.crash_rows = set(crash_rows)
         self.fail_rows = set(fail_rows)
+        self.fail_once_rows = fail_once_rows if isinstance(fail_once_rows, set) \
+            else set(fail_once_rows)
         self.prompt_mismatch = prompt_mismatch
         self.short_batch = short_batch
         self.log_path = log_path
@@ -946,6 +949,9 @@ class FakeEngine:
                 raise SystemExit(137)  # simulate SIGKILL: no results are written
             if row_id in self.fail_rows:
                 raise RuntimeError("simulated CUDA failure")
+            if row_id in self.fail_once_rows:
+                self.fail_once_rows.discard(row_id)
+                raise RuntimeError("simulated one-time engine failure")
             self._log(row_id)
             if row_id in self.truncate_rows:
                 outputs.append(b.EngineOutput(prompt=item["prompt"], text="Partial caption",

@@ -1999,6 +1999,92 @@ class PipelineIdentityError(RuntimeError):
     """Raised when a result cannot be trusted to belong to this run and row."""
 
 
+class ResultSchemaError(ValueError):
+    """Raised when a result file is valid JSON but not a valid result document."""
+
+
+# Required result fields and their accepted types.  ``bool`` is deliberately
+# not accepted where an integer is expected (bool is an int subclass).
+RESULT_FIELD_TYPES = {
+    "row_id": (str,),
+    "source_row_index": (int,),
+    "worker": (str,),
+    "max_tokens": (int,),
+    "ok": (bool,),
+    "instruction": (str, type(None)),
+    "finish_reason": (str, type(None)),
+    "prompt_tokens": (int, type(None)),
+    "completion_tokens": (int, type(None)),
+    "error_category": (str, type(None)),
+    "error_detail": (str, type(None)),
+    "image_sha256": (str,),
+    "tikz_sha256": (str,),
+    "model_revision": (str,),
+    "prompt_sha256": (str,),
+    "config_hash": (str,),
+}
+RESULT_OPTIONAL_FIELD_TYPES = {
+    "text": (str, type(None)),
+    "batch_index": (int,),
+}
+
+
+def _matches_type(value, types) -> bool:
+    if isinstance(value, bool) and bool not in types:
+        return False
+    return isinstance(value, types)
+
+
+def validate_result_file(data) -> None:
+    """Validate the structure of a result document before any field is used.
+
+    Raises ResultSchemaError for malformed-but-valid JSON (missing keys, wrong
+    types, invalid containers, duplicate rows).  Programming defects in the
+    pipeline itself must still raise normally and are never classified here.
+    """
+    if not isinstance(data, dict):
+        raise ResultSchemaError(f"result document is {type(data).__name__}, expected object")
+    for key in ("run_id", "worker", "worker_index", "results"):
+        if key not in data:
+            raise ResultSchemaError(f"result document is missing {key!r}")
+    if not isinstance(data["run_id"], str) or not data["run_id"]:
+        raise ResultSchemaError("run_id must be a non-empty string")
+    if not isinstance(data["worker"], str) or not data["worker"]:
+        raise ResultSchemaError("worker must be a non-empty string")
+    if not _matches_type(data["worker_index"], (int,)):
+        raise ResultSchemaError(
+            f"worker_index has type {type(data['worker_index']).__name__}, expected int")
+    if not isinstance(data["results"], list):
+        raise ResultSchemaError(
+            f"results must be a list, got {type(data['results']).__name__}")
+    seen = set()
+    for position, result in enumerate(data["results"]):
+        if not isinstance(result, dict):
+            raise ResultSchemaError(
+                f"results[{position}] is {type(result).__name__}, expected object")
+        for key, types in RESULT_FIELD_TYPES.items():
+            if key not in result:
+                raise ResultSchemaError(f"results[{position}] is missing {key!r}")
+            if not _matches_type(result[key], types):
+                raise ResultSchemaError(
+                    f"results[{position}].{key} has type {type(result[key]).__name__}, "
+                    f"expected {'/'.join(t.__name__ for t in types)}")
+        for key, types in RESULT_OPTIONAL_FIELD_TYPES.items():
+            if key in result and not _matches_type(result[key], types):
+                raise ResultSchemaError(
+                    f"results[{position}].{key} has type {type(result[key]).__name__}")
+        if not result["row_id"]:
+            raise ResultSchemaError(f"results[{position}].row_id is empty")
+        if result["max_tokens"] < 1:
+            raise ResultSchemaError(f"results[{position}].max_tokens must be positive")
+        for key in ("prompt_tokens", "completion_tokens"):
+            if result[key] is not None and result[key] < 0:
+                raise ResultSchemaError(f"results[{position}].{key} must be non-negative")
+        if result["row_id"] in seen:
+            raise ResultSchemaError(f"duplicate result for {result['row_id']}")
+        seen.add(result["row_id"])
+
+
 class StopFlag:
     """Cooperative SIGTERM/SIGINT handling for the controller."""
 
@@ -2257,28 +2343,26 @@ def ingest_result_files(*, ledger, work, config, index, policy) -> dict:
             continue
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
-            if data.get("run_id") != config.run_id():
+            validate_result_file(data)
+            if data["run_id"] != config.run_id():
                 raise PipelineIdentityError(
-                    f"Result file {path.name} belongs to run {data.get('run_id')!r}, "
+                    f"Result file {path.name} belongs to run {data['run_id']!r}, "
                     f"not {config.run_id()!r}")
-            worker = data.get("worker")
-            if worker != f"worker-{data.get('worker_index')}":
+            worker = data["worker"]
+            if worker != f"worker-{data['worker_index']}":
                 raise PipelineIdentityError(
                     f"Result file {path.name} has an inconsistent worker label")
-            results, row_ids = [], []
-            for result in data.get("results", []):
-                if result.get("worker") != worker:
+            results = []
+            for result in data["results"]:
+                if result["worker"] != worker:
                     raise PipelineIdentityError(
-                        f"Result for {result.get('row_id')} claims worker "
-                        f"{result.get('worker')!r} but arrived in {worker}'s file")
-                if result["row_id"] in row_ids:
-                    raise PipelineIdentityError(
-                        f"Duplicate result for {result['row_id']} inside {path.name}")
+                        f"Result for {result['row_id']} claims worker "
+                        f"{result['worker']!r} but arrived in {worker}'s file")
                 reason = validate_result_identity(result, config, index)
                 if reason is not None:
                     result = dict(result, ok=False, instruction=None, finish_reason=None,
                                   error_category="integrity", error_detail=reason)
-                elif result.get("ok"):
+                elif result["ok"]:
                     # Semantic validation is authoritative here and never retried:
                     # greedy decoding would reproduce the same invalid text.
                     valid, rule, detail = validate_instruction(result.get("instruction"),
@@ -2295,16 +2379,24 @@ def ingest_result_files(*, ledger, work, config, index, policy) -> dict:
                         f"Row {result['row_id']} is claimed by {row['worker']!r} but a result "
                         f"arrived from {worker!r}")
                 results.append(result)
-                row_ids.append(result["row_id"])
-        except (json.JSONDecodeError, PipelineIdentityError, OSError) as exc:
+        except (json.JSONDecodeError, OSError, ResultSchemaError,
+                PipelineIdentityError) as exc:
             destination = move_aside(path, quarantine_root)
             print(f"WARNING: quarantined unprocessable result file {destination}: {exc}",
                   flush=True)
             continue
-        ledger.record_results(results, policy=policy,
-                              consumed_file=(sha256, path.name))
+        try:
+            ledger.record_results(results, policy=policy,
+                                  consumed_file=(sha256, path.name))
+        except LedgerError as exc:
+            # The transaction rolled back, so the ledger is consistent; keep the
+            # file as evidence and let the run continue.
+            destination = move_aside(path, quarantine_root)
+            print(f"WARNING: quarantined result file {destination} after a ledger "
+                  f"conflict: {exc}", flush=True)
+            continue
         move_aside(path, consumed_root / worker_dir)
-        seen.setdefault(worker, set()).update(row_ids)
+        seen.setdefault(worker, set()).update(result["row_id"] for result in results)
     return seen
 
 
@@ -2335,8 +2427,12 @@ def _worker_last_activity(handle, heartbeat_path) -> float:
 
 
 def run_wave(*, args, config, work, deps, ledger, index, policy, wave, stop_flag,
-             deadline, claimed_so_far: int) -> int:
+             deadline_monotonic, claimed_so_far: int) -> int:
     """Claim rows, run both replicas to completion, reclaim what they left.
+
+    ``deadline_monotonic`` is a ``time.monotonic()`` instant; every comparison in
+    this function uses that same clock.  Ledger timestamps are epoch seconds and
+    are never compared with it directly.
 
     Returns the number of rows claimed in this wave.
     """
@@ -2413,7 +2509,7 @@ def run_wave(*, args, config, work, deps, ledger, index, policy, wave, stop_flag
                 ingest()
                 release_outstanding("run_interrupted")
                 return claimed_count
-            if deadline is not None and time.time() > deadline:
+            if deadline_monotonic is not None and time.monotonic() > deadline_monotonic:
                 _request_stop(work)
                 print("Runtime budget reached; stopping workers", flush=True)
                 _drain_workers(args, handles)
@@ -2468,16 +2564,16 @@ def _request_stop(work) -> None:
 
 
 def _drain_workers(args, handles) -> None:
-    deadline = time.time() + args.shutdown_grace_seconds
-    while time.time() < deadline:
+    deadline = time.monotonic() + args.shutdown_grace_seconds
+    while time.monotonic() < deadline:
         if all(handle.poll() is not None for handle in handles.values()):
             return
         time.sleep(1)
     for handle in handles.values():
         if handle.poll() is None:
             handle.terminate()
-    deadline = time.time() + 30
-    while time.time() < deadline:
+    deadline = time.monotonic() + 30
+    while time.monotonic() < deadline:
         if all(handle.poll() is not None for handle in handles.values()):
             return
         time.sleep(1)
@@ -2546,7 +2642,11 @@ def _run_pipeline_locked(args, config, meta, deps, stop_flag, work) -> dict:
                          truncation_max_tokens=config.inference.truncation_retry_tokens)
     index = manifest_index(work)
     started = time.monotonic()
-    deadline = started + args.max_runtime_minutes * 60 if args.max_runtime_minutes else None
+    # One clock for all runtime budgets: monotonic seconds since boot.  Ledger
+    # timestamps are epoch seconds and are converted to durations before they
+    # are ever compared with this deadline.
+    deadline_monotonic = (started + args.max_runtime_minutes * 60
+                          if args.max_runtime_minutes else None)
     ledger = Ledger(work).open()
     claimed_so_far = 0
     try:
@@ -2577,7 +2677,7 @@ def _run_pipeline_locked(args, config, meta, deps, stop_flag, work) -> dict:
             if stop_flag.requested:
                 print(f"Stop requested ({stop_flag.signal_name}); no new claims", flush=True)
                 break
-            if deadline is not None and time.monotonic() > deadline:
+            if deadline_monotonic is not None and time.monotonic() > deadline_monotonic:
                 print("Runtime budget reached; no new claims", flush=True)
                 break
             if args.max_rows_this_run and claimed_so_far >= args.max_rows_this_run:
@@ -2587,19 +2687,20 @@ def _run_pipeline_locked(args, config, meta, deps, stop_flag, work) -> dict:
                                    limit=1):
                 next_retry = ledger.next_retry_time(start_index=args.start_index,
                                                     end_index=args.end_index)
-                now = time.time()
-                # Only a strictly future, in-window retry is worth waiting for.
-                if (next_retry is not None and now < next_retry
-                        and next_retry - now <= args.retry_wait_seconds
-                        and (deadline is None or next_retry < deadline)):
-                    print(f"Waiting {next_retry - now:.0f}s for retry backoff", flush=True)
-                    deps.sleep(next_retry - now)
+                # Ledger retry timestamps are epoch seconds; translate to a
+                # duration before comparing with the monotonic deadline.
+                wait = None if next_retry is None else next_retry - time.time()
+                if (wait is not None and 0 < wait <= args.retry_wait_seconds
+                        and (deadline_monotonic is None
+                             or time.monotonic() + wait < deadline_monotonic)):
+                    print(f"Waiting {wait:.1f}s for retry backoff", flush=True)
+                    deps.sleep(wait)
                     continue
                 break
             claimed_so_far += run_wave(
                 args=args, config=config, work=work, deps=deps, ledger=ledger, index=index,
-                policy=policy, wave=wave + 1, stop_flag=stop_flag, deadline=deadline,
-                claimed_so_far=claimed_so_far)
+                policy=policy, wave=wave + 1, stop_flag=stop_flag,
+                deadline_monotonic=deadline_monotonic, claimed_so_far=claimed_so_far)
             wave += 1
         counts = ledger.counts()
         states = counts["states"]

@@ -97,6 +97,15 @@ heartbeat. The worker container gets `CUDA_VISIBLE_DEVICES` for one GPU,
 `HF_HUB_OFFLINE=1` / `TRANSFORMERS_OFFLINE=1`; the model snapshot path is
 bind-mounted, so workers need no network.
 
+Before any field of a result file is used, `validate_result_file` checks its
+structure: the document must be an object with `run_id`, `worker`,
+`worker_index` and a `results` list, and every result must be an object with
+the required keys and types (no bool where an integer is expected, no
+non-positive `max_tokens`, no duplicate row ids). A file that is valid JSON
+but fails this schema - or that conflicts with the ledger - is quarantined as
+evidence and its rows are reclaimed; unexpected programming defects are never
+classified this way and still raise normally.
+
 Every batch is validated before its results are trusted: the output count must
 match, and each output must echo the request prompt. An engine that does not
 echo prompts is refused by default (`--allow-missing-prompt-echo` accepts
@@ -794,6 +803,11 @@ microbatches.
 
 The runtime budget is measured from controller start and is checked before new
 claims and inside each wave; it is not a hard kill of an in-flight batch.
+Every runtime budget uses one clock: `time.monotonic()`. Ledger retry
+timestamps are epoch seconds (`time.time()`), and the controller translates
+them into a duration before comparing them with the monotonic deadline, so
+retry waiting, the runtime budget and the wave stop check can never disagree
+about which clock they are reading.
 
 ---
 
@@ -1047,8 +1061,11 @@ checkpoint. Resubmit the same script; it resumes from the ledger. Check
 - Never run two controllers against one work directory; the second one refuses
   to start while the lock is held.
 - Unprocessable result files are moved to `runtime/quarantine/` (the run
-  continues and their rows are reclaimed). Inspect them before deleting;
-  `audit` warns while any remain.
+  continues and their rows are reclaimed). This covers malformed-but-valid
+  JSON (missing keys, wrong types, invalid containers, duplicate row ids),
+  foreign run ids, ownership conflicts, and ledger ingestion conflicts such as
+  a conflicting instruction for an already-complete row. Inspect them before
+  deleting; `audit` warns while any remain.
 
 ### 12.3 Corrupt or incomplete shard
 
@@ -1224,6 +1241,11 @@ Notes:
 - Tests use the hidden `--allow-non-slurm` flag, the hidden
   `--stall-kill-grace-seconds` control and injectable dependency seams;
   production runs must not use them.
+- Deadline behavior is covered by integration tests with a non-null
+  `--max-runtime-minutes`: workers must be allowed to run, and a retry backoff
+  must be waited out under a runtime deadline. Malformed result files are
+  covered by a table of resume tests (one per malformed case) plus a ledger
+  conflict case.
 
 ---
 

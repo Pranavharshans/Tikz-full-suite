@@ -497,6 +497,43 @@ class FaultInjectionTests(unittest.TestCase):
         for row in complete:
             self.assertEqual(row["instruction"], f"Instruction for {row['row_id']}")
 
+    def test_runtime_deadline_allows_workers_to_run(self):
+        """A non-null runtime budget must not stop the wave before any work happens."""
+        with slurm_env():
+            code = b.cmd_run(run_args(self.work, "--max-runtime-minutes", "0.05"),
+                             deps=LocalDeps(LocalSpawner(self.engine_factory())))
+        self.assertEqual(code, 0)
+        states, complete, _ = read_states(self.work)
+        self.assertEqual(states["complete"], 12)
+        for row in complete:
+            self.assertEqual(row["instruction"], f"Instruction for {row['row_id']}")
+
+    def test_retry_waiting_works_under_a_runtime_deadline(self):
+        """Epoch retry timestamps must be translated before comparing to the deadline."""
+        target = self.entries[4]["row_id"]
+        failed_once = {target}  # shared across engine instances: fail exactly once
+
+        def engine_factory(job):
+            return FakeEngine(job, fail_once_rows=failed_once)
+
+        output = io.StringIO()
+        with slurm_env(), contextlib.redirect_stdout(output):
+            code = b.cmd_run(run_args(self.work, "--max-runtime-minutes", "0.05",
+                                      "--retry-wait-seconds", "5",
+                                      "--retry-backoff-base-seconds", "0.2",
+                                      "--retry-backoff-cap-seconds", "0.2"),
+                             deps=LocalDeps(LocalSpawner(engine_factory)))
+        self.assertEqual(code, 0)
+        self.assertIn("Waiting", output.getvalue())
+        states, complete, _ = read_states(self.work)
+        self.assertEqual(states["complete"], 12)
+        self.assertEqual(states["retryable"] + states["running"] + states["pending"], 0)
+        with b.Ledger(self.work, read_only=True) as ledger:
+            attempts = ledger.attempts_for([target])[target]
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(attempts[0]["error_category"], "engine_transient")
+            self.assertEqual(attempts[1]["state"], "complete")
+
     def test_run_guards(self):
         spawner = LocalSpawner(self.engine_factory())
         # No --allow-non-slurm here: the production guard must refuse outright.
@@ -830,6 +867,128 @@ class AuditAndStatusTests(unittest.TestCase):
         report = json.loads((self.work / "validation-report.json").read_text())
         self.assertEqual(report["status"], "fail")
         self.assertIn("instruction:task_reference", report["failures"][0]["problems"])
+
+
+MALFORMED_RESULT_CASES = [
+    ("missing results container", lambda payload: payload.pop("results")),
+    ("results is a dict", lambda payload: payload.update(results={"row": {}})),
+    ("results is a string", lambda payload: payload.update(results="not-a-list")),
+    ("results holds a non-object", lambda payload: payload.update(results=["not-a-dict"])),
+    ("missing run_id", lambda payload: payload.pop("run_id")),
+    ("run_id is not a string", lambda payload: payload.update(run_id=12345)),
+    ("missing worker", lambda payload: payload.pop("worker")),
+    ("missing worker_index", lambda payload: payload.pop("worker_index")),
+    ("worker_index is a string", lambda payload: payload.update(worker_index="0")),
+    ("result missing row_id", lambda payload: payload["results"][0].pop("row_id")),
+    ("result missing ok", lambda payload: payload["results"][0].pop("ok")),
+    ("result missing max_tokens", lambda payload: payload["results"][0].pop("max_tokens")),
+    ("row_id is not a string", lambda payload: payload["results"][0].update(row_id=7)),
+    ("ok is a string", lambda payload: payload["results"][0].update(ok="yes")),
+    ("max_tokens is a string", lambda payload: payload["results"][0].update(max_tokens="256")),
+    ("max_tokens is zero", lambda payload: payload["results"][0].update(max_tokens=0)),
+    ("source_row_index is a bool", lambda payload: payload["results"][0].update(source_row_index=True)),
+    ("instruction is a dict", lambda payload: payload["results"][0].update(instruction={"text": "x"})),
+    ("finish_reason is an int", lambda payload: payload["results"][0].update(finish_reason=1)),
+    ("prompt_tokens is negative", lambda payload: payload["results"][0].update(prompt_tokens=-1)),
+    ("completion_tokens is a string", lambda payload: payload["results"][0].update(completion_tokens="12")),
+    ("error_detail is a list", lambda payload: payload["results"][0].update(error_detail=["x"])),
+    ("config_hash is missing", lambda payload: payload["results"][0].pop("config_hash")),
+    ("text is an int", lambda payload: payload["results"][0].update(text=5)),
+    ("duplicate row ids", lambda payload: payload["results"].append(dict(payload["results"][0]))),
+]
+
+
+class MalformedResultTests(unittest.TestCase):
+    """Every malformed-but-valid JSON file is quarantined and the run resumes."""
+
+    def build_work(self, directory):
+        work = Path(directory)
+        meta, _rows = make_work_fixture(work, rows=4)
+        args = b.build_parser().parse_args(
+            ["run", "--work", str(work), "--allow-non-slurm", "--vllm-sif", "/tmp/vllm.sif"])
+        config = b.config_from_args(args, manifest_meta=meta, container_sha256="b" * 64,
+                                    require_pinned=True)
+        index = b.manifest_index(work)
+        with b.Ledger(work).open() as ledger:
+            ledger.initialize(b.ledger_identity_from_config(config, meta))
+            ledger.seed(iter(b.iter_manifest(work)), rows_frozen=4)
+            ledger.claim({"worker-0": [row["row_id"] for row in ledger.eligible()]},
+                         policy=b.RetryPolicy())
+        entries = list(b.iter_manifest(work))
+        result = dict(row_id=entries[0]["row_id"], source_row_index=0, worker="worker-0",
+                      batch_index=0, max_tokens=256, ok=True,
+                      instruction="Draw a circle with a labelled radius",
+                      text=None, finish_reason="stop", prompt_tokens=10,
+                      completion_tokens=20, error_category=None, error_detail=None,
+                      image_sha256=entries[0]["image_sha256"],
+                      tikz_sha256=entries[0]["tikz_sha256"],
+                      model_revision=config.model.revision,
+                      prompt_sha256=config.prompt.sha256,
+                      config_hash=config.identity_sha256())
+        return work, config, entries, result
+
+    def write_payload(self, work, payload):
+        directory = work / "runtime" / "results" / "worker-0"
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "batch-1-00000.json").write_text(json.dumps(payload))
+
+    def test_malformed_result_files_are_quarantined_and_resume(self):
+        for name, mutate in MALFORMED_RESULT_CASES:
+            with self.subTest(name):
+                with tempfile.TemporaryDirectory() as directory:
+                    work, config, entries, result = self.build_work(directory)
+                    payload = dict(run_id=config.run_id(), worker="worker-0",
+                                   worker_index=0, results=[dict(result)])
+                    mutate(payload)
+                    self.write_payload(work, payload)
+                    with slurm_env(), contextlib.redirect_stdout(io.StringIO()):
+                        code = b.cmd_run(run_args(work), deps=LocalDeps(
+                            LocalSpawner(lambda job: FakeEngine(job))))
+                    self.assertEqual(code, 0, msg=name)
+                    with b.Ledger(work, read_only=True) as ledger:
+                        states = ledger.counts()["states"]
+                    self.assertEqual(states["complete"], 4, msg=name)
+                    quarantine = list((work / "runtime" / "quarantine").glob("*"))
+                    self.assertEqual(len(quarantine), 1, msg=name)
+
+    def test_ledger_conflict_is_quarantined_without_overwriting_complete_row(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work, config, entries, result = self.build_work(directory)
+            # Complete the row first, then deliver a conflicting instruction.
+            with b.Ledger(work).open() as ledger:
+                ledger.record_result(dict(result), policy=b.RetryPolicy())
+                self.assertEqual(ledger.get(result["row_id"])["state"], b.STATE_COMPLETE)
+            conflict = dict(result, instruction="A completely different caption")
+            payload = dict(run_id=config.run_id(), worker="worker-0", worker_index=0,
+                           results=[conflict])
+            self.write_payload(work, payload)
+            with b.Ledger(work).open() as ledger:
+                ingested = b.ingest_result_files(ledger=ledger, work=work, config=config,
+                                                 index=b.manifest_index(work),
+                                                 policy=b.RetryPolicy())
+                self.assertEqual(ingested, {})
+                row = ledger.get(result["row_id"])
+                self.assertEqual(row["state"], b.STATE_COMPLETE)
+                self.assertEqual(row["instruction"], result["instruction"])
+            self.assertEqual(len(list((work / "runtime" / "quarantine").glob("*"))), 1)
+
+    def test_schema_validation_messages_are_specific(self):
+        for payload, fragment in [
+            ({"run_id": "r", "worker": "worker-0", "worker_index": 0, "results": {}},
+             "results must be a list"),
+            ({"run_id": "r", "worker": "worker-0", "worker_index": 0,
+              "results": [{"row_id": "x"}]}, "is missing 'source_row_index'"),
+            ({"run_id": "r", "worker": "worker-0", "worker_index": 0,
+              "results": [{"row_id": "x", "source_row_index": 0, "worker": "w",
+                           "max_tokens": 256, "ok": "yes", "instruction": None,
+                           "finish_reason": None, "prompt_tokens": None,
+                           "completion_tokens": None, "error_category": None,
+                           "error_detail": None, "image_sha256": "a", "tikz_sha256": "b",
+                           "model_revision": "c", "prompt_sha256": "d", "config_hash": "e"}]},
+             ".ok has type str"),
+        ]:
+            with self.assertRaisesRegex(b.ResultSchemaError, fragment):
+                b.validate_result_file(payload)
 
 
 if __name__ == "__main__":
