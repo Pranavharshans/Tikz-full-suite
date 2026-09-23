@@ -37,3 +37,28 @@ frozen dataset samples. Prefix caching was disabled. The speeds exclude engine
 startup, compilation and shutdown; `startup_inclusive_s` preserves those costs.
 Responses reaching the output ceiling were counted as failures, and caption
 quality was not evaluated.
+
+## RTX PRO 6000 decoding and quantization comparison
+
+[`rtxpro6000-decoding-comparison-2026-09-23.csv`](rtxpro6000-decoding-comparison-2026-09-23.csv)
+records the isolated RTX experiments on two NVIDIA RTX PRO 6000 Blackwell
+96GB GPUs. The two-replica runs assign one TP1 replica per GPU; the four-replica
+run assigns two TP1 replicas per GPU. Aggregate concurrency is 64 and the
+benchmark uses greedy decoding unless noted. The 512 requests cycle 100 frozen
+dataset samples, so this is a throughput benchmark rather than a 512-example
+quality evaluation. Output-ceiling responses count as failures, and caption
+quality has not yet been reviewed.
+
+| Model / decoding | Replicas | Batch budget | Successful | Wall (s) | Successful samples/hour |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Qwen3.8-27B FP8, sampled | 2 | 16K | 476/512 | 153.15 | 11,189.15 |
+| Qwen3.8-27B FP8, greedy | 2 | 16K | 478/512 | 149.27 | 11,527.84 |
+| Qwen3.8-27B FP8, greedy | 2 | 32K | 479/512 | 148.95 | 11,576.99 |
+| Qwen3.8-27B NVFP4, greedy | 2 | 16K | 483/512 | 117.83 | **14,756.96** |
+| Qwen3.8-27B NVFP4, greedy, 12GiB KV/engine | 4 (2/GPU) | 16K | 472/512 | 145.41 | 11,685.80 |
+
+The current winner is **NVFP4 with two total replicas at aggregate
+concurrency 64**, at 14,756.96 successful samples/hour. Four colocated
+replicas were slower and had more failures, so that topology is rejected for
+production. The NVFP4 result is 31.9% faster than the FP8 sampled baseline and
+28.0% faster than the equivalent FP8 greedy 16K configuration.
