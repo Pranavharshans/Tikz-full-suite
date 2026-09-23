@@ -24,7 +24,7 @@ sys.modules["build_dataset"] = b
 SPEC.loader.exec_module(b)
 
 from test_build_dataset import (  # noqa: E402
-    FakeEngine, FakePromptBuilder, TINY_PNG, make_work_fixture,
+    FakeEngine, FakePromptBuilder, TINY_PNG, fail_result, make_work_fixture,
 )
 
 
@@ -62,14 +62,16 @@ class LocalWorkerHandle:
 class LocalSpawner:
     """Runs run_worker in a thread with an injected fake engine."""
 
-    def __init__(self, engine_factory, prompt_builder_factory=None, on_spawn=None):
+    def __init__(self, engine_factory, prompt_builder_factory=None, on_spawn=None,
+                 outcomes=None):
         self.engine_factory = engine_factory
         self.prompt_builder_factory = prompt_builder_factory or (lambda job: FakePromptBuilder(job))
         self.on_spawn = on_spawn
+        self.outcomes = outcomes
         self.handles = []
 
     def __call__(self, *, job_path, worker_index, device, args, work):
-        outcome = {}
+        outcome = self.outcomes.setdefault(worker_index, {}) if self.outcomes is not None else {}
 
         def target():
             try:
@@ -102,6 +104,38 @@ class GatedEngine(FakeEngine):
         deadline = time.time() + 15
         while not self.gate_path.exists() and time.time() < deadline:
             time.sleep(0.005)
+        return super().generate(items)
+
+
+class StallingEngine(FakeEngine):
+    """Fake engine that stalls once, then runs slowly, honoring terminate/kill signals."""
+
+    def __init__(self, job, *, outcome, stall_seconds, slow_seconds=0.0, log_path=None):
+        super().__init__(job, log_path=log_path)
+        self.outcome = outcome
+        self.stall_seconds = stall_seconds
+        self.slow_seconds = slow_seconds
+        self.stalled_once = False
+
+    def generate(self, items):
+        if not self.outcome.get("stalled"):
+            self.outcome["stalled"] = True
+            deadline = time.time() + self.stall_seconds
+            while time.time() < deadline:
+                if self.outcome.get("terminated"):
+                    raise RuntimeError("terminated by the controller")
+                time.sleep(0.005)
+        elif not self.outcome.get("slow_done"):
+            # The restarted instance is deliberately slow so a stale kill
+            # deadline has time to fire.
+            self.outcome["slow_done"] = True
+            deadline = time.time() + self.slow_seconds
+            while time.time() < deadline:
+                if self.outcome.get("killed"):
+                    break
+                time.sleep(0.005)
+        if self.outcome.get("killed"):
+            raise SystemExit(137)
         return super().generate(items)
 
 
@@ -411,6 +445,58 @@ class FaultInjectionTests(unittest.TestCase):
             second = b.ControllerLock(self.work)
             second.acquire()
 
+    def test_retry_wait_does_not_spin_on_out_of_window_retry(self):
+        """A past-due retry outside the index window must not busy-spin the controller."""
+        args = run_args(self.work)
+        config = b.config_from_args(args, manifest_meta=self.meta, container_sha256="b" * 64,
+                                    require_pinned=True)
+        index = b.manifest_index(self.work)
+        with b.Ledger(self.work).open() as ledger:
+            ledger.initialize(b.ledger_identity_from_config(config, self.meta))
+            ledger.seed(iter(b.iter_manifest(self.work)), rows_frozen=12)
+            policy = b.RetryPolicy(backoff_base_seconds=0)
+            target = [row for row in ledger.eligible() if row["source_row_index"] == 0]
+            claims = ledger.claim(b.balanced_assignment(target, index, workers=2), policy=policy)
+            owner = next(worker for worker, rows in claims.items() if rows)
+            ledger.record_result(fail_result(self.entries[0]["row_id"], 0, worker=owner),
+                                 policy=policy)
+        with b.Ledger(self.work, read_only=True) as ledger:
+            self.assertEqual(ledger.get(self.entries[0]["row_id"])["state"], b.STATE_RETRYABLE)
+        output = io.StringIO()
+        with slurm_env(), contextlib.redirect_stdout(output):
+            code = b.cmd_run(run_args(self.work, "--start-index", "6", "--end-index", "11"),
+                             deps=LocalDeps(LocalSpawner(self.engine_factory())))
+        self.assertNotIn("Waiting 0s", output.getvalue())
+        self.assertEqual(code, 3)
+        with b.Ledger(self.work, read_only=True) as ledger:
+            self.assertEqual(ledger.get(self.entries[0]["row_id"])["state"], b.STATE_RETRYABLE)
+            self.assertEqual(ledger.counts()["states"]["complete"], 6)
+
+    def test_stalled_worker_restart_is_not_killed_by_a_stale_deadline(self):
+        outcomes = {}
+        stall_log = self.work / "stall.log"
+
+        def engine_factory(job):
+            if job["worker_index"] == 0:
+                return StallingEngine(job, outcome=outcomes.setdefault(0, {}),
+                                      stall_seconds=3, slow_seconds=0.15,
+                                      log_path=stall_log)
+            return FakeEngine(job, log_path=stall_log)
+
+        spawner = LocalSpawner(engine_factory, outcomes=outcomes)
+        with slurm_env():
+            code = b.cmd_run(run_args(self.work, "--concurrency", "4",
+                                      "--worker-timeout", "0.3",
+                                      "--stall-kill-grace-seconds", "0.05",
+                                      "--worker-restarts", "1"),
+                             deps=LocalDeps(spawner))
+        self.assertEqual(code, 0)
+        states, complete, _ = read_states(self.work)
+        self.assertEqual(states["complete"], 12)
+        self.assertEqual(states["retryable"] + states["running"] + states["pending"], 0)
+        for row in complete:
+            self.assertEqual(row["instruction"], f"Instruction for {row['row_id']}")
+
     def test_run_guards(self):
         spawner = LocalSpawner(self.engine_factory())
         # No --allow-non-slurm here: the production guard must refuse outright.
@@ -634,11 +720,17 @@ class AuditAndStatusTests(unittest.TestCase):
         failed = {check["name"] for check in report["checks"] if check["status"] == "fail"}
         self.assertIn("ledger.complete_rows_have_instructions", failed)
 
-    def test_audit_fails_on_instruction_reuse(self):
-        self.sql("UPDATE rows SET instruction = 'the same caption' WHERE source_row_index IN (1, 4)")
+    def test_audit_warns_on_instruction_reuse(self):
+        # Identical greedy captions are legitimate; the audit warns with evidence.
+        caption = "Draw the same circle with a labelled radius line"
+        self.sql("UPDATE rows SET instruction = ? WHERE source_row_index IN (1, 4)",
+                 (caption,))
         report = b.run_audit(self.work)
-        failed = {check["name"] for check in report["checks"] if check["status"] == "fail"}
-        self.assertIn("ledger.instructions_attached_to_one_row", failed)
+        self.assertEqual(report["violations"], 0)
+        warning = next(check for check in report["checks"]
+                       if check["name"] == "ledger.instructions_attached_to_one_row")
+        self.assertEqual(warning["status"], "warn")
+        self.assertIn("appear on multiple rows", warning["detail"])
 
     def test_audit_fails_on_manifest_tampering(self):
         with b.manifest_path(self.work).open("a") as handle:

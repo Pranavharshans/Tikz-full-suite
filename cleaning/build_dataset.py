@@ -35,6 +35,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+import traceback
 from dataclasses import dataclass, field
 from itertools import islice
 from pathlib import Path
@@ -438,7 +439,7 @@ def verify_run_record(work, config: RunConfig) -> dict:
 
 def write_run_record(work, config: RunConfig) -> dict:
     record = build_run_record(config)
-    bench.dump(run_record_path(work), record)
+    write_json_atomic(run_record_path(work), record)
     return record
 
 
@@ -555,6 +556,10 @@ PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 class ManifestError(RuntimeError):
     """Raised when a frozen manifest is missing, partial, or inconsistent."""
+
+
+class IncompleteFreezeError(ManifestError):
+    """Raised when a freeze was interrupted; the work directory can re-freeze."""
 
 
 @dataclass(frozen=True)
@@ -756,6 +761,28 @@ def clean_incomplete_freeze(work) -> list[str]:
     return removed
 
 
+def verify_staged_freeze(manifest_tmp, stage_images, expected_rows: int) -> None:
+    """Read back the staged freeze and verify every image hash before committing."""
+    count = 0
+    with Path(manifest_tmp).open("rb") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            entry = json.loads(line)
+            if entry["status"] == "valid" and stage_images is not None:
+                image = Path(stage_images) / Path(entry["image"]).name
+                if not image.is_file():
+                    raise ManifestError(
+                        f"Staged image missing at source row {entry['source_row_index']}")
+                if sha256_file(image) != entry["image_sha256"]:
+                    raise ManifestError(
+                        f"Staged image checksum mismatch at source row "
+                        f"{entry['source_row_index']}")
+            count += 1
+    if count != expected_rows:
+        raise ManifestError(f"Staged freeze holds {count} rows, expected {expected_rows}")
+
+
 def freeze_source(rows, *, work, dataset_id: str, revision: str, split: str,
                   limits: FreezeLimits, meta_extra: dict | None = None,
                   row_limit: int = ROW_LIMIT, write_images: bool = True,
@@ -798,6 +825,13 @@ def freeze_source(rows, *, work, dataset_id: str, revision: str, split: str,
                 f"{row_limit} source rows. Check the pinned revision and split.")
         manifest_sha = sha256_file(manifest_tmp)
         manifest_bytes = manifest_tmp.stat().st_size
+        # Read the staged freeze back before committing: a node crash or a bad
+        # write must fail here, while no authoritative marker exists yet.
+        if progress_every:
+            print("  verifying staged freeze (image hashes) ...", flush=True)
+        verify_staged_freeze(manifest_tmp, stage_images if write_images else None, row_limit)
+        fsync_dir(stage_images)
+        fsync_dir(staging)
         final_images = images_dir(work)
         if final_images.exists():
             shutil.rmtree(final_images)
@@ -824,7 +858,7 @@ def freeze_source(rows, *, work, dataset_id: str, revision: str, split: str,
             "freeze_limits": dataclasses.asdict(limits),
         }
         meta.update(meta_extra or {})
-        bench.dump(manifest_meta_path(work), meta)
+        write_json_atomic(manifest_meta_path(work), meta)
         fsync_dir(work)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
@@ -839,7 +873,11 @@ def verify_manifest(work, *, quick: bool = True) -> dict:
         raise ManifestError(
             f"No frozen manifest at {meta_file}. A manifest is authoritative only after "
             "prepare writes manifest.meta.json.")
-    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    try:
+        meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as exc:
+        raise IncompleteFreezeError(
+            f"manifest.meta.json is not valid JSON ({exc}); the freeze was interrupted") from exc
     if meta.get("schema_version") != MANIFEST_SCHEMA_VERSION:
         raise ManifestError(f"Manifest schema {meta.get('schema_version')!r} is not supported")
     path = manifest_path(work)
@@ -874,6 +912,9 @@ def verify_manifest(work, *, quick: bool = True) -> dict:
                 image_path = work / entry["image"]
                 if not image_path.is_file():
                     raise ManifestError(f"Image missing for source row {index}: {image_path}")
+                if image_path.stat().st_size == 0:
+                    raise ManifestError(
+                        f"Image is empty for source row {index}; the freeze is damaged")
                 if not quick and sha256_file(image_path) != entry["image_sha256"]:
                     raise ManifestError(f"Image checksum mismatch at source row {index}")
             elif entry["status"] == "rejected":
@@ -963,24 +1004,31 @@ def cmd_prepare(args, deps=None) -> int:
                           max_image_bytes=args.max_image_bytes,
                           estimate_rows=args.estimate_rows)
     if manifest_meta_path(work).is_file():
-        meta = verify_manifest(work, quick=True)
-        check_manifest_agreement(args, meta)
-        model_path = meta.get("model_path", "")
-        if args.download_model and (not model_path or not Path(model_path).is_dir()):
+        try:
+            meta = verify_manifest(work, quick=True)
+        except IncompleteFreezeError as exc:
+            # A torn meta file from an interrupted freeze: clean and re-freeze.
+            print(f"Existing manifest marker is unusable ({exc}); re-freezing", flush=True)
+            clean_incomplete_freeze(work)
+            meta = None
+        if meta is not None:
+            check_manifest_agreement(args, meta)
+            model_path = meta.get("model_path", "")
+            if args.download_model and (not model_path or not Path(model_path).is_dir()):
+                if model_path:
+                    print(f"Recorded model snapshot is missing ({model_path}); re-downloading")
+                model_path = deps.download_model(args, meta["model_revision"])
+                meta["model_path"] = model_path
+                write_json_atomic(manifest_meta_path(work), meta)
+            print(f"Reusing frozen manifest: {manifest_path(work)}")
+            print(f"  rows={meta['rows_frozen']} valid={meta['valid_rows']} "
+                  f"rejected={meta['rejected_rows']} dataset_revision={meta['dataset_revision']}")
+            print(f"  model_revision={meta['model_revision']}")
             if model_path:
-                print(f"Recorded model snapshot is missing ({model_path}); re-downloading")
-            model_path = deps.download_model(args, meta["model_revision"])
-            meta["model_path"] = model_path
-            bench.dump(manifest_meta_path(work), meta)
-        print(f"Reusing frozen manifest: {manifest_path(work)}")
-        print(f"  rows={meta['rows_frozen']} valid={meta['valid_rows']} "
-              f"rejected={meta['rejected_rows']} dataset_revision={meta['dataset_revision']}")
-        print(f"  model_revision={meta['model_revision']}")
-        if model_path:
-            print(f"  model_path={model_path}")
-        if meta.get("rejection_counts"):
-            print(f"  rejection_counts={meta['rejection_counts']}")
-        return 0
+                print(f"  model_path={model_path}")
+            if meta.get("rejection_counts"):
+                print(f"  rejection_counts={meta['rejection_counts']}")
+            return 0
     work.mkdir(parents=True, exist_ok=True)
     removed = clean_incomplete_freeze(work)
     if removed:
@@ -1038,9 +1086,9 @@ TRANSIENT_CATEGORIES = frozenset({
     "worker_lost", "worker_stall",
 })
 NON_COUNTING_CATEGORIES = frozenset({"stale_claim", "run_interrupted"})
-PERMANENT_CATEGORIES = frozenset({
-    "input_invalid", "integrity", "input_too_long", "truncated_at_ceiling",
-    "transient_exhausted", "invalid_instruction",
+# Row-level failures that must never be retried (deterministic or source damage).
+IMMEDIATE_REJECT_CATEGORIES = frozenset({
+    "input_invalid", "integrity", "input_too_long", "invalid_instruction",
 })
 
 LEDGER_SCHEMA = """
@@ -1090,6 +1138,11 @@ CREATE TABLE IF NOT EXISTS attempts (
     model_revision TEXT,
     prompt_sha256 TEXT,
     config_hash TEXT
+);
+CREATE TABLE IF NOT EXISTS consumed_files (
+    sha256 TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    consumed_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS attempts_by_row ON attempts(row_id);
 CREATE INDEX IF NOT EXISTS rows_by_state ON rows(state, source_row_index);
@@ -1147,7 +1200,7 @@ def decide_result(result: dict, attempts, policy: RetryPolicy) -> Decision:
         return Decision(STATE_COMPLETE, "ok", "none")
     category = result.get("error_category") or "engine_transient"
     detail = result.get("error_detail") or ""
-    if category in ("integrity", "input_too_long", "invalid_instruction"):
+    if category in IMMEDIATE_REJECT_CATEGORIES:
         return Decision(STATE_REJECTED, category, category, detail=detail)
     if result.get("finish_reason") == "length":
         retry_attempted = any((attempt.get("max_tokens") or 0) >= policy.truncation_max_tokens
@@ -1367,9 +1420,12 @@ class Ledger:
         return [dict(row) for row in self.conn.execute(
             "SELECT * FROM attempts ORDER BY row_id, attempt_id")]
 
-    def next_retry_time(self) -> float | None:
+    def next_retry_time(self, *, start_index: int = 0,
+                        end_index: int = ROW_LIMIT - 1) -> float | None:
         row = self.conn.execute(
-            "SELECT MIN(not_before) AS t FROM rows WHERE state = ?", (STATE_RETRYABLE,)).fetchone()
+            "SELECT MIN(not_before) AS t FROM rows WHERE state = ? "
+            "AND source_row_index BETWEEN ? AND ?",
+            (STATE_RETRYABLE, start_index, end_index)).fetchone()
         return row["t"] if row and row["t"] is not None else None
 
     def complete_rows(self) -> list[dict]:
@@ -1454,11 +1510,22 @@ class Ledger:
             return self._record_result_locked(result, policy, time.time() if now is None else now)
 
     def record_results(self, results, *, policy: RetryPolicy,
-                       now: float | None = None) -> list[str]:
-        """Commit a batch of results in one transaction."""
+                       now: float | None = None, consumed_file=None) -> list[str]:
+        """Commit a batch of results and mark its file consumed, atomically."""
         moment = time.time() if now is None else now
         with self.transaction():
-            return [self._record_result_locked(result, policy, moment) for result in results]
+            states = [self._record_result_locked(result, policy, moment)
+                      for result in results]
+            if consumed_file is not None:
+                sha256, name = consumed_file
+                self.conn.execute(
+                    "INSERT OR IGNORE INTO consumed_files (sha256, name, consumed_at) "
+                    "VALUES (?, ?, ?)", (sha256, name, moment))
+        return states
+
+    def file_consumed(self, sha256: str) -> bool:
+        return self.conn.execute(
+            "SELECT 1 FROM consumed_files WHERE sha256 = ?", (sha256,)).fetchone() is not None
 
     def _record_result_locked(self, result: dict, policy: RetryPolicy, now: float) -> str:
         row_id = result["row_id"]
@@ -1594,11 +1661,16 @@ class Ledger:
         while target.exists():
             suffix += 1
             target = directory / f"ledger-{stamp}-{suffix}.sqlite3"
-        backup = sqlite3.connect(str(target))
+        temporary = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+        backup = sqlite3.connect(str(temporary))
         try:
             self.conn.backup(backup)
         finally:
             backup.close()
+        with temporary.open("rb") as handle:
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+        fsync_dir(directory)
         return target
 
 
@@ -1678,10 +1750,10 @@ class VllmOfflineEngine:
         if config["mtp"]:
             options["speculative_config"] = dict(method="mtp",
                                                  num_speculative_tokens=config["mtp"])
-        bench.dump(Path(job["engine_options_path"]), options)
+        write_json_atomic(Path(job["engine_options_path"]), options)
         self.llm = LLM(**options)
         import vllm
-        bench.dump(Path(job["versions_path"]),
+        write_json_atomic(Path(job["versions_path"]),
                    dict(python=sys.version, engine=vllm.__version__))
 
     def generate(self, items: list) -> list[EngineOutput]:
@@ -1702,17 +1774,21 @@ class VllmOfflineEngine:
         return results
 
 
-def write_json_atomic(path, value) -> None:
-    bench.dump(path, value)
-
-
 def write_text_atomic(path, text: str) -> None:
+    """Write a file durably: unique tmp, fsync, atomic rename, fsync directory."""
     path = Path(path)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(text, encoding="utf-8")
-    with temporary.open("rb") as handle:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        handle.write(text)
+        handle.flush()
         os.fsync(handle.fileno())
     os.replace(temporary, path)
+    fsync_dir(path.parent)
+
+
+def write_json_atomic(path, value) -> None:
+    write_text_atomic(path, json.dumps(value, indent=2, ensure_ascii=False))
 
 
 def worker_base_result(task: dict, config: dict, worker: str, batch_index: int) -> dict:
@@ -1751,9 +1827,10 @@ def prepare_task(task: dict, builder, config: dict, worker: str, batch_index: in
     except Exception as exc:
         return error_result(task, config, worker, batch_index, "decode",
                             f"prompt build failed: {exc!r}")
-    if length >= config["context"]:
+    if length + int(task["max_tokens"]) > config["context"]:
         return error_result(task, config, worker, batch_index, "input_too_long",
-                            f"input {length} tokens >= context {config['context']}")
+                            f"input {length} + max_tokens {task['max_tokens']} exceeds "
+                            f"context {config['context']}")
     return dict(task=task, prompt=prompt, image=image, length=length,
                 max_tokens=task["max_tokens"])
 
@@ -1771,12 +1848,19 @@ def generated_result(item: dict, output: EngineOutput, config: dict, worker: str
     return result
 
 
-def validate_outputs(outputs: list, items: list) -> None:
+def validate_outputs(outputs: list, items: list, require_prompt_echo: bool = True) -> None:
     """Refuse to trust engine outputs whose association with inputs is unclear."""
     if len(outputs) != len(items):
         raise WorkerError(f"engine returned {len(outputs)} outputs for {len(items)} inputs")
     for item, output in zip(items, outputs):
-        if output.prompt is not None and output.prompt != item["prompt"]:
+        if output.prompt is None:
+            if require_prompt_echo:
+                raise WorkerError(
+                    "engine did not echo the request prompt; refusing positional "
+                    "association (override with --allow-missing-prompt-echo only if "
+                    "the engine guarantees input order)")
+            continue
+        if output.prompt != item["prompt"]:
             raise WorkerError(
                 f"engine prompt for {item['task']['row_id']} does not match the request")
 
@@ -1805,7 +1889,8 @@ def process_batch(*, job: dict, batch: list, batch_index: int, engine, builder,
             outputs = engine.generate([dict(prompt=item["prompt"], image=item["image"],
                                             max_tokens=item["max_tokens"],
                                             row_id=item["task"]["row_id"]) for item in items])
-            validate_outputs(outputs, items)
+            validate_outputs(outputs, items,
+                             require_prompt_echo=config.get("require_prompt_echo", True))
         except Exception as exc:
             engine_error = exc
             for item in items:
@@ -1899,6 +1984,7 @@ def run_worker(job_path, *, engine_factory=None, prompt_builder_factory=None) ->
                     engine_failed = True
     except Exception as exc:
         log(f"worker crashed: {exc!r}")
+        traceback.print_exc()
         return 3
     log(f"finished {rows_done} rows")
     return 3 if engine_failed else 0
@@ -1987,7 +2073,7 @@ def container_sha256(path, cache_path=None) -> str:
             return cached["sha256"]
     digest = sha256_file(path)
     if cache_path is not None:
-        bench.dump(cache_path, dict(key=key, sha256=digest))
+        write_json_atomic(cache_path, dict(key=key, sha256=digest))
     return digest
 
 
@@ -2107,8 +2193,10 @@ def write_worker_job(path, *, args, config, work, worker_index: int, generation:
             gpu_memory_utilization=config.inference.gpu_memory_utilization,
             max_output_tokens=config.inference.max_output_tokens,
             truncation_retry_tokens=config.inference.truncation_retry_tokens,
-            warmup_samples=args.warmup_samples, config_hash=config.identity_sha256()))
-    bench.dump(path, job)
+            warmup_samples=args.warmup_samples,
+            require_prompt_echo=getattr(args, "require_prompt_echo", True),
+            config_hash=config.identity_sha256()))
+    write_json_atomic(path, job)
     return Path(path)
 
 
@@ -2133,57 +2221,89 @@ def validate_result_identity(result: dict, config, index: dict) -> str | None:
     return None
 
 
+def move_aside(path, destination_dir) -> Path:
+    """Move a file into a directory, keeping a unique name."""
+    path, destination_dir = Path(path), Path(destination_dir)
+    destination_dir.mkdir(parents=True, exist_ok=True)
+    destination = destination_dir / path.name
+    suffix = 0
+    while destination.exists():
+        suffix += 1
+        destination = destination_dir / f"{path.name}.{suffix}"
+    os.replace(path, destination)
+    return destination
+
+
 def ingest_result_files(*, ledger, work, config, index, policy) -> dict:
-    """Commit every unconsumed result file, then move it to consumed/."""
+    """Commit every unconsumed result file, then move it out of the results tree.
+
+    Files whose content was already committed (tracked by SHA256 in the ledger)
+    are moved without reprocessing, so a crash between commit and move cannot
+    double-count retries.  Files that cannot be processed are quarantined as
+    evidence instead of blocking every future resume.
+    """
     work = Path(work)
     results_root = work / "runtime" / "results"
     consumed_root = work / "runtime" / "consumed"
+    quarantine_root = work / "runtime" / "quarantine"
     seen: dict[str, set] = {}
     if not results_root.is_dir():
         return seen
     for path in sorted(results_root.glob("worker-*/*.json")):
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if data.get("run_id") != config.run_id():
-            raise PipelineIdentityError(
-                f"Result file {path} belongs to run {data.get('run_id')!r}, not {config.run_id()!r}")
-        worker = data.get("worker")
-        if worker != f"worker-{data.get('worker_index')}":
-            raise PipelineIdentityError(f"Result file {path} has an inconsistent worker label")
-        results, row_ids = [], []
-        for result in data.get("results", []):
-            if result.get("worker") != worker:
+        sha256 = sha256_file(path)
+        worker_dir = path.parent.name
+        if ledger.file_consumed(sha256):
+            move_aside(path, consumed_root / worker_dir)
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            if data.get("run_id") != config.run_id():
                 raise PipelineIdentityError(
-                    f"Result for {result.get('row_id')} claims worker {result.get('worker')!r} "
-                    f"but arrived in {worker}'s file")
-            if result["row_id"] in row_ids:
+                    f"Result file {path.name} belongs to run {data.get('run_id')!r}, "
+                    f"not {config.run_id()!r}")
+            worker = data.get("worker")
+            if worker != f"worker-{data.get('worker_index')}":
                 raise PipelineIdentityError(
-                    f"Duplicate result for {result['row_id']} inside {path}")
-            reason = validate_result_identity(result, config, index)
-            if reason is not None:
-                result = dict(result, ok=False, instruction=None, finish_reason=None,
-                              error_category="integrity", error_detail=reason)
-            elif result.get("ok"):
-                # Semantic validation is authoritative here and never retried:
-                # greedy decoding would reproduce the same invalid text.
-                valid, rule, detail = validate_instruction(result.get("instruction"),
-                                                           config.validation)
-                if not valid:
-                    result = dict(result, ok=False, instruction=None,
-                                  error_category="invalid_instruction",
-                                  error_detail=f"{rule}: {detail}" if detail else rule)
-            row = ledger.get(result["row_id"])
-            if row is None:
-                raise PipelineIdentityError(f"Result for unknown row {result['row_id']}")
-            if row["state"] == STATE_RUNNING and row["worker"] != worker:
-                raise PipelineIdentityError(
-                    f"Row {result['row_id']} is claimed by {row['worker']!r} but a result "
-                    f"arrived from {worker!r}")
-            results.append(result)
-            row_ids.append(result["row_id"])
-        ledger.record_results(results, policy=policy)
-        destination = consumed_root / worker / path.name
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        os.replace(path, destination)
+                    f"Result file {path.name} has an inconsistent worker label")
+            results, row_ids = [], []
+            for result in data.get("results", []):
+                if result.get("worker") != worker:
+                    raise PipelineIdentityError(
+                        f"Result for {result.get('row_id')} claims worker "
+                        f"{result.get('worker')!r} but arrived in {worker}'s file")
+                if result["row_id"] in row_ids:
+                    raise PipelineIdentityError(
+                        f"Duplicate result for {result['row_id']} inside {path.name}")
+                reason = validate_result_identity(result, config, index)
+                if reason is not None:
+                    result = dict(result, ok=False, instruction=None, finish_reason=None,
+                                  error_category="integrity", error_detail=reason)
+                elif result.get("ok"):
+                    # Semantic validation is authoritative here and never retried:
+                    # greedy decoding would reproduce the same invalid text.
+                    valid, rule, detail = validate_instruction(result.get("instruction"),
+                                                               config.validation)
+                    if not valid:
+                        result = dict(result, ok=False, instruction=None,
+                                      error_category="invalid_instruction",
+                                      error_detail=f"{rule}: {detail}" if detail else rule)
+                row = ledger.get(result["row_id"])
+                if row is None:
+                    raise PipelineIdentityError(f"Result for unknown row {result['row_id']}")
+                if row["state"] == STATE_RUNNING and row["worker"] != worker:
+                    raise PipelineIdentityError(
+                        f"Row {result['row_id']} is claimed by {row['worker']!r} but a result "
+                        f"arrived from {worker!r}")
+                results.append(result)
+                row_ids.append(result["row_id"])
+        except (json.JSONDecodeError, PipelineIdentityError, OSError) as exc:
+            destination = move_aside(path, quarantine_root)
+            print(f"WARNING: quarantined unprocessable result file {destination}: {exc}",
+                  flush=True)
+            continue
+        ledger.record_results(results, policy=policy,
+                              consumed_file=(sha256, path.name))
+        move_aside(path, consumed_root / worker_dir)
         seen.setdefault(worker, set()).update(row_ids)
     return seen
 
@@ -2310,13 +2430,14 @@ def run_wave(*, args, config, work, deps, ledger, index, policy, wave, stop_flag
                         print(f"{worker} stalled for {args.worker_timeout}s; terminating",
                               flush=True)
                         handle.terminate()
-                        stall_deadline[worker_index] = now + 60
+                        stall_deadline[worker_index] = now + args.stall_kill_grace_seconds
                     elif worker_index in stall_deadline and now > stall_deadline[worker_index]:
                         print(f"{worker} did not exit; killing", flush=True)
                         handle.kill()
                     continue
                 # Worker exited: sweep its final results, then restart or release.
                 ingest()
+                stall_deadline.pop(worker_index, None)
                 if outstanding[worker_index]:
                     if restarts[worker_index] >= args.worker_restarts:
                         print(f"{worker} exited rc={handle.returncode} with "
@@ -2409,6 +2530,15 @@ def run_pipeline(args, config, meta, deps, stop_flag=None) -> dict:
     """Wave-based controller: claim, run, ingest, reclaim, repeat."""
     work = Path(args.work).resolve()
     stop_flag = stop_flag or StopFlag()
+    lock = ControllerLock(work)
+    lock.acquire()
+    try:
+        return _run_pipeline_locked(args, config, meta, deps, stop_flag, work)
+    finally:
+        lock.release()
+
+
+def _run_pipeline_locked(args, config, meta, deps, stop_flag, work) -> dict:
     policy = RetryPolicy(max_transient_attempts=args.max_transient_attempts,
                          backoff_base_seconds=args.retry_backoff_base_seconds,
                          backoff_cap_seconds=args.retry_backoff_cap_seconds,
@@ -2419,8 +2549,6 @@ def run_pipeline(args, config, meta, deps, stop_flag=None) -> dict:
     deadline = started + args.max_runtime_minutes * 60 if args.max_runtime_minutes else None
     ledger = Ledger(work).open()
     claimed_so_far = 0
-    lock = ControllerLock(work)
-    lock.acquire()
     try:
         # A leftover stop marker from an interrupted run must not stop this one.
         stop_path = work / "runtime" / "stop"
@@ -2457,13 +2585,15 @@ def run_pipeline(args, config, meta, deps, stop_flag=None) -> dict:
                 break
             if not ledger.eligible(start_index=args.start_index, end_index=args.end_index,
                                    limit=1):
-                next_retry = ledger.next_retry_time()
+                next_retry = ledger.next_retry_time(start_index=args.start_index,
+                                                    end_index=args.end_index)
                 now = time.time()
-                if (next_retry is not None and next_retry - now <= args.retry_wait_seconds
-                        and (deadline is None or now + (next_retry - now) < deadline)):
-                    wait = max(0.0, next_retry - now)
-                    print(f"Waiting {wait:.0f}s for retry backoff", flush=True)
-                    deps.sleep(wait)
+                # Only a strictly future, in-window retry is worth waiting for.
+                if (next_retry is not None and now < next_retry
+                        and next_retry - now <= args.retry_wait_seconds
+                        and (deadline is None or next_retry < deadline)):
+                    print(f"Waiting {next_retry - now:.0f}s for retry backoff", flush=True)
+                    deps.sleep(next_retry - now)
                     continue
                 break
             claimed_so_far += run_wave(
@@ -2485,7 +2615,6 @@ def run_pipeline(args, config, meta, deps, stop_flag=None) -> dict:
         return dict(states=states, remaining=remaining, elapsed_s=elapsed,
                     exit_code=0 if remaining == 0 else 3)
     finally:
-        lock.release()
         ledger.close()
 
 
@@ -2557,6 +2686,7 @@ def cmd_run(args, deps=None) -> int:
 # ---------------------------------------------------------------------------
 
 EXPORT_SCHEMA_VERSION = "export-v1"
+STALL_KILL_GRACE_SECONDS = 60.0
 
 
 class ExportError(RuntimeError):
@@ -2669,7 +2799,7 @@ def logical_checksum(rows: list) -> str:
 
 
 def _merge_stream(work, cursor, row_key):
-    """Yield (manifest_entry, ledger_row) pairs by index order; strict about gaps."""
+    """Yield (manifest_entry, ledger_row) pairs by index order; strict about identity."""
     ledger_row = cursor.fetchone()
     for entry in iter_manifest(work):
         if ledger_row is None:
@@ -2680,6 +2810,11 @@ def _merge_stream(work, cursor, row_key):
             raise ExportError(
                 f"Ledger row {ledger_row[row_key]} has no manifest entry at index "
                 f"{ledger_row['source_row_index']}")
+        if entry["row_id"] != ledger_row[row_key]:
+            raise ExportError(
+                f"Ledger row {ledger_row[row_key]} is paired with manifest row "
+                f"{entry['row_id']} at index {entry['source_row_index']}; refusing to "
+                "attach content across rows")
         yield entry, dict(ledger_row)
         ledger_row = cursor.fetchone()
     if ledger_row is not None:
@@ -2696,6 +2831,10 @@ def export_dataset(work, *, export_dir=None, shard_size: int = 1000) -> dict:
     if record is None:
         raise ExportError(f"No run record at {run_record_path(work)}; nothing to export")
     identity = record["identity"]
+    if validation_rules_sha256() != identity["validation"].get("rules_sha256"):
+        raise ExportError(
+            "The live validation rules do not match the run identity; restore the "
+            "original rule tables or start a new run")
     shard_root = root / "shards"
     shard_root.mkdir(parents=True, exist_ok=True)
     schema = dataset_arrow_schema()
@@ -2711,8 +2850,8 @@ def export_dataset(work, *, export_dir=None, shard_size: int = 1000) -> dict:
             raise ExportError("Ledger does not belong to this frozen manifest")
         cursor = ledger.conn.execute(
             "SELECT row_id, source_row_index, instruction, image_sha256, tikz_sha256, "
-            "finish_reason, completed_at FROM rows WHERE state = ? "
-            "ORDER BY source_row_index", (STATE_COMPLETE,))
+            "finish_reason, prompt_sha256, config_hash, model_revision, completed_at "
+            "FROM rows WHERE state = ? ORDER BY source_row_index", (STATE_COMPLETE,))
         shards, buffer, shard_index = [], [], 0
         validation_failures = []
         total_rows = 0
@@ -2734,6 +2873,13 @@ def export_dataset(work, *, export_dir=None, shard_size: int = 1000) -> dict:
         for entry, row in _merge_stream(work, cursor, "row_id"):
             if entry["status"] != "valid":
                 raise ExportError(f"Complete row {row['row_id']} maps to a rejected manifest row")
+            if (row["finish_reason"] != "stop"
+                    or row["prompt_sha256"] != prompt["sha256"]
+                    or row["config_hash"] != record["identity_sha256"]
+                    or row["model_revision"] != model["revision"]):
+                raise ExportError(
+                    f"Complete row {row['row_id']} does not match the run identity "
+                    "(finish reason, prompt, config or model revision)")
             if sha256_text(entry["tikz_code"]) != entry["tikz_sha256"]:
                 raise ExportError(f"TikZ checksum drift for {row['row_id']}")
             image_path = work / entry["image"]
@@ -2814,8 +2960,8 @@ def export_dataset(work, *, export_dir=None, shard_size: int = 1000) -> dict:
         "rejected": rejected_written,
         "attempts": attempts_written,
     }
-    bench.dump(root / "run-metadata.json", provenance)
-    bench.dump(root / "stats.json", dict(
+    write_json_atomic(root / "run-metadata.json", provenance)
+    write_json_atomic(root / "stats.json", dict(
         states=counts["states"], attempts=counts["attempts"],
         truncation_attempts=counts["truncation_attempts"],
         error_categories=counts["error_categories"],
@@ -2824,17 +2970,17 @@ def export_dataset(work, *, export_dir=None, shard_size: int = 1000) -> dict:
         completion_tokens=counts["completion_tokens"],
         first_complete_at=counts["first_complete_at"],
         last_complete_at=counts["last_complete_at"]))
-    bench.dump(root / "checksums.json", dict(
+    write_json_atomic(root / "checksums.json", dict(
         shards=[dict(name=shard["name"], rows=shard["rows"],
                      logical_sha256=shard["logical_sha256"],
                      file_sha256=shard["file_sha256"]) for shard in shards],
         rejected=rejected_written, attempts=attempts_written,
         dataset_logical_sha256=export_meta["dataset_logical_sha256"]))
-    bench.dump(root / "validation-report.json", dict(
+    write_json_atomic(root / "validation-report.json", dict(
         status="pass", checked=total_rows, failures=[],
         rules_sha256=validation_rules_sha256()))
     write_text_atomic(root / "dataset-card.md", render_dataset_card(provenance))
-    bench.dump(root / "export.meta.json", export_meta)
+    write_json_atomic(root / "export.meta.json", export_meta)
     return export_meta
 
 
@@ -3146,6 +3292,9 @@ def run_audit(work, *, quick: bool = False, export_dir=None) -> dict:
                      f"{prompt.version} {prompt.sha256[:16]}")
     except PromptError as exc:
         report.check("run.prompt_matches_registry", False, str(exc))
+    report.check("run.validation_rules_match",
+                 validation_rules_sha256() == identity["validation"].get("rules_sha256"),
+                 "live rule tables must match the run identity")
 
     if not (work / LEDGER_FILE).is_file():
         report.check("ledger.present", False, "ledger.sqlite3 is missing")
@@ -3200,8 +3349,19 @@ def run_audit(work, *, quick: bool = False, export_dir=None) -> dict:
             "SELECT COUNT(*) FROM (SELECT instruction FROM rows WHERE state = ? AND "
             "instruction IS NOT NULL GROUP BY instruction HAVING COUNT(*) > 1)",
             (STATE_COMPLETE,)).fetchone()[0]
-        report.check("ledger.instructions_attached_to_one_row", duplicate_instructions == 0,
-                     f"{duplicate_instructions} instructions appear on multiple rows")
+        # Identical captions are legitimate under greedy decoding, so this is a
+        # warning with evidence, not a violation.
+        if duplicate_instructions:
+            report.warn("ledger.instructions_attached_to_one_row",
+                        f"{duplicate_instructions} captions appear on multiple rows; "
+                        "inspect them before assuming a misattachment")
+        else:
+            report.check("ledger.instructions_attached_to_one_row", True, "")
+        mismatched_pairs = sum(
+            1 for row in ledger.conn.execute("SELECT row_id, source_row_index FROM rows")
+            if index.get(row["row_id"], {}).get("source_row_index") != row["source_row_index"])
+        report.check("ledger.index_pairs_match_manifest", mismatched_pairs == 0,
+                     f"{mismatched_pairs} ledger rows have the wrong source index")
         orphan_attempts = ledger.conn.execute(
             "SELECT COUNT(*) FROM attempts WHERE row_id NOT IN (SELECT row_id FROM rows)"
         ).fetchone()[0]
@@ -3211,6 +3371,14 @@ def run_audit(work, *, quick: bool = False, export_dir=None) -> dict:
                                                index)
         report.check("ledger.accepted_instructions_valid", not failures,
                      f"{len(failures)} invalid accepted instructions")
+        quarantined = sorted((work / "runtime" / "quarantine").glob("*")) \
+            if (work / "runtime" / "quarantine").is_dir() else []
+        if quarantined:
+            report.warn("runtime.no_quarantined_results",
+                        f"{len(quarantined)} unprocessable result files are quarantined "
+                        f"(first: {quarantined[0].name}); their rows were reclaimed")
+        else:
+            report.check("runtime.no_quarantined_results", True, "")
 
         # Export checks, when an export exists.
         root = Path(export_dir).resolve() if export_dir else work / "export"
@@ -3266,6 +3434,20 @@ def run_audit(work, *, quick: bool = False, export_dir=None) -> dict:
                                  len(mapped) == len(exported), "")
                     report.check("export.checksums_match",
                                  not export_failures, "; ".join(export_failures[:3]))
+                    companion_failures = []
+                    if not quick:
+                        for label, entry in (("rejected", checksums.get("rejected", {})),
+                                             ("attempts", checksums.get("attempts", {}))):
+                            path = root / f"{label}.parquet"
+                            if entry.get("file_sha256") and path.is_file() and \
+                                    entry["file_sha256"] != sha256_file(path):
+                                companion_failures.append(f"{label}.parquet file checksum")
+                    report.check("export.companion_checksums_match",
+                                 not companion_failures, "; ".join(companion_failures))
+                    shard_files = sorted((root / "shards").glob("*.parquet"))
+                    report.check("export.shard_count_matches_meta",
+                                 export_meta.get("shards") == len(shard_files),
+                                 f"meta {export_meta.get('shards')} vs files {len(shard_files)}")
                     rejected_table = parquet.read_table(root / "rejected.parquet").to_pylist() \
                         if (root / "rejected.parquet").is_file() else []
                     report.check("export.rejected_matches_ledger",
@@ -3286,7 +3468,7 @@ def cmd_audit(args) -> int:
         marker = {"pass": "PASS", "fail": "FAIL", "warn": "WARN"}[check["status"]]
         detail = f" - {check['detail']}" if check["detail"] else ""
         print(f"[{marker}] {check['name']}{detail}")
-    bench.dump(Path(args.work).resolve() / "audit-report.json", report)
+    write_json_atomic(Path(args.work).resolve() / "audit-report.json", report)
     print(f"Audit: {report['status']} ({report['violations']} violations, "
           f"{report['warnings']} warnings)")
     return 1 if report["violations"] else 0
@@ -3312,7 +3494,7 @@ def cmd_validate(args) -> int:
         "rules_sha256": validation_rules_sha256(),
         "manifest_sha256": meta["manifest_sha256"],
     }
-    bench.dump(work / "validation-report.json", report)
+    write_json_atomic(work / "validation-report.json", report)
     if failures:
         print(f"Validation FAILED: {len(failures)} of {report['checked']} accepted rows")
         for failure in failures[:10]:
@@ -3412,6 +3594,8 @@ def build_slurm_script(args) -> str:
         run_flags += ["--max-rows-this-run", str(args.max_rows_this_run)]
     if args.reprocess_rejected:
         run_flags += ["--reprocess-rejected"]
+    if not getattr(args, "require_prompt_echo", True):
+        run_flags += ["--allow-missing-prompt-echo"]
     if args.model_revision:
         run_flags += ["--model-revision", args.model_revision]
     run_command = quote(["python3", script, *run_flags])
@@ -3631,6 +3815,8 @@ def build_parser() -> argparse.ArgumentParser:
                      help="In-run restarts per worker before its rows are released")
     run.add_argument("--worker-timeout", type=float, default=1800,
                      help="Kill a worker with no heartbeat for this many seconds")
+    run.add_argument("--stall-kill-grace-seconds", type=float,
+                     default=STALL_KILL_GRACE_SECONDS, help=argparse.SUPPRESS)
     run.add_argument("--poll-seconds", type=float, default=2.0)
     run.add_argument("--shutdown-grace-seconds", type=float, default=120)
     run.add_argument("--retry-wait-seconds", type=float, default=300,
@@ -3639,6 +3825,10 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Untimed warmup generations per worker (0 disables)")
     run.add_argument("--reprocess-rejected", action="store_true",
                      help="Explicitly move rejected rows back to pending")
+    run.add_argument("--allow-missing-prompt-echo", dest="require_prompt_echo",
+                     action="store_false", default=True,
+                     help="Accept engine outputs that do not echo the request prompt "
+                          "(relies on engine input ordering; off by default)")
     run.add_argument("--max-transient-attempts", type=int, default=3,
                      help="Bounded transient retry budget per row")
     run.add_argument("--retry-backoff-base-seconds", type=float, default=30.0)
@@ -3702,6 +3892,8 @@ def build_parser() -> argparse.ArgumentParser:
     slurm.add_argument("--retry-backoff-base-seconds", type=float, default=30.0)
     slurm.add_argument("--retry-backoff-cap-seconds", type=float, default=600.0)
     slurm.add_argument("--reprocess-rejected", action="store_true")
+    slurm.add_argument("--allow-missing-prompt-echo", dest="require_prompt_echo",
+                       action="store_false", default=True)
     slurm.set_defaults(handler=cmd_slurm_script)
     return parser
 
