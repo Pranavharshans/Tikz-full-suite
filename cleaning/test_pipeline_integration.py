@@ -5,6 +5,7 @@ threads with a deterministic fake engine.  No GPU, no network, no vLLM.
 """
 import contextlib
 import importlib.util
+import io
 import json
 import os
 import signal
@@ -393,6 +394,114 @@ class FaultInjectionTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "RTX PRO 6000"):
                 b.cmd_run(fixture,
                           deps=LocalDeps(spawner, gpu_names=["NVIDIA A40"] * 2))
+
+
+HAS_PYARROW = importlib.util.find_spec("pyarrow") is not None
+
+
+@unittest.skipUnless(HAS_PYARROW, "pyarrow is required for export tests")
+class ExportTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.work = Path(self.directory.name)
+        self.meta, _rows = make_work_fixture(self.work, rows=12)
+        self.entries = list(b.iter_manifest(self.work))
+        self.log = self.work / "generated.log"
+        rejected_id = self.entries[7]["row_id"]
+        with slurm_env():
+            self.assertEqual(b.cmd_run(
+                run_args(self.work),
+                deps=LocalDeps(LocalSpawner(
+                    lambda job: FakeEngine(job, log_path=self.log,
+                                           invalid_rows={rejected_id})))), 0)
+        self.rejected_id = rejected_id
+
+    def read_shards(self, root):
+        import pyarrow.parquet as parquet
+        rows = []
+        for path in sorted((root / "shards").glob("*.parquet")):
+            rows.extend(parquet.read_table(path).to_pylist())
+        return rows
+
+    def test_export_is_deterministic_and_excludes_rejected(self):
+        meta = b.export_dataset(self.work, shard_size=5)
+        self.assertEqual(meta["rows"], 11)
+        self.assertEqual(meta["shards"], 3)
+        self.assertEqual(meta["rejected_rows"], 1)
+        rows = self.read_shards(self.work / "export")
+        self.assertEqual([row["source_row_index"] for row in rows], list(range(12))[:7] + list(range(8, 12)))
+        for row in rows:
+            self.assertEqual(row["instruction"], f"Instruction for {row['id']}")
+            self.assertEqual(row["source_dataset"], b.DATASET_ID)
+            self.assertEqual(row["source_revision"], "1" * 40)
+            self.assertEqual(row["caption_model"], b.MODEL_ID)
+            self.assertEqual(row["caption_model_revision"], "2" * 40)
+            self.assertEqual(row["prompt_version"], "caption-v1")
+            self.assertEqual(b.sha256_bytes(row["png_image"]), row["image_sha256"])
+            self.assertEqual(b.sha256_text(row["tikz_code"]), row["tikz_sha256"])
+        self.assertNotIn(self.rejected_id, {row["id"] for row in rows})
+
+        import pyarrow.parquet as parquet
+        rejected = parquet.read_table(self.work / "export" / "rejected.parquet").to_pylist()
+        self.assertEqual([row["id"] for row in rejected], [self.rejected_id])
+        self.assertEqual(rejected[0]["rejection_reason"], "invalid_instruction")
+        attempts = parquet.read_table(self.work / "export" / "attempts.parquet").to_pylist()
+        self.assertEqual(len(attempts), 12)
+        checksums = json.loads((self.work / "export" / "checksums.json").read_text())
+        self.assertEqual(len(checksums["shards"]), 3)
+        self.assertTrue(all(shard["file_sha256"] for shard in checksums["shards"]))
+        self.assertTrue((self.work / "export" / "export.meta.json").is_file())
+        self.assertTrue((self.work / "export" / "run-metadata.json").is_file())
+        self.assertTrue((self.work / "export" / "stats.json").is_file())
+        report = json.loads((self.work / "export" / "validation-report.json").read_text())
+        self.assertEqual(report["status"], "pass")
+        card = (self.work / "export" / "dataset-card.md").read_text()
+        self.assertIn("DRAFT", card)
+        self.assertIn("not uploaded", card)
+        self.assertIn(b.DATASET_ID, card)
+
+    def test_export_is_idempotent(self):
+        first = b.export_dataset(self.work, shard_size=5)
+        first_checksums = json.loads((self.work / "export" / "checksums.json").read_text())
+        second = b.export_dataset(self.work, shard_size=5)
+        second_checksums = json.loads((self.work / "export" / "checksums.json").read_text())
+        self.assertEqual(first["dataset_logical_sha256"], second["dataset_logical_sha256"])
+        self.assertEqual([shard["logical_sha256"] for shard in first_checksums["shards"]],
+                         [shard["logical_sha256"] for shard in second_checksums["shards"]])
+
+    def test_export_removes_stale_shards_when_shard_size_changes(self):
+        b.export_dataset(self.work, shard_size=5)
+        self.assertEqual(len(list((self.work / "export" / "shards").glob("*.parquet"))), 3)
+        meta = b.export_dataset(self.work, shard_size=100)
+        self.assertEqual(meta["shards"], 1)
+        self.assertEqual(len(list((self.work / "export" / "shards").glob("*.parquet"))), 1)
+
+    def test_export_refuses_source_drift(self):
+        entry = self.entries[0]
+        image = self.work / entry["image"]
+        image.write_bytes(image.read_bytes() + b"corruption")
+        with self.assertRaisesRegex(b.ExportError, "Image checksum drift"):
+            b.export_dataset(self.work, shard_size=5)
+
+    def test_export_requires_a_run_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            make_work_fixture(work, rows=3)
+            with self.assertRaisesRegex(b.ExportError, "nothing to export"):
+                b.export_dataset(work)
+
+    def test_export_cli_requires_slurm_guard(self):
+        args = b.build_parser().parse_args(
+            ["export", "--work", str(self.work), "--shard-size", "5"])
+        with mock.patch.dict(os.environ, {"SLURM_JOB_ID": ""}):
+            with self.assertRaisesRegex(SystemExit, "outside a Slurm allocation"):
+                b.cmd_export(args)
+        output = io.StringIO()
+        with slurm_env(), contextlib.redirect_stdout(output):
+            self.assertEqual(b.main(["export", "--work", str(self.work), "--shard-size", "5",
+                                     "--allow-non-slurm"]), 0)
+        self.assertIn("Export complete: 11 rows in 3 shards", output.getvalue())
 
 
 if __name__ == "__main__":

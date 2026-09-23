@@ -1703,6 +1703,15 @@ def write_json_atomic(path, value) -> None:
     bench.dump(path, value)
 
 
+def write_text_atomic(path, text: str) -> None:
+    path = Path(path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(text, encoding="utf-8")
+    with temporary.open("rb") as handle:
+        os.fsync(handle.fileno())
+    os.replace(temporary, path)
+
+
 def worker_base_result(task: dict, config: dict, worker: str, batch_index: int) -> dict:
     return dict(row_id=task["row_id"], source_row_index=task["source_row_index"],
                 worker=worker, batch_index=batch_index, max_tokens=task["max_tokens"],
@@ -2491,6 +2500,357 @@ def cmd_run(args, deps=None) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Export
+# ---------------------------------------------------------------------------
+
+EXPORT_SCHEMA_VERSION = "export-v1"
+
+
+class ExportError(RuntimeError):
+    """Raised when the export cannot guarantee a consistent, complete dataset."""
+
+
+def require_pyarrow():
+    try:
+        import pyarrow  # noqa: F401
+        import pyarrow.parquet  # noqa: F401
+        return pyarrow
+    except ImportError as exc:
+        raise ExportError(
+            "pyarrow is required for export. Run export inside the vLLM container "
+            "(the image provides pyarrow through datasets) or install pyarrow.") from exc
+
+
+def dataset_arrow_schema():
+    pyarrow = require_pyarrow()
+    return pyarrow.schema([
+        pyarrow.field("id", pyarrow.string(), nullable=False),
+        pyarrow.field("source_row_index", pyarrow.int32(), nullable=False),
+        pyarrow.field("file_id", pyarrow.string()),
+        pyarrow.field("png_image", pyarrow.binary(), nullable=False),
+        pyarrow.field("tikz_code", pyarrow.string(), nullable=False),
+        pyarrow.field("instruction", pyarrow.string(), nullable=False),
+        pyarrow.field("source_dataset", pyarrow.string(), nullable=False),
+        pyarrow.field("source_revision", pyarrow.string(), nullable=False),
+        pyarrow.field("caption_model", pyarrow.string(), nullable=False),
+        pyarrow.field("caption_model_revision", pyarrow.string(), nullable=False),
+        pyarrow.field("prompt_version", pyarrow.string(), nullable=False),
+        pyarrow.field("image_sha256", pyarrow.string(), nullable=False),
+        pyarrow.field("tikz_sha256", pyarrow.string(), nullable=False),
+    ])
+
+
+def rejected_arrow_schema():
+    pyarrow = require_pyarrow()
+    return pyarrow.schema([
+        pyarrow.field("id", pyarrow.string(), nullable=False),
+        pyarrow.field("source_row_index", pyarrow.int32(), nullable=False),
+        pyarrow.field("rejection_reason", pyarrow.string()),
+        pyarrow.field("error_category", pyarrow.string()),
+        pyarrow.field("error_detail", pyarrow.string()),
+        pyarrow.field("attempt_count", pyarrow.int32(), nullable=False),
+        pyarrow.field("updated_at", pyarrow.float64()),
+        pyarrow.field("image_sha256", pyarrow.string(), nullable=False),
+        pyarrow.field("tikz_sha256", pyarrow.string(), nullable=False),
+    ])
+
+
+def attempts_arrow_schema():
+    pyarrow = require_pyarrow()
+    return pyarrow.schema([
+        pyarrow.field("row_id", pyarrow.string(), nullable=False),
+        pyarrow.field("attempt_no", pyarrow.int32(), nullable=False),
+        pyarrow.field("attempt_kind", pyarrow.string(), nullable=False),
+        pyarrow.field("state", pyarrow.string(), nullable=False),
+        pyarrow.field("worker", pyarrow.string()),
+        pyarrow.field("max_tokens", pyarrow.int32()),
+        pyarrow.field("started_at", pyarrow.float64()),
+        pyarrow.field("ended_at", pyarrow.float64()),
+        pyarrow.field("finish_reason", pyarrow.string()),
+        pyarrow.field("error_category", pyarrow.string()),
+        pyarrow.field("error_detail", pyarrow.string()),
+        pyarrow.field("prompt_tokens", pyarrow.int32()),
+        pyarrow.field("completion_tokens", pyarrow.int32()),
+        pyarrow.field("instruction", pyarrow.string()),
+        pyarrow.field("model_revision", pyarrow.string()),
+        pyarrow.field("prompt_sha256", pyarrow.string()),
+        pyarrow.field("config_hash", pyarrow.string()),
+    ])
+
+
+def write_parquet_atomic(path, rows: list, schema, identity_column: str = "id") -> dict:
+    """Write a parquet file with a tmp -> validate -> fsync -> rename lifecycle."""
+    import pyarrow.parquet as parquet
+    pyarrow = require_pyarrow()
+    path = Path(path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    table = pyarrow.Table.from_pylist(rows, schema=schema)
+    parquet.write_table(table, temporary)
+    with temporary.open("rb") as handle:
+        os.fsync(handle.fileno())
+    check = parquet.read_table(temporary)
+    if check.num_rows != len(rows):
+        temporary.unlink(missing_ok=True)
+        raise ExportError(f"Shard {path.name} failed read-back validation")
+    if len(rows) and check.column(identity_column)[0].as_py() != rows[0][identity_column]:
+        temporary.unlink(missing_ok=True)
+        raise ExportError(f"Shard {path.name} failed identity validation")
+    os.replace(temporary, path)
+    fsync_dir(path.parent)
+    return dict(rows=len(rows), file_sha256=sha256_file(path))
+
+
+def logical_row(row: dict) -> str:
+    return json.dumps(dict(id=row["id"], source_row_index=row["source_row_index"],
+                           image_sha256=row["image_sha256"], tikz_sha256=row["tikz_sha256"],
+                           instruction=row["instruction"], prompt_version=row["prompt_version"]),
+                      sort_keys=True, ensure_ascii=False)
+
+
+def logical_checksum(rows: list) -> str:
+    digest = hashlib.sha256()
+    for row in rows:
+        digest.update(logical_row(row).encode("utf-8"))
+        digest.update(b"\n")
+    return digest.hexdigest()
+
+
+def _merge_stream(work, cursor, row_key):
+    """Yield (manifest_entry, ledger_row) pairs by index order; strict about gaps."""
+    ledger_row = cursor.fetchone()
+    for entry in iter_manifest(work):
+        if ledger_row is None:
+            break
+        if entry["source_row_index"] < ledger_row["source_row_index"]:
+            continue
+        if entry["source_row_index"] > ledger_row["source_row_index"]:
+            raise ExportError(
+                f"Ledger row {ledger_row[row_key]} has no manifest entry at index "
+                f"{ledger_row['source_row_index']}")
+        yield entry, dict(ledger_row)
+        ledger_row = cursor.fetchone()
+    if ledger_row is not None:
+        raise ExportError(
+            f"Ledger row {ledger_row[row_key]} is beyond the frozen manifest")
+
+
+def export_dataset(work, *, export_dir=None, shard_size: int = 1000) -> dict:
+    """Deterministically export complete rows; idempotent for unchanged input."""
+    work = Path(work).resolve()
+    root = Path(export_dir).resolve() if export_dir else work / "export"
+    meta = verify_manifest(work, quick=True)
+    record = load_run_record(work)
+    if record is None:
+        raise ExportError(f"No run record at {run_record_path(work)}; nothing to export")
+    identity = record["identity"]
+    shard_root = root / "shards"
+    shard_root.mkdir(parents=True, exist_ok=True)
+    schema = dataset_arrow_schema()
+    source = identity["dataset"]
+    model = identity["model"]
+    prompt = identity["prompt"]
+
+    with Ledger(work, read_only=True) as ledger:
+        stored = ledger.meta()
+        if stored.get("identity_sha256") != record["identity_sha256"]:
+            raise ExportError("Ledger identity does not match run.json; refusing to export")
+        if stored.get("manifest_sha256") != meta["manifest_sha256"]:
+            raise ExportError("Ledger does not belong to this frozen manifest")
+        cursor = ledger.conn.execute(
+            "SELECT row_id, source_row_index, instruction, image_sha256, tikz_sha256, "
+            "finish_reason, completed_at FROM rows WHERE state = ? "
+            "ORDER BY source_row_index", (STATE_COMPLETE,))
+        shards, buffer, shard_index = [], [], 0
+        validation_failures = []
+        total_rows = 0
+
+        def flush_shard():
+            nonlocal buffer, shard_index
+            if not buffer:
+                return
+            path = shard_root / f"shard-{shard_index:05d}.parquet"
+            written = write_parquet_atomic(path, buffer, schema)
+            written.update(logical_sha256=logical_checksum(buffer),
+                           first_index=buffer[0]["source_row_index"],
+                           last_index=buffer[-1]["source_row_index"],
+                           name=path.name)
+            shards.append(written)
+            shard_index += 1
+            buffer = []
+
+        for entry, row in _merge_stream(work, cursor, "row_id"):
+            if entry["status"] != "valid":
+                raise ExportError(f"Complete row {row['row_id']} maps to a rejected manifest row")
+            if sha256_text(entry["tikz_code"]) != entry["tikz_sha256"]:
+                raise ExportError(f"TikZ checksum drift for {row['row_id']}")
+            image_path = work / entry["image"]
+            raw = image_path.read_bytes()
+            if sha256_bytes(raw) != entry["image_sha256"]:
+                raise ExportError(f"Image checksum drift for {row['row_id']}; refusing to export")
+            valid, rule, detail = validate_instruction(row["instruction"], ValidationPolicy(
+                min_chars=identity["validation"]["min_chars"],
+                max_chars=identity["validation"]["max_chars"],
+                max_words=identity["validation"]["max_words"]))
+            if not valid:
+                validation_failures.append(dict(id=row["row_id"], rule=rule, detail=detail))
+                continue
+            buffer.append(dict(
+                id=row["row_id"], source_row_index=row["source_row_index"],
+                file_id=entry.get("file_id"), png_image=raw,
+                tikz_code=entry["tikz_code"], instruction=row["instruction"],
+                source_dataset=source["dataset_id"], source_revision=source["revision"],
+                caption_model=model["model_id"], caption_model_revision=model["revision"],
+                prompt_version=prompt["version"], image_sha256=entry["image_sha256"],
+                tikz_sha256=entry["tikz_sha256"]))
+            total_rows += 1
+            if len(buffer) >= shard_size:
+                flush_shard()
+        flush_shard()
+        if validation_failures:
+            raise ExportError(
+                f"{len(validation_failures)} complete rows fail the validation policy; "
+                "run validate and audit before exporting")
+        # Remove shards from a previous export that this run no longer produces.
+        for stale in shard_root.glob("shard-*.parquet"):
+            if stale.name not in {shard["name"] for shard in shards}:
+                stale.unlink()
+
+        rejected_rows = []
+        cursor = ledger.conn.execute(
+            "SELECT row_id, source_row_index, rejection_reason, last_error_category, "
+            "last_error_detail, attempt_count, updated_at, image_sha256, tikz_sha256 "
+            "FROM rows WHERE state = ? ORDER BY source_row_index", (STATE_REJECTED,))
+        for entry, row in _merge_stream(work, cursor, "row_id"):
+            rejected_rows.append(dict(
+                id=row["row_id"], source_row_index=row["source_row_index"],
+                rejection_reason=row["rejection_reason"],
+                error_category=row["last_error_category"],
+                error_detail=row["last_error_detail"], attempt_count=row["attempt_count"],
+                updated_at=row["updated_at"], image_sha256=row["image_sha256"],
+                tikz_sha256=row["tikz_sha256"]))
+        rejected_path = root / "rejected.parquet"
+        rejected_written = write_parquet_atomic(rejected_path, rejected_rows,
+                                                rejected_arrow_schema())
+        attempts = ledger.all_attempts()
+        attempts_path = root / "attempts.parquet"
+        attempts_written = write_parquet_atomic(attempts_path, attempts,
+                                                attempts_arrow_schema(),
+                                                identity_column="row_id")
+        counts = ledger.counts()
+
+    export_meta = {
+        "schema_version": EXPORT_SCHEMA_VERSION,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "tool_version": TOOL_VERSION,
+        "run_id": record["run_id"],
+        "identity_sha256": record["identity_sha256"],
+        "manifest_sha256": meta["manifest_sha256"],
+        "rows": total_rows,
+        "rejected_rows": len(rejected_rows),
+        "shards": len(shards),
+        "shard_size": shard_size,
+        "dataset_logical_sha256": canonical_digest([shard["logical_sha256"] for shard in shards]),
+        "complete_rows": counts["states"]["complete"],
+    }
+    provenance = {
+        "run": record,
+        "manifest": meta,
+        "export": export_meta,
+        "counts": counts,
+        "shards": shards,
+        "rejected": rejected_written,
+        "attempts": attempts_written,
+    }
+    bench.dump(root / "run-metadata.json", provenance)
+    bench.dump(root / "stats.json", dict(
+        states=counts["states"], attempts=counts["attempts"],
+        truncation_attempts=counts["truncation_attempts"],
+        error_categories=counts["error_categories"],
+        rejection_reasons=counts["rejection_reasons"],
+        prompt_tokens=counts["prompt_tokens"],
+        completion_tokens=counts["completion_tokens"],
+        first_complete_at=counts["first_complete_at"],
+        last_complete_at=counts["last_complete_at"]))
+    bench.dump(root / "checksums.json", dict(
+        shards=[dict(name=shard["name"], rows=shard["rows"],
+                     logical_sha256=shard["logical_sha256"],
+                     file_sha256=shard["file_sha256"]) for shard in shards],
+        rejected=rejected_written, attempts=attempts_written,
+        dataset_logical_sha256=export_meta["dataset_logical_sha256"]))
+    bench.dump(root / "validation-report.json", dict(
+        status="pass", checked=total_rows, failures=[],
+        rules_sha256=validation_rules_sha256()))
+    write_text_atomic(root / "dataset-card.md", render_dataset_card(provenance))
+    bench.dump(root / "export.meta.json", export_meta)
+    return export_meta
+
+
+def render_dataset_card(provenance: dict) -> str:
+    identity = provenance["run"]["identity"]
+    source, model, prompt = identity["dataset"], identity["model"], identity["prompt"]
+    export = provenance["export"]
+    counts = provenance["counts"]
+    return "\n".join([
+        "# TikZ instruction dataset (DRAFT - not uploaded)",
+        "",
+        f"Auto-generated text-to-TikZ instructions for {export['rows']} diagrams, "
+        "derived from a frozen slice of the source dataset.",
+        "",
+        "## Source",
+        "",
+        f"- Dataset: `{source['dataset_id']}` at revision `{source['revision']}` "
+        f"(split `{source['split']}`, rows {source['row_start']}-"
+        f"{source['row_start'] + source['row_limit'] - 1})",
+        f"- Caption model: `{model['model_id']}` at revision `{model['revision']}`",
+        f"- Prompt: `{prompt['version']}` (SHA256 `{prompt['sha256'][:16]}...`)",
+        f"- Run: `{provenance['run']['run_id']}`",
+        "",
+        "## Contents",
+        "",
+        "- `shards/shard-*.parquet`: accepted rows sorted by source index",
+        "- `rejected.parquet`: rejected rows with explicit reasons",
+        "- `attempts.parquet`: full attempt history",
+        "- `checksums.json`, `run-metadata.json`, `stats.json`",
+        "",
+        "## Schema",
+        "",
+        "`id`, `source_row_index`, `file_id`, `png_image`, `tikz_code`, `instruction`, "
+        "`source_dataset`, `source_revision`, `caption_model`, `caption_model_revision`, "
+        "`prompt_version`, `image_sha256`, `tikz_sha256`",
+        "",
+        "## Counts",
+        "",
+        f"- complete: {counts['states']['complete']}",
+        f"- rejected: {counts['states']['rejected']}",
+        f"- attempts: {counts['attempts']}",
+        f"- truncated attempts: {counts['truncation_attempts']}",
+        "",
+        "## Intended use",
+        "",
+        "Supervised fine-tuning for text-to-TikZ generation: the instruction is the model "
+        "input and the TikZ code is the target output.",
+        "",
+        "## Limitations",
+        "",
+        "- Captions are model-generated and have not been human-reviewed.",
+        "- The source slice is the first rows of the split, not a random sample.",
+        "- Rejected rows are excluded from the training shards; inspect them before "
+        "assuming the dataset is complete.",
+        "- This card is a draft; publishing requires separate authorization.",
+        "",
+    ])
+
+
+def cmd_export(args) -> int:
+    require_slurm(args)
+    meta = export_dataset(args.work, export_dir=args.export_dir, shard_size=args.shard_size)
+    print(f"Export complete: {meta['rows']} rows in {meta['shards']} shards, "
+          f"{meta['rejected_rows']} rejected")
+    print(f"  dataset_logical_sha256={meta['dataset_logical_sha256']}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Slurm guard
 # ---------------------------------------------------------------------------
 
@@ -2654,6 +3014,13 @@ def build_parser() -> argparse.ArgumentParser:
     worker = subparsers.add_parser("worker", help=argparse.SUPPRESS)
     worker.add_argument("--job", required=True)
     worker.set_defaults(handler=lambda args: run_worker(args.job))
+
+    export = subparsers.add_parser(
+        "export", help="Write deterministic atomic Parquet shards for complete rows")
+    add_common_arguments(export)
+    export.add_argument("--export-dir", default="", help="Default: WORK/export")
+    export.add_argument("--shard-size", type=int, default=1000)
+    export.set_defaults(handler=cmd_export)
     return parser
 
 
