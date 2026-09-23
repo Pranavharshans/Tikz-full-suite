@@ -2259,6 +2259,11 @@ def run_wave(*, args, config, work, deps, ledger, index, policy, wave, stop_flag
         worker = f"worker-{worker_index}"
         outstanding[worker_index] = {row["row_id"] for row in claims[worker]}
         restarts[worker_index] = 0
+        if not outstanding[worker_index]:
+            continue  # no engine is started for an empty assignment
+        if worker_index >= len(devices):
+            raise SystemExit(
+                f"Worker {worker_index} needs a GPU but only {len(devices)} are visible")
         start(worker_index)
 
     def ingest():
@@ -3023,8 +3028,11 @@ def render_status(status: dict) -> str:
                      f"successful/hour (30 min window), "
                      f"{overall if overall is None else round(overall, 1)} overall")
         eta = ledger["estimated_remaining_seconds"]
-        if eta:
-            lines.append(f"ETA:      {eta / 3600:.1f} h for {states['pending'] + states['retryable'] + states['running']} "
+        remaining = states["pending"] + states["retryable"] + states["running"]
+        if remaining == 0:
+            lines.append("ETA:      done (no rows remain)")
+        elif eta:
+            lines.append(f"ETA:      {eta / 3600:.1f} h for {remaining} "
                          "remaining rows (recent rate)")
         else:
             lines.append("ETA:      unknown (no completed rows yet)")
