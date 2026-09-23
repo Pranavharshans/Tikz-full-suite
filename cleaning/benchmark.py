@@ -152,7 +152,7 @@ def prepare(args):
     root.mkdir(parents=True, exist_ok=True)
     api = HfApi()
     revision = api.dataset_info(DATASET).sha
-    model_revision = api.model_info(MODEL).sha
+    model_revision = api.model_info(args.model).sha
     # Streaming avoids downloading all image shards. This is a bounded candidate
     # pool, not a claim of globally stratified sampling across the entire dataset.
     ds = load_dataset(DATASET, split="train", revision=revision, streaming=True).cast_column(
@@ -188,9 +188,9 @@ def prepare(args):
         rows.append(dict(id=f"{i:04d}", file_id=row.get("file_id"),
                          source=row.get("source"), tikz_code=row["tikz_code"],
                          image=str(path), image_sha256=hashlib.sha256(raw).hexdigest()))
-    model_path = snapshot_download(MODEL, revision=model_revision,
+    model_path = snapshot_download(args.model, revision=model_revision,
                                    cache_dir=str(root / "hf"))
-    dump(manifest, dict(dataset=DATASET, revision=revision, model=MODEL,
+    dump(manifest, dict(dataset=DATASET, revision=revision, model=args.model,
                         model_revision=model_revision, model_path=model_path,
                         candidates=len(pool), sampling="source/code-length buckets in bounded stream pool",
                         seed=42, rows=rows))
@@ -566,6 +566,8 @@ def run_config(args, cfg, manifest):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--work", default="./tikz-benchmark")
+    parser.add_argument("--model", default=MODEL,
+                        help="Hugging Face model ID to freeze during preparation")
     parser.add_argument("--prepare", action="store_true", help="Download bounded candidate pool, freeze 100 rows and model")
     parser.add_argument("--run", action="store_true", help="Run staged sweep inside a four-GPU Slurm allocation")
     parser.add_argument("--plan", action="store_true", help="Print stages without downloading or starting engines")
@@ -625,9 +627,12 @@ def main():
         if Path(args.prepare_python).is_absolute():
             prep_cmd += ["--bind", str(Path(args.prepare_python).parent.parent)]
         prep = shlex.join(prep_cmd + [vllm, args.prepare_python, script, "--prepare", "--work", work,
+                           "--model", args.model,
                            "--candidates", str(args.candidates)])
-        reuse = shlex.join(["python3", script, "--prepare", "--work", work])
+        reuse = shlex.join(["python3", script, "--prepare", "--work", work,
+                            "--model", args.model])
         run = shlex.join(["python3", script, "--run", "--work", work,
+                          "--model", args.model,
                           "--vllm-sif", vllm, "--sglang-sif", sglang,
                           "--nccl-p2p", args.nccl_p2p,
                           "--context", str(args.context), "--startup-timeout", str(args.startup_timeout),
@@ -690,6 +695,8 @@ def main():
         setattr(args, attr, str(path))
     root = Path(args.work).resolve()
     manifest = json.loads((root / "dataset.json").read_text())
+    if manifest.get("model") != args.model:
+        raise SystemExit(f"Prepared model {manifest.get('model')!r} does not match --model {args.model!r}")
     if len(manifest["rows"]) != 100:
         raise SystemExit("Manifest must contain exactly 100 rows")
     for row in manifest["rows"]:

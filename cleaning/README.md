@@ -186,6 +186,12 @@ Use `--rtx-concurrencies 64` to run only the validated concurrency during a
 focused A/B test. The option also accepts a comma-separated subset such as
 `64,96`; its default remains the full `64,96,128,192,256` capacity sweep.
 
+Use `--model OWNER/NAME` with a fresh `--work` directory to compare another
+checkpoint without contaminating the frozen FP8 manifest. Preparation records
+the exact Hub revision and refuses to run when the requested model does not
+match the prepared manifest. Model download and preparation remain inside the
+generated Slurm job.
+
 ### Tests
 
 ```bash
