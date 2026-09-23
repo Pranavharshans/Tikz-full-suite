@@ -4,14 +4,17 @@ Synthetic fixtures only: tests never download the real dataset or model and
 never start an inference engine.
 """
 import contextlib
+import base64
 import dataclasses
 import importlib.util
 import io
 import json
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SPEC = importlib.util.spec_from_file_location(
     "build_dataset", Path(__file__).with_name("build_dataset.py"))
@@ -241,6 +244,258 @@ class PlanTests(unittest.TestCase):
         second = self.run_plan("--concurrency", "32")
         self.assertNotEqual(first["identity_sha256_provisional"],
                             second["identity_sha256_provisional"])
+
+
+# ---------------------------------------------------------------------------
+# Feature 2: manifest freeze
+# ---------------------------------------------------------------------------
+
+# A 1x1 transparent PNG used as the only real image fixture.
+TINY_PNG = base64.b64decode(
+    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==")
+
+
+def fake_row(index, tikz=None, image=TINY_PNG, **extra):
+    row = {"file_id": f"file-{index}", "source": "arxiv",
+           "tikz_code": f"\\begin{{tikzpicture}}\\draw (0,0) -- ({index},1);\\end{{tikzpicture}}" if tikz is None else tikz,
+           "png_image": {"bytes": image}}
+    row.update(extra)
+    return row
+
+
+class FakePrepareDeps(b.PrepareDeps):
+    def __init__(self, rows, dataset_revision="1" * 40, model_revision="2" * 40,
+                 model_path="/tmp/fake-model", pulled=None):
+        self.rows = rows
+        self.dataset_revision = dataset_revision
+        self.model_revision = model_revision
+        self.model_path = model_path
+        self.pulled = pulled if pulled is not None else []
+
+    def resolve_dataset_revision(self, args):
+        return self.dataset_revision
+
+    def resolve_model_revision(self, args):
+        return self.model_revision
+
+    def download_model(self, args, revision):
+        return self.model_path
+
+    def row_source(self, args, revision):
+        for row in self.rows:
+            self.pulled.append(row)
+            yield row
+
+
+def prepare_args(work, *extra):
+    return b.build_parser().parse_args(
+        ["prepare", "--work", str(work), "--allow-non-slurm", *extra])
+
+
+class RowIdentityTests(unittest.TestCase):
+    def test_stable_row_id_determinism(self):
+        base = b.stable_row_id("d", "r" * 40, "train", 7, "t" * 64, "i" * 64)
+        self.assertEqual(base, b.stable_row_id("d", "r" * 40, "train", 7, "t" * 64, "i" * 64))
+        self.assertEqual(len(base), 32)
+        for change in [("d2", "r" * 40, "train", 7, "t" * 64, "i" * 64),
+                       ("d", "e" * 40, "train", 7, "t" * 64, "i" * 64),
+                       ("d", "r" * 40, "validation", 7, "t" * 64, "i" * 64),
+                       ("d", "r" * 40, "train", 8, "t" * 64, "i" * 64),
+                       ("d", "r" * 40, "train", 7, "u" * 64, "i" * 64),
+                       ("d", "r" * 40, "train", 7, "t" * 64, "j" * 64)]:
+            self.assertNotEqual(base, b.stable_row_id(*change))
+
+    def test_extract_image_bytes_shapes(self):
+        self.assertEqual(b.extract_image_bytes(None), None)
+        self.assertEqual(b.extract_image_bytes(TINY_PNG), TINY_PNG)
+        self.assertEqual(b.extract_image_bytes({"bytes": TINY_PNG}), TINY_PNG)
+        self.assertEqual(b.extract_image_bytes(base64.b64encode(TINY_PNG).decode()), TINY_PNG)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "x.png"
+            path.write_bytes(TINY_PNG)
+            self.assertEqual(b.extract_image_bytes({"path": str(path)}), TINY_PNG)
+            self.assertEqual(b.extract_image_bytes(str(path)), TINY_PNG)
+        self.assertIsNone(b.extract_image_bytes({"bytes": None, "path": "/missing.png"}))
+
+    def test_image_inspection(self):
+        limits = b.FreezeLimits()
+        self.assertEqual(b.inspect_image(TINY_PNG, limits), None)
+        self.assertEqual(b.inspect_image(b"", limits), "missing_image")
+        self.assertEqual(b.inspect_image(b"not a png", limits), "invalid_image")
+        self.assertEqual(b.inspect_image(TINY_PNG, b.FreezeLimits(max_image_bytes=4)),
+                         "image_too_large")
+
+
+class FreezeTests(unittest.TestCase):
+    def setUp(self):
+        # cmd_prepare performs a real disk-space check; tests run on small disks.
+        patcher = mock.patch.object(
+            b.shutil, "disk_usage",
+            return_value=types.SimpleNamespace(free=10**12, total=10**12, used=0))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_invalid_early_rows_are_not_replaced(self):
+        rows = [fake_row(0), fake_row(1), fake_row(2, tikz="   "), fake_row(3),
+                fake_row(4, image=b"broken"), fake_row(5)]
+        with tempfile.TemporaryDirectory() as directory:
+            deps = FakePrepareDeps(rows)
+            meta = b.freeze_source(deps.row_source(None, None), work=directory,
+                                   dataset_id="d", revision="r" * 40, split="train",
+                                   limits=b.FreezeLimits(), row_limit=5)
+            self.assertEqual(len(deps.pulled), 5)  # no replacement row pulled
+            self.assertEqual(meta["rows_frozen"], 5)
+            self.assertEqual(meta["valid_rows"], 3)
+            self.assertEqual(meta["rejected_rows"], 2)
+            self.assertEqual(meta["rejection_counts"], {"empty_tikz": 1, "invalid_image": 1})
+            entries = list(b.iter_manifest(directory))
+            self.assertEqual([entry["source_row_index"] for entry in entries], [0, 1, 2, 3, 4])
+            self.assertEqual(entries[2]["status"], "rejected")
+            self.assertEqual(entries[2]["rejection_reason"], "empty_tikz")
+            self.assertIsNone(entries[2]["image"])
+            self.assertEqual(entries[3]["status"], "valid")
+            self.assertEqual(entries[4]["rejection_reason"], "invalid_image")
+            # Rejected rows still carry evidence: checksums of whatever was received.
+            self.assertEqual(entries[4]["image_sha256"], b.sha256_bytes(b"broken"))
+            # A valid row's image is on disk with the recorded checksum.
+            image_path = Path(directory) / entries[3]["image"]
+            self.assertEqual(b.sha256_file(image_path), entries[3]["image_sha256"])
+            b.verify_manifest(directory, quick=False)
+
+    def test_exact_first_100k_boundary(self):
+        total = b.ROW_LIMIT + 10
+        rows = (fake_row(i, tikz=f"\\draw ({i},0);") for i in range(total))
+        with tempfile.TemporaryDirectory() as directory:
+            meta = b.freeze_source(rows, work=directory, dataset_id="d", revision="r" * 40,
+                                   split="train", limits=b.FreezeLimits(),
+                                   write_images=False)
+            self.assertEqual(meta["rows_frozen"], b.ROW_LIMIT)
+            self.assertEqual(meta["valid_rows"], b.ROW_LIMIT)
+            self.assertEqual(meta["rejected_rows"], 0)
+            entries = list(b.iter_manifest(directory))
+            self.assertEqual(len(entries), b.ROW_LIMIT)
+            self.assertEqual(entries[0]["source_row_index"], 0)
+            self.assertEqual(entries[-1]["source_row_index"], b.ROW_LIMIT - 1)
+            self.assertEqual(len({entry["row_id"] for entry in entries}), b.ROW_LIMIT)
+            excluded = b.stable_row_id("d", "r" * 40, "train", b.ROW_LIMIT,
+                                       b.sha256_text(f"\\draw ({b.ROW_LIMIT},0);"),
+                                       b.sha256_bytes(TINY_PNG))
+            self.assertNotIn(excluded, {entry["row_id"] for entry in entries})
+
+    def test_short_stream_is_a_hard_failure(self):
+        rows = [fake_row(i) for i in range(5)]
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(b.ManifestError, "exactly 10"):
+                b.freeze_source(iter(rows), work=directory, dataset_id="d", revision="r" * 40,
+                                split="train", limits=b.FreezeLimits(), row_limit=10,
+                                write_images=False)
+
+    def test_interrupted_freeze_leaves_no_committed_manifest(self):
+        def exploding():
+            yield fake_row(0)
+            yield fake_row(1)
+            raise RuntimeError("simulated stream failure")
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(RuntimeError, "simulated"):
+                b.freeze_source(exploding(), work=directory, dataset_id="d", revision="r" * 40,
+                                split="train", limits=b.FreezeLimits(), row_limit=5)
+            self.assertFalse(b.manifest_path(directory).exists())
+            self.assertFalse(b.manifest_meta_path(directory).exists())
+            self.assertEqual(list(Path(directory).glob(".staging-*")), [])
+            with self.assertRaisesRegex(b.ManifestError, "authoritative only after"):
+                b.verify_manifest(directory)
+
+    def test_prepare_cleans_partial_artifacts_and_reuses_complete_manifest(self):
+        rows = [fake_row(i) for i in range(6)]
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            # Simulate a crash that left a manifest and images but no meta file.
+            b.manifest_path(work).write_text('{"source_row_index": 0}\n')
+            b.images_dir(work).mkdir()
+            (b.images_dir(work) / "stale.png").write_bytes(b"stale")
+            (work / ".staging-999").mkdir()
+            deps = FakePrepareDeps(rows)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(b.cmd_prepare(prepare_args(work, "--row-limit", "6"), deps), 0)
+            self.assertIn("Removed incomplete freeze artifacts", output.getvalue())
+            self.assertFalse((b.images_dir(work) / "stale.png").exists())
+            meta = b.verify_manifest(work, quick=False)
+            self.assertEqual(meta["rows_frozen"], 6)
+            first_meta = json.loads(b.manifest_meta_path(work).read_text())
+            # A second prepare reuses the frozen manifest without touching it.
+            deps2 = FakePrepareDeps(rows)
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                self.assertEqual(b.cmd_prepare(prepare_args(work), deps2), 0)
+            self.assertIn("Reusing frozen manifest", output.getvalue())
+            self.assertEqual(deps2.pulled, [])
+            self.assertEqual(json.loads(b.manifest_meta_path(work).read_text()), first_meta)
+            # Requested revisions must agree with the frozen manifest.
+            with self.assertRaisesRegex(b.ConfigError, "does not match frozen manifest"):
+                b.cmd_prepare(prepare_args(work, "--dataset-revision", "9" * 40), deps2)
+
+    def test_prepare_refuses_row_limit_without_fixture_mode(self):
+        rows = [fake_row(i) for i in range(3)]
+        with tempfile.TemporaryDirectory() as directory:
+            args = b.build_parser().parse_args(
+                ["prepare", "--work", directory, "--row-limit", "3"])
+            with mock.patch.dict("os.environ", {"SLURM_JOB_ID": "12345"}):
+                with self.assertRaisesRegex(b.ConfigError, "synthetic-fixture control"):
+                    b.cmd_prepare(args, FakePrepareDeps(rows))
+
+    def test_disk_estimate_and_guard(self):
+        rows = [fake_row(i) for i in range(10)]
+        limits = b.FreezeLimits(estimate_rows=10)
+        estimate = b.estimate_storage(rows, limits, row_limit=100)
+        self.assertEqual(estimate["sample_rows"], 10)
+        self.assertGreater(estimate["projected_bytes"], 100 * len(TINY_PNG))
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(b.shutil, "disk_usage",
+                                   return_value=types.SimpleNamespace(free=0, total=0, used=0)):
+                with self.assertRaisesRegex(SystemExit, "Insufficient free space"):
+                    b.check_disk_space(directory, estimate, limits, row_limit=100)
+            with mock.patch.object(b.shutil, "disk_usage",
+                                   return_value=types.SimpleNamespace(free=10**12, total=0, used=0)):
+                self.assertGreater(b.check_disk_space(directory, estimate, limits, row_limit=100), 0)
+
+    def test_verify_detects_tampering(self):
+        rows = [fake_row(i) for i in range(4)]
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            deps = FakePrepareDeps(rows)
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(b.cmd_prepare(prepare_args(work, "--row-limit", "4"), deps), 0)
+            entries = list(b.iter_manifest(work))
+            image_path = work / entries[0]["image"]
+            original = image_path.read_bytes()
+            # Quick verify trusts existence; full verify checks hashes.
+            image_path.write_bytes(b"corrupted")
+            b.verify_manifest(work, quick=True)
+            with self.assertRaisesRegex(b.ManifestError, "Image checksum mismatch"):
+                b.verify_manifest(work, quick=False)
+            image_path.write_bytes(original)
+            image_path.unlink()
+            with self.assertRaisesRegex(b.ManifestError, "Image missing"):
+                b.verify_manifest(work, quick=True)
+            image_path.write_bytes(original)
+            manifest = b.manifest_path(work)
+            text = manifest.read_text()
+            manifest.write_text(text.replace(entries[1]["row_id"], "0" * 32))
+            with self.assertRaisesRegex(b.ManifestError, "Stable id mismatch"):
+                b.verify_manifest(work, quick=True)
+
+    def test_manifest_hash_mismatch_detected(self):
+        rows = [fake_row(i) for i in range(4)]
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            with contextlib.redirect_stdout(io.StringIO()):
+                b.cmd_prepare(prepare_args(work, "--row-limit", "4"), FakePrepareDeps(rows))
+            manifest = b.manifest_path(work)
+            manifest.write_text(manifest.read_text() + "\n")
+            with self.assertRaises(b.ManifestError):
+                b.verify_manifest(work, quick=True)
 
 
 if __name__ == "__main__":

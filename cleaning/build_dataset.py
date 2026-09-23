@@ -21,8 +21,10 @@ helpers.  See ``cleaning/PRODUCTION.md`` for the production runbook.
 from __future__ import annotations
 
 import argparse
+import base64
 import dataclasses
 import hashlib
+import io
 import json
 import os
 import re
@@ -32,6 +34,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
+from itertools import islice
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -479,6 +482,482 @@ def config_from_args(args, *, manifest_meta=None, prompt: Prompt | None = None,
 
 
 # ---------------------------------------------------------------------------
+# Manifest freeze
+# ---------------------------------------------------------------------------
+
+PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
+
+
+class ManifestError(RuntimeError):
+    """Raised when a frozen manifest is missing, partial, or inconsistent."""
+
+
+@dataclass(frozen=True)
+class FreezeLimits:
+    max_tikz_chars: int = 200_000
+    max_image_bytes: int = 20_000_000
+    estimate_rows: int = 200
+    safety_factor: float = 1.5
+    reserve_bytes: int = 5 * 1024**3
+
+
+def manifest_path(work) -> Path:
+    return Path(work) / "manifest.jsonl"
+
+
+def manifest_meta_path(work) -> Path:
+    return Path(work) / "manifest.meta.json"
+
+
+def images_dir(work) -> Path:
+    return Path(work) / "images"
+
+
+def stable_row_id(dataset_id: str, revision: str, split: str, source_index: int,
+                  tikz_sha256: str, image_sha256: str) -> str:
+    """Deterministic identity from immutable source information only."""
+    payload = "\x1f".join((ROW_ID_VERSION, dataset_id, revision, split,
+                           str(source_index), tikz_sha256, image_sha256))
+    return sha256_text(payload)[:32]
+
+
+def extract_image_bytes(value) -> bytes | None:
+    """Accept the shapes the Hub can hand back with decode=False."""
+    if value is None:
+        return None
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value)
+    if isinstance(value, str):
+        try:
+            return base64.b64decode(value, validate=True)
+        except Exception:
+            path = Path(value)
+            return path.read_bytes() if path.is_file() else None
+    if isinstance(value, dict):
+        raw = value.get("bytes")
+        if isinstance(raw, (bytes, bytearray)):
+            return bytes(raw)
+        if isinstance(raw, str):
+            try:
+                return base64.b64decode(raw, validate=True)
+            except Exception:
+                return None
+        path = value.get("path")
+        if path and Path(path).is_file():
+            return Path(path).read_bytes()
+    return None
+
+
+def pillow_available() -> bool:
+    try:
+        import PIL.Image  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def inspect_image(raw: bytes | None, limits: FreezeLimits) -> str | None:
+    """Return a rejection reason for unusable image bytes, else None."""
+    if not raw:
+        return "missing_image"
+    if len(raw) > limits.max_image_bytes:
+        return "image_too_large"
+    if not raw.startswith(PNG_SIGNATURE):
+        return "invalid_image"
+    if pillow_available():
+        try:
+            from PIL import Image
+            with io.BytesIO(raw) as buffer:
+                with Image.open(buffer) as image:
+                    image.verify()
+            with io.BytesIO(raw) as buffer:
+                with Image.open(buffer) as image:
+                    if image.size[0] < 1 or image.size[1] < 1:
+                        return "invalid_image"
+        except Exception:
+            return "invalid_image"
+    return None
+
+
+def _json_safe(value):
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def freeze_row(index: int, row: dict, *, dataset_id: str, revision: str, split: str,
+               limits: FreezeLimits, stage_images: Path | None) -> dict:
+    """Build one manifest entry.  Invalid rows are recorded, never replaced."""
+    tikz = row.get("tikz_code")
+    tikz = tikz if isinstance(tikz, str) else ""
+    raw = extract_image_bytes(row.get("png_image"))
+    reason = None
+    if not tikz.strip():
+        reason = "empty_tikz"
+    elif len(tikz) > limits.max_tikz_chars:
+        reason = "tikz_too_long"
+    else:
+        reason = inspect_image(raw, limits)
+    tikz_sha = sha256_text(tikz)
+    image_sha = sha256_bytes(raw or b"")
+    entry = {
+        "row_id": stable_row_id(dataset_id, revision, split, index, tikz_sha, image_sha),
+        "source_row_index": index,
+        "file_id": _json_safe(row.get("file_id")),
+        "source": _json_safe(row.get("source")),
+        "dataset_id": dataset_id,
+        "dataset_revision": revision,
+        "split": split,
+        "tikz_code": tikz,
+        "tikz_sha256": tikz_sha,
+        "image": None,
+        "image_sha256": image_sha,
+        "status": "valid" if reason is None else "rejected",
+        "rejection_reason": reason,
+    }
+    if reason is None:
+        entry["image"] = f"images/{index:06d}.png"
+        if stage_images is not None:
+            (Path(stage_images) / f"{index:06d}.png").write_bytes(raw)
+    return entry
+
+
+def estimate_storage(rows, limits: FreezeLimits, row_limit: int = ROW_LIMIT) -> dict:
+    image_sizes, tikz_sizes = [], []
+    for row in rows:
+        image_sizes.append(len(extract_image_bytes(row.get("png_image")) or b""))
+        tikz = row.get("tikz_code")
+        tikz_sizes.append(len(tikz) if isinstance(tikz, str) else 0)
+    count = max(1, len(image_sizes))
+    average_image = sum(image_sizes) / count
+    average_tikz = sum(tikz_sizes) / count
+    projected = int(row_limit * (average_image + average_tikz + 256))
+    return {
+        "sample_rows": len(image_sizes),
+        "average_image_bytes": round(average_image, 1),
+        "average_tikz_bytes": round(average_tikz, 1),
+        "projected_bytes": projected,
+    }
+
+
+def check_disk_space(work, estimate: dict, limits: FreezeLimits,
+                     row_limit: int = ROW_LIMIT) -> int:
+    required = int(estimate["projected_bytes"] * limits.safety_factor) + limits.reserve_bytes
+    free = shutil.disk_usage(str(work)).free
+    if free < required:
+        raise SystemExit(
+            f"Insufficient free space under {work}: need about {human_bytes(required)} "
+            f"(projected {human_bytes(estimate['projected_bytes'])} x safety {limits.safety_factor} "
+            f"+ {human_bytes(limits.reserve_bytes)} reserve), have {human_bytes(free)}. "
+            "Free space or choose a different --work directory before freezing.")
+    return required
+
+
+def human_bytes(value) -> str:
+    value = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(value) < 1024 or unit == "TiB":
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} TiB"
+
+
+def fsync_dir(path) -> None:
+    try:
+        descriptor = os.open(str(path), os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(descriptor)
+    except OSError:
+        pass
+    finally:
+        os.close(descriptor)
+
+
+def clean_incomplete_freeze(work) -> list[str]:
+    """Remove artifacts from an interrupted freeze.  Never touches a committed manifest."""
+    removed = []
+    for path in (manifest_path(work), images_dir(work)):
+        if path.is_dir():
+            shutil.rmtree(path)
+            removed.append(str(path))
+        elif path.exists():
+            path.unlink()
+            removed.append(str(path))
+    for staging in Path(work).glob(".staging-*"):
+        shutil.rmtree(staging, ignore_errors=True)
+        removed.append(str(staging))
+    return removed
+
+
+def freeze_source(rows, *, work, dataset_id: str, revision: str, split: str,
+                  limits: FreezeLimits, meta_extra: dict | None = None,
+                  row_limit: int = ROW_LIMIT, write_images: bool = True,
+                  progress_every: int = 0) -> dict:
+    """Freeze exactly ``row_limit`` streamed rows and commit the manifest atomically.
+
+    A partial freeze leaves no ``manifest.jsonl``/``manifest.meta.json`` at the
+    top level; ``manifest.meta.json`` is written last and is the only marker
+    that makes a manifest authoritative.
+    """
+    work = Path(work)
+    staging = work / f".staging-{os.getpid()}"
+    if staging.exists():
+        shutil.rmtree(staging)
+    stage_images = staging / "images"
+    stage_images.mkdir(parents=True)
+    manifest_tmp = staging / "manifest.jsonl"
+    counts = {"valid": 0, "rejected": 0}
+    rejections: dict[str, int] = {}
+    written = 0
+    try:
+        with manifest_tmp.open("w", encoding="utf-8") as handle:
+            for index, row in enumerate(islice(rows, row_limit)):
+                entry = freeze_row(index, row, dataset_id=dataset_id, revision=revision,
+                                   split=split, limits=limits,
+                                   stage_images=stage_images if write_images else None)
+                counts[entry["status"]] += 1
+                if entry["rejection_reason"]:
+                    rejections[entry["rejection_reason"]] = rejections.get(
+                        entry["rejection_reason"], 0) + 1
+                handle.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\n")
+                written += 1
+                if progress_every and written % progress_every == 0:
+                    print(f"  frozen {written}/{row_limit} rows", flush=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        if written != row_limit:
+            raise ManifestError(
+                f"Dataset stream ended after {written} rows; production requires exactly "
+                f"{row_limit} source rows. Check the pinned revision and split.")
+        manifest_sha = sha256_file(manifest_tmp)
+        manifest_bytes = manifest_tmp.stat().st_size
+        final_images = images_dir(work)
+        if final_images.exists():
+            shutil.rmtree(final_images)
+        os.replace(stage_images, final_images)
+        os.replace(manifest_tmp, manifest_path(work))
+        fsync_dir(work)
+        meta = {
+            "schema_version": MANIFEST_SCHEMA_VERSION,
+            "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "tool_version": TOOL_VERSION,
+            "dataset_id": dataset_id,
+            "dataset_revision": revision,
+            "split": split,
+            "row_start": 0,
+            "row_limit": row_limit,
+            "rows_frozen": written,
+            "valid_rows": counts["valid"],
+            "rejected_rows": counts["rejected"],
+            "rejection_counts": rejections,
+            "row_id_version": ROW_ID_VERSION,
+            "image_validation": "pillow" if pillow_available() else "signature",
+            "manifest_sha256": manifest_sha,
+            "manifest_bytes": manifest_bytes,
+            "freeze_limits": dataclasses.asdict(limits),
+        }
+        meta.update(meta_extra or {})
+        bench.dump(manifest_meta_path(work), meta)
+        fsync_dir(work)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return meta
+
+
+def verify_manifest(work, *, quick: bool = True) -> dict:
+    """Verify the frozen manifest and return its metadata; raises ManifestError."""
+    work = Path(work)
+    meta_file = manifest_meta_path(work)
+    if not meta_file.is_file():
+        raise ManifestError(
+            f"No frozen manifest at {meta_file}. A manifest is authoritative only after "
+            "prepare writes manifest.meta.json.")
+    meta = json.loads(meta_file.read_text(encoding="utf-8"))
+    if meta.get("schema_version") != MANIFEST_SCHEMA_VERSION:
+        raise ManifestError(f"Manifest schema {meta.get('schema_version')!r} is not supported")
+    path = manifest_path(work)
+    if not path.is_file():
+        raise ManifestError(f"manifest.jsonl missing under {work}")
+    digest = hashlib.sha256()
+    count = 0
+    seen_ids = set()
+    with path.open("rb") as handle:
+        for line in handle:
+            digest.update(line)
+            if not line.strip():
+                continue
+            entry = json.loads(line)
+            index = entry.get("source_row_index")
+            if index != count:
+                raise ManifestError(
+                    f"Manifest row {count} has source_row_index {index}; indices must be contiguous from 0")
+            if entry["row_id"] in seen_ids:
+                raise ManifestError(f"Duplicate stable id {entry['row_id']} at source row {index}")
+            seen_ids.add(entry["row_id"])
+            expected = stable_row_id(entry["dataset_id"], entry["dataset_revision"],
+                                     entry["split"], index, entry["tikz_sha256"],
+                                     entry["image_sha256"])
+            if expected != entry["row_id"]:
+                raise ManifestError(f"Stable id mismatch at source row {index}")
+            if sha256_text(entry["tikz_code"]) != entry["tikz_sha256"]:
+                raise ManifestError(f"TikZ checksum mismatch at source row {index}")
+            if entry["status"] == "valid":
+                if not entry.get("image"):
+                    raise ManifestError(f"Valid row {index} has no image path")
+                image_path = work / entry["image"]
+                if not image_path.is_file():
+                    raise ManifestError(f"Image missing for source row {index}: {image_path}")
+                if not quick and sha256_file(image_path) != entry["image_sha256"]:
+                    raise ManifestError(f"Image checksum mismatch at source row {index}")
+            elif entry["status"] == "rejected":
+                if not entry.get("rejection_reason"):
+                    raise ManifestError(f"Rejected row {index} has no rejection reason")
+            else:
+                raise ManifestError(f"Unknown row status {entry['status']!r} at source row {index}")
+            count += 1
+    if count != meta.get("rows_frozen"):
+        raise ManifestError(f"Manifest holds {count} rows but meta records {meta.get('rows_frozen')}")
+    if digest.hexdigest() != meta.get("manifest_sha256"):
+        raise ManifestError("Manifest content hash does not match manifest.meta.json")
+    return meta
+
+
+def iter_manifest(work):
+    with manifest_path(work).open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                yield json.loads(line)
+
+
+def manifest_index(work) -> dict:
+    """Compact per-row identity index used for inference and audit checks."""
+    index = {}
+    for entry in iter_manifest(work):
+        index[entry["row_id"]] = {
+            "source_row_index": entry["source_row_index"],
+            "tikz_sha256": entry["tikz_sha256"],
+            "image_sha256": entry["image_sha256"],
+            "image": entry["image"],
+            "status": entry["status"],
+            "tikz_chars": len(entry["tikz_code"]),
+        }
+    return index
+
+
+def check_manifest_agreement(args, meta: dict) -> None:
+    if args.dataset != meta.get("dataset_id"):
+        raise ConfigError(f"--dataset {args.dataset} does not match frozen manifest "
+                          f"{meta.get('dataset_id')}")
+    if args.dataset_revision and args.dataset_revision != meta.get("dataset_revision"):
+        raise ConfigError(f"--dataset-revision {args.dataset_revision} does not match frozen "
+                          f"manifest {meta.get('dataset_revision')}")
+    if args.model != meta.get("model_id"):
+        raise ConfigError(f"--model {args.model} does not match frozen manifest {meta.get('model_id')}")
+    if args.model_revision and args.model_revision != meta.get("model_revision"):
+        raise ConfigError(f"--model-revision {args.model_revision} does not match frozen "
+                          f"manifest {meta.get('model_revision')}")
+
+
+class PrepareDeps:
+    """Injectable seams so prepare runs without network access in tests."""
+
+    def resolve_dataset_revision(self, args) -> str:
+        from huggingface_hub import HfApi
+        return HfApi().dataset_info(args.dataset, revision=args.dataset_revision or "main").sha
+
+    def resolve_model_revision(self, args) -> str:
+        from huggingface_hub import HfApi
+        return HfApi().model_info(args.model, revision=args.model_revision or "main").sha
+
+    def download_model(self, args, revision: str) -> str:
+        from huggingface_hub import snapshot_download
+        cache = Path(args.model_cache_dir).resolve() if args.model_cache_dir \
+            else Path(args.work).resolve() / "hf"
+        return str(Path(snapshot_download(args.model, revision=revision,
+                                          cache_dir=str(cache))).resolve())
+
+    def row_source(self, args, revision: str):
+        from datasets import Image, load_dataset
+        dataset = load_dataset(args.dataset, split=DATASET_SPLIT, revision=revision,
+                               streaming=True).cast_column("png_image", Image(decode=False))
+        return iter(dataset)
+
+
+def cmd_prepare(args, deps=None) -> int:
+    require_slurm(args)
+    deps = deps or PrepareDeps()
+    work = Path(args.work).resolve()
+    row_limit = getattr(args, "row_limit", ROW_LIMIT)
+    if row_limit != ROW_LIMIT and not args.allow_non_slurm:
+        raise ConfigError(
+            "--row-limit is a synthetic-fixture control; production freezes exactly "
+            f"{ROW_LIMIT} rows")
+    limits = FreezeLimits(max_tikz_chars=args.max_tikz_chars,
+                          max_image_bytes=args.max_image_bytes,
+                          estimate_rows=args.estimate_rows)
+    if manifest_meta_path(work).is_file():
+        meta = verify_manifest(work, quick=True)
+        check_manifest_agreement(args, meta)
+        model_path = meta.get("model_path", "")
+        if args.download_model and not model_path:
+            model_path = deps.download_model(args, meta["model_revision"])
+            meta["model_path"] = model_path
+            bench.dump(manifest_meta_path(work), meta)
+        print(f"Reusing frozen manifest: {manifest_path(work)}")
+        print(f"  rows={meta['rows_frozen']} valid={meta['valid_rows']} "
+              f"rejected={meta['rejected_rows']} dataset_revision={meta['dataset_revision']}")
+        print(f"  model_revision={meta['model_revision']}")
+        if model_path:
+            print(f"  model_path={model_path}")
+        if meta.get("rejection_counts"):
+            print(f"  rejection_counts={meta['rejection_counts']}")
+        return 0
+    work.mkdir(parents=True, exist_ok=True)
+    removed = clean_incomplete_freeze(work)
+    if removed:
+        print(f"Removed incomplete freeze artifacts: {', '.join(removed)}")
+    dataset_revision = deps.resolve_dataset_revision(args)
+    model_revision = deps.resolve_model_revision(args)
+    print(f"Pinned dataset revision: {dataset_revision}")
+    print(f"Pinned model revision:   {model_revision}")
+    sample = list(islice(deps.row_source(args, dataset_revision), limits.estimate_rows))
+    if len(sample) < min(limits.estimate_rows, row_limit):
+        raise SystemExit(
+            f"Dataset stream returned only {len(sample)} rows for the storage estimate; "
+            "check the pinned revision, split and network access.")
+    estimate = estimate_storage(sample, limits, row_limit)
+    required = check_disk_space(work, estimate, limits, row_limit)
+    print(f"Storage estimate from {estimate['sample_rows']} rows: "
+          f"avg image {human_bytes(estimate['average_image_bytes'])}, "
+          f"avg TikZ {human_bytes(estimate['average_tikz_bytes'])}, "
+          f"projected {human_bytes(estimate['projected_bytes'])}, "
+          f"required {human_bytes(required)}")
+    model_path = deps.download_model(args, model_revision) if args.download_model else ""
+    if model_path:
+        print(f"Model snapshot ready: {model_path}")
+    meta_extra = {
+        "model_id": args.model,
+        "model_revision": model_revision,
+        "model_path": model_path,
+        "storage": dict(estimate, required_bytes=required),
+        "runner_sha256": sha256_file(Path(__file__).resolve()),
+    }
+    print(f"Freezing source rows 0-{row_limit - 1} from {args.dataset}@{dataset_revision} ...")
+    meta = freeze_source(deps.row_source(args, dataset_revision), work=work,
+                         dataset_id=args.dataset, revision=dataset_revision,
+                         split=DATASET_SPLIT, limits=limits, meta_extra=meta_extra,
+                         row_limit=row_limit, progress_every=5000)
+    print(f"Frozen manifest complete: {manifest_path(work)}")
+    print(f"  rows={meta['rows_frozen']} valid={meta['valid_rows']} rejected={meta['rejected_rows']}")
+    if meta["rejection_counts"]:
+        print(f"  rejection_counts={meta['rejection_counts']}")
+    print(f"  manifest_sha256={meta['manifest_sha256']}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Slurm guard
 # ---------------------------------------------------------------------------
 
@@ -577,6 +1056,20 @@ def build_parser() -> argparse.ArgumentParser:
     plan = subparsers.add_parser("plan", help="Print resolved configuration and identity")
     add_common_arguments(plan)
     plan.set_defaults(handler=cmd_plan)
+
+    prepare = subparsers.add_parser(
+        "prepare", help="Freeze exactly the first 100,000 source rows into a manifest")
+    add_common_arguments(prepare)
+    prepare.add_argument("--model-cache-dir", default="",
+                         help="Hugging Face cache for the model snapshot (default: WORK/hf)")
+    prepare.add_argument("--download-model", action=argparse.BooleanOptionalAction,
+                         default=True, help="Download the pinned model snapshot during prepare")
+    prepare.add_argument("--max-tikz-chars", type=int, default=200_000)
+    prepare.add_argument("--max-image-bytes", type=int, default=20_000_000)
+    prepare.add_argument("--estimate-rows", type=int, default=200,
+                         help="Bounded sample used for the disk-space estimate")
+    prepare.add_argument("--row-limit", type=int, default=ROW_LIMIT, help=argparse.SUPPRESS)
+    prepare.set_defaults(handler=cmd_prepare)
     return parser
 
 
@@ -589,7 +1082,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.handler(args)
-    except (ConfigError, IdentityMismatch, PromptError) as exc:
+    except (ConfigError, IdentityMismatch, PromptError, ManifestError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 
