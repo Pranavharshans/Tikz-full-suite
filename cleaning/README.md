@@ -156,6 +156,14 @@ concurrency 100 with MTP2. It writes `rtx-throughput-results.json` and
 `rtx-throughput-summary.csv`, requests the `rtxpro6k` partition and exactly two
 GPUs, and retains the same non-thinking 256-token quality controls.
 
+After selecting MTP, `--rtx-concurrency-screen --load-samples 512
+--throughput-mtp N` runs a sustained two-replica TP1 load test at aggregate
+concurrency 64, 96, 128, 192, and 256. It cycles the immutable 100-row workload
+with unique request IDs; these are 512 requests, not 512 unique dataset samples.
+Prefix caching remains disabled. This isolates capacity saturation without a
+new dataset download and writes `rtx-concurrency-results.json` plus
+`rtx-concurrency-summary.csv`. Use it for throughput, not quality statistics.
+
 ### Tests
 
 ```bash

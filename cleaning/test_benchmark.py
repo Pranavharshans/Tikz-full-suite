@@ -74,6 +74,29 @@ class Tests(unittest.TestCase):
         self.assertNotIn("#SBATCH --partition=a40", script)
         subprocess.run(["bash", "-n"], input=script, text=True, check=True)
 
+    def test_rtx_concurrency_slurm_flags(self):
+        script = subprocess.check_output([
+            sys.executable, str(Path(b.__file__)), "--slurm-script",
+            "--rtx-concurrency-screen", "--no-enable-thinking",
+            "--max-output-tokens", "256", "--load-samples", "512",
+            "--throughput-mtp", "1", "--vllm-sif", "/tmp/vllm.sif",
+            "--sglang-sif", "/tmp/sglang.sif"], text=True)
+        self.assertIn("--rtx-concurrency-screen", script)
+        self.assertIn("--load-samples 512", script)
+        self.assertIn("--throughput-mtp 1", script)
+        self.assertIn("#SBATCH --partition=rtxpro6k", script)
+        self.assertIn("#SBATCH --gres=gpu:rtxpro6k:2", script)
+        subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
+    def test_load_manifest_has_unique_ids(self):
+        manifest = {"rows": [{"id": "a", "tikz_code": "x"},
+                             {"id": "b", "tikz_code": "y"}]}
+        expanded = b.load_manifest(manifest, 512)
+        self.assertEqual(len(expanded["rows"]), 512)
+        self.assertEqual(len({row["id"] for row in expanded["rows"]}), 512)
+        self.assertEqual(expanded["load_test_source_rows"], 2)
+        self.assertEqual(expanded["load_test_requests"], 512)
+
     def test_generation_settings(self):
         thinking = b.generation_settings({"enable_thinking": True})
         instruct = b.generation_settings({"enable_thinking": False})

@@ -101,6 +101,19 @@ def screen_manifest(manifest, count):
     return dict(manifest, rows=ordered[:count])
 
 
+def load_manifest(manifest, count):
+    """Repeat the frozen workload with unique request IDs for sustained load tests."""
+    rows = manifest["rows"]
+    if not rows:
+        raise ValueError("Cannot expand an empty manifest")
+    expanded = []
+    for index in range(count):
+        row = dict(rows[index % len(rows)])
+        row["id"] = f"{row['id']}-load-{index:04d}"
+        expanded.append(row)
+    return dict(manifest, rows=expanded, load_test_source_rows=len(rows), load_test_requests=count)
+
+
 def shortlist(results):
     eligible = [r for r in results if r.get("successful") == r.get("samples", 100)
                 and not r.get("failed") and r["config"]["mtp"]]
@@ -555,12 +568,20 @@ def main():
                         help="Run only bounded non-thinking vLLM offline throughput candidates")
     parser.add_argument("--rtx-throughput-screen", action="store_true",
                         help="Run bounded TP1 throughput candidates on two RTX PRO GPUs")
+    parser.add_argument("--rtx-concurrency-screen", action="store_true",
+                        help="Run a sustained two-GPU RTX TP1 concurrency load test")
+    parser.add_argument("--load-samples", type=int, default=512)
+    parser.add_argument("--throughput-mtp", type=int, choices=(0, 1, 2, 3), default=2)
     parser.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--reasoning-effort", choices=("low", "medium", "xhigh"), default="xhigh")
     parser.add_argument("--max-output-tokens", type=int, default=32768)
     args = parser.parse_args()
-    if args.throughput_screen and args.rtx_throughput_screen:
+    throughput_modes = sum((args.throughput_screen, args.rtx_throughput_screen,
+                            args.rtx_concurrency_screen))
+    if throughput_modes > 1:
         parser.error("Choose only one throughput screen")
+    if args.load_samples < 1:
+        parser.error("--load-samples must be positive")
     if args.warmup_samples < 1:
         parser.error("--warmup-samples must be positive")
     if args.slurm_script:
@@ -583,13 +604,17 @@ def main():
                           "--request-timeout", str(args.request_timeout), "--config-timeout", str(args.config_timeout),
                           "--warmup-samples", str(args.warmup_samples),
                           "--reasoning-effort", args.reasoning_effort,
-                          "--max-output-tokens", str(args.max_output_tokens)] +
+                          "--max-output-tokens", str(args.max_output_tokens),
+                          "--load-samples", str(args.load_samples),
+                          "--throughput-mtp", str(args.throughput_mtp)] +
                          (["--enable-thinking"] if args.enable_thinking else ["--no-enable-thinking"]) +
                          (["--throughput-screen"] if args.throughput_screen else []) +
                          (["--rtx-throughput-screen"] if args.rtx_throughput_screen else []) +
+                         (["--rtx-concurrency-screen"] if args.rtx_concurrency_screen else []) +
                          (["--split-screen"] if args.split_screen else []))
-        partition = "rtxpro6k" if args.rtx_throughput_screen else "a40"
-        gres = "gpu:rtxpro6k:2" if args.rtx_throughput_screen else "gpu:a40:4"
+        rtx_mode = args.rtx_throughput_screen or args.rtx_concurrency_screen
+        partition = "rtxpro6k" if rtx_mode else "a40"
+        gres = "gpu:rtxpro6k:2" if rtx_mode else "gpu:a40:4"
         print(f"#!/bin/bash -l\n#SBATCH --job-name=tikz-bench\n#SBATCH --partition={partition}\n"
               f"#SBATCH --gres={gres}\n#SBATCH --nodes=1\n#SBATCH --ntasks=1\n"
               "#SBATCH --cpus-per-task=64\n#SBATCH --time=24:00:00\n#SBATCH --export=NONE\n"
@@ -616,7 +641,7 @@ def main():
         prepare(args)
     if not args.run:
         return
-    expected_gpus = 2 if args.rtx_throughput_screen else 4
+    expected_gpus = 2 if (args.rtx_throughput_screen or args.rtx_concurrency_screen) else 4
     visible_gpus = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
     if not os.environ.get("SLURM_JOB_ID") or len(visible_gpus) != expected_gpus:
         raise SystemExit(f"Run only inside a Slurm allocation exposing exactly {expected_gpus} GPUs")
@@ -646,6 +671,27 @@ def main():
                 h.update(chunk)
         container_hashes[path] = h.hexdigest()
     manifest["container_sha256"] = container_hashes
+    if args.rtx_concurrency_screen:
+        if args.enable_thinking:
+            raise SystemExit("--rtx-concurrency-screen requires --no-enable-thinking")
+        if args.load_samples < 256:
+            raise SystemExit("--rtx-concurrency-screen requires at least 256 load requests")
+        load = load_manifest(manifest, args.load_samples)
+        configs = [config(engine="vllm-offline", tp=1, replicas=2,
+                          mtp=args.throughput_mtp, concurrency=c)
+                   for c in (64, 96, 128, 192, 256)]
+        results = []
+        for cfg in configs:
+            print("rtx-concurrency", f"requests={args.load_samples}", json.dumps(cfg), flush=True)
+            results.append(run_config(args, cfg, load))
+            dump(root / "rtx-concurrency-results.json", results)
+        fields = sorted(set().union(*(r.keys() for r in results)))
+        with (root / "rtx-concurrency-summary.csv").open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(results)
+        print("RTX concurrency screen complete:", root / "rtx-concurrency-summary.csv")
+        return
     if args.rtx_throughput_screen:
         if args.enable_thinking:
             raise SystemExit("--rtx-throughput-screen requires --no-enable-thinking")
