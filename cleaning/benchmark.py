@@ -344,6 +344,8 @@ def worker(args):
                         enable_chunked_prefill=cfg["chunked"], enable_prefix_caching=False,
                         mm_processor_cache_gb=0,
                         gpu_memory_utilization=job["gpu_memory_utilization"])
+            if job.get("kv_cache_memory_bytes"):
+                opts["kv_cache_memory_bytes"] = job["kv_cache_memory_bytes"]
             opts.update(vllm_runtime_options())
             dump(out / "engine-options.json", opts)
             if cfg["mtp"]:
@@ -405,6 +407,8 @@ def worker(args):
                    "--generation-config", "vllm",
                    "--enable-chunked-prefill" if cfg["chunked"] else "--no-enable-chunked-prefill"]
             cmd += vllm_runtime_flags()
+            if job.get("kv_cache_memory_bytes"):
+                cmd += ["--kv-cache-memory-bytes", str(job["kv_cache_memory_bytes"])]
             if cfg["mtp"]:
                 cmd += ["--speculative-config", json.dumps(dict(method="mtp", num_speculative_tokens=cfg["mtp"]))]
         else:
@@ -474,6 +478,7 @@ def run_config(args, cfg, manifest):
                               greedy=args.greedy,
                               replicas_per_gpu=args.replicas_per_gpu,
                               gpu_memory_utilization=args.gpu_memory_utilization,
+                              kv_cache_memory_bytes=args.kv_cache_memory_gib * 1024**3,
                               nccl_p2p=args.nccl_p2p,
                               request_timeout=args.request_timeout, config_timeout=args.config_timeout,
                               script=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
@@ -526,6 +531,7 @@ def run_config(args, cfg, manifest):
                         max_output_tokens=args.max_output_tokens,
                         greedy=args.greedy,
                         gpu_memory_utilization=args.gpu_memory_utilization,
+                        kv_cache_memory_bytes=args.kv_cache_memory_gib * 1024**3,
                         concurrency=concurrency, context=args.context, port=19000+index,
                         startup_timeout=args.startup_timeout, request_timeout=args.request_timeout)
             dump(folder / "job.json", spec)
@@ -628,6 +634,8 @@ def main():
                         help="TP1 engine replicas sharing each physical GPU in RTX concurrency mode")
     parser.add_argument("--gpu-memory-utilization", type=float, default=.90,
                         help="Per-engine fraction of visible GPU memory reserved by the inference engine")
+    parser.add_argument("--kv-cache-memory-gib", type=float, default=0,
+                        help="Explicit per-engine KV cache GiB; zero uses automatic profiling")
     args = parser.parse_args()
     throughput_modes = sum((args.throughput_screen, args.rtx_throughput_screen,
                             args.rtx_concurrency_screen))
@@ -643,6 +651,8 @@ def main():
         parser.error("--replicas-per-gpu must be positive")
     if not 0 < args.gpu_memory_utilization < 1:
         parser.error("--gpu-memory-utilization must be between 0 and 1")
+    if args.kv_cache_memory_gib < 0:
+        parser.error("--kv-cache-memory-gib cannot be negative")
     if args.replicas_per_gpu > 1 and not args.rtx_concurrency_screen:
         parser.error("GPU sharing is supported only with --rtx-concurrency-screen")
     if args.slurm_script:
@@ -672,6 +682,7 @@ def main():
                           "--batch-token-budget", str(args.batch_token_budget),
                           "--replicas-per-gpu", str(args.replicas_per_gpu),
                           "--gpu-memory-utilization", str(args.gpu_memory_utilization),
+                          "--kv-cache-memory-gib", str(args.kv_cache_memory_gib),
                           "--load-samples", str(args.load_samples),
                           "--rtx-concurrencies", ",".join(map(str, args.rtx_concurrencies)),
                           "--throughput-mtp", str(args.throughput_mtp)] +

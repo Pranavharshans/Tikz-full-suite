@@ -199,6 +199,11 @@ GPU, and divides aggregate concurrency across all four. GPU-hour throughput is
 normalized by the two physical GPUs rather than the four engine processes.
 Sharing is intentionally rejected outside this TP1 RTX mode; it can OOM during
 model loading or CUDA-graph capture even when static weight arithmetic fits.
+When colocated engines confuse automatic KV profiling, set an explicit
+per-engine cache with `--kv-cache-memory-gib N`. This maps to vLLM
+`kv_cache_memory_bytes`, which overrides automatic cache sizing; the value is
+included in the run fingerprint. Two shared NVFP4 replicas per 96GB GPU should
+begin with 12 GiB each rather than raising both engines' memory fractions.
 
 ### Tests
 
