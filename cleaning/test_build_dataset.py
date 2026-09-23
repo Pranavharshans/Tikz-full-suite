@@ -1160,7 +1160,7 @@ class RunArgumentTests(unittest.TestCase):
                       ["--start-index", "10", "--end-index", "5"],
                       ["--max-rows-this-run", "0"], ["--max-runtime-minutes", "0"],
                       ["--worker-restarts", "-1"], ["--warmup-samples", "-1"],
-                      ["--poll-seconds", "0"], ["--stale-claim-seconds", "0"],
+                      ["--poll-seconds", "0"],
                       ["--worker-timeout", "0"], ["--max-transient-attempts", "0"],
                       ["--retry-backoff-base-seconds", "-1"]):
             with self.assertRaises(b.ConfigError, msg=str(extra)):

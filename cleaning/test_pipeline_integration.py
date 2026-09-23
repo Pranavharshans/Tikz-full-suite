@@ -379,6 +379,38 @@ class FaultInjectionTests(unittest.TestCase):
             self.assertEqual(len(attempts), 1, "deterministic invalid output must not be retried")
             self.assertEqual(ledger.counts()["states"]["complete"], 11)
 
+    def test_orphaned_running_rows_are_reclaimed_on_immediate_resubmission(self):
+        args = run_args(self.work)
+        config = b.config_from_args(args, manifest_meta=self.meta, container_sha256="b" * 64,
+                                    require_pinned=True)
+        index = b.manifest_index(self.work)
+        # Simulate a controller that died after claiming rows, moments ago.
+        with b.Ledger(self.work).open() as ledger:
+            ledger.initialize(b.ledger_identity_from_config(config, self.meta))
+            ledger.seed(iter(b.iter_manifest(self.work)), rows_frozen=12)
+            ledger.claim(b.balanced_assignment(ledger.eligible(), index, workers=2),
+                         policy=b.RetryPolicy())
+        with slurm_env():
+            code = b.cmd_run(run_args(self.work), deps=LocalDeps(
+                LocalSpawner(self.engine_factory())))
+        self.assertEqual(code, 0)
+        states, complete, _ = read_states(self.work)
+        self.assertEqual(states["complete"], 12)
+        self.assertEqual(states["running"] + states["retryable"] + states["pending"], 0)
+        with b.Ledger(self.work, read_only=True) as ledger:
+            attempts = ledger.all_attempts()
+            # The orphaned claim did not consume the transient budget.
+            self.assertEqual({attempt["error_category"] for attempt in attempts},
+                             {None, "stale_claim"})
+
+    def test_concurrent_controllers_are_refused(self):
+        lock = b.ControllerLock(self.work)
+        lock.acquire()
+        self.addCleanup(lock.release)
+        with self.assertRaisesRegex(SystemExit, "Another controller"):
+            second = b.ControllerLock(self.work)
+            second.acquire()
+
     def test_run_guards(self):
         spawner = LocalSpawner(self.engine_factory())
         # No --allow-non-slurm here: the production guard must refuse outright.

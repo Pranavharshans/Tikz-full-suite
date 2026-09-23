@@ -2358,6 +2358,46 @@ def _drain_workers(args, handles) -> None:
             handle.kill()
 
 
+class ControllerLock:
+    """Advisory single-controller lock for one work directory."""
+
+    def __init__(self, work):
+        self.path = Path(work) / "runtime" / "controller.lock"
+        self.handle = None
+
+    def acquire(self) -> None:
+        import fcntl
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        handle = self.path.open("w")
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            unsupported = exc.errno in (getattr(os, "ENOLCK", None), getattr(os, "EOPNOTSUPP", None),
+                                        getattr(os, "ENOSYS", None))
+            if not unsupported:
+                handle.close()
+                raise SystemExit(
+                    f"Another controller appears to be running against {self.path.parent.parent} "
+                    f"({exc}). Run only one orchestrator per work directory.") from exc
+            print(f"WARNING: file locking unsupported here ({exc}); "
+                  "keep to one controller per work directory", flush=True)
+        self.handle = handle
+        self.handle.write(f"pid={os.getpid()} host={os.uname().nodename} "
+                          f"at={time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}\n")
+        self.handle.flush()
+
+    def release(self) -> None:
+        if self.handle is None:
+            return
+        try:
+            import fcntl
+            fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        self.handle.close()
+        self.handle = None
+
+
 def run_pipeline(args, config, meta, deps, stop_flag=None) -> dict:
     """Wave-based controller: claim, run, ingest, reclaim, repeat."""
     work = Path(args.work).resolve()
@@ -2372,6 +2412,8 @@ def run_pipeline(args, config, meta, deps, stop_flag=None) -> dict:
     deadline = started + args.max_runtime_minutes * 60 if args.max_runtime_minutes else None
     ledger = Ledger(work).open()
     claimed_so_far = 0
+    lock = ControllerLock(work)
+    lock.acquire()
     try:
         # A leftover stop marker from an interrupted run must not stop this one.
         stop_path = work / "runtime" / "stop"
@@ -2387,9 +2429,11 @@ def run_pipeline(args, config, meta, deps, stop_flag=None) -> dict:
         if resumed:
             print(f"Recovered results from a previous run: "
                   f"{sum(len(rows) for rows in resumed.values())} rows", flush=True)
-        reclaimed = ledger.reclaim_stale(args.stale_claim_seconds, policy=policy)
+        # This controller owns the work directory, so every row still marked
+        # running belongs to a dead worker and is safely reclaimed.
+        reclaimed = ledger.reclaim_stale(0, policy=policy)
         if reclaimed:
-            print(f"Reclaimed {reclaimed} stale running rows", flush=True)
+            print(f"Reclaimed {reclaimed} orphaned running rows", flush=True)
         if args.reprocess_rejected:
             moved = ledger.reprocess_rejected(policy=policy)
             print(f"Reprocessing {moved} rejected rows at the operator's request", flush=True)
@@ -2434,6 +2478,7 @@ def run_pipeline(args, config, meta, deps, stop_flag=None) -> dict:
         return dict(states=states, remaining=remaining, elapsed_s=elapsed,
                     exit_code=0 if remaining == 0 else 3)
     finally:
+        lock.release()
         ledger.close()
 
 
@@ -2450,7 +2495,7 @@ def validate_run_args(args) -> None:
         raise ConfigError("--worker-restarts cannot be negative")
     if args.warmup_samples < 0:
         raise ConfigError("--warmup-samples cannot be negative")
-    for name in ("stale_claim_seconds", "worker_timeout", "poll_seconds"):
+    for name in ("worker_timeout", "poll_seconds"):
         if getattr(args, name) <= 0:
             raise ConfigError(f"--{name.replace('_', '-')} must be positive")
     for name in ("shutdown_grace_seconds", "retry_wait_seconds"):
@@ -3574,8 +3619,6 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--end-index", type=int, default=ROW_LIMIT - 1)
     run.add_argument("--worker-restarts", type=int, default=2,
                      help="In-run restarts per worker before its rows are released")
-    run.add_argument("--stale-claim-seconds", type=float, default=3600,
-                     help="Running rows older than this are reclaimed at startup")
     run.add_argument("--worker-timeout", type=float, default=1800,
                      help="Kill a worker with no heartbeat for this many seconds")
     run.add_argument("--poll-seconds", type=float, default=2.0)
