@@ -10,9 +10,11 @@ import importlib.util
 import io
 import json
 import sqlite3
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -753,6 +755,18 @@ class LedgerTransitionTests(unittest.TestCase):
             self.assertEqual(len(ledger.attempts_for([row_id])[row_id]), 1)
             ledger.close()
 
+    def test_late_result_for_rejected_row_is_ignored(self):
+        row_id = self.ids(0)[0]
+        self.claim_one(0)
+        self.ledger.record_result(fail_result(row_id, 0, category="integrity",
+                                              detail="image checksum mismatch"),
+                                  policy=self.policy)
+        self.assertEqual(self.ledger.get(row_id)["state"], b.STATE_REJECTED)
+        self.assertEqual(self.ledger.record_result(ok_result(row_id, 0), policy=self.policy),
+                         b.STATE_REJECTED)
+        self.assertEqual(self.ledger.get(row_id)["state"], b.STATE_REJECTED)
+        self.assertIsNone(self.ledger.get(row_id)["instruction"])
+
     def test_checkpoint_backup_is_readable(self):
         row_id = self.ids(0)[0]
         self.claim_one(0)
@@ -884,7 +898,8 @@ class FakeEngine:
     """Deterministic fake engine: text is derived from the prompt's row id."""
 
     def __init__(self, job, *, crash_rows=(), fail_rows=(), prompt_mismatch=False,
-                 short_batch=False, log_path=None, truncate_rows=(), invalid_rows=()):
+                 short_batch=False, log_path=None, truncate_rows=(), invalid_rows=(),
+                 reverse_outputs=False, fail_first_call=False):
         self.job = job
         self.crash_rows = set(crash_rows)
         self.fail_rows = set(fail_rows)
@@ -893,6 +908,9 @@ class FakeEngine:
         self.log_path = log_path
         self.truncate_rows = set(truncate_rows)
         self.invalid_rows = set(invalid_rows)
+        self.reverse_outputs = reverse_outputs
+        self.fail_first_call = fail_first_call
+        self.calls = 0
 
     def _log(self, row_id):
         if self.log_path:
@@ -900,6 +918,9 @@ class FakeEngine:
                 handle.write(row_id + "\n")
 
     def generate(self, items):
+        self.calls += 1
+        if self.fail_first_call and self.calls == 1:
+            raise RuntimeError("simulated warmup engine failure")
         outputs = []
         for index, item in enumerate(items):
             row_id = item["row_id"]
@@ -921,6 +942,8 @@ class FakeEngine:
                                           completion_tokens=len(text.split())))
         if self.short_batch:
             outputs = outputs[:-1]
+        if self.reverse_outputs:
+            outputs = list(reversed(outputs))
         if self.prompt_mismatch and outputs:
             outputs[0].prompt = "wrong prompt"
         return outputs
@@ -1072,7 +1095,27 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(results, {})
         self.assertFalse(any((self.work / "results").glob("*.json")))
 
-    def test_worker_writes_heartbeat(self):
+    def test_worker_detects_swapped_engine_outputs(self):
+        """No positional cross-row assignment: reversed outputs abort the batch."""
+        tasks = [worker_task(self.work, index) for index in range(3)]
+        engine = FakeEngine(None, reverse_outputs=True)
+        code, results = self.run_worker(tasks, engine=engine, per_replica=3)
+        self.assertEqual(code, 3)
+        self.assertEqual(len(results), 3)
+        for result in results.values():
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["error_category"], "engine_transient")
+            self.assertIn("does not match", result["error_detail"])
+
+    def test_worker_warmup_failure_exits_without_results(self):
+        tasks = [worker_task(self.work, index) for index in range(2)]
+        engine = FakeEngine(None, fail_first_call=True)
+        code, results = self.run_worker(tasks, engine=engine, warmup=1)
+        self.assertEqual(code, 3)
+        self.assertEqual(results, {})
+        self.assertFalse(any((self.work / "results").glob("*.json")))
+
+    def test_worker_heartbeat_records_progress(self):
         tasks = [worker_task(self.work, index) for index in range(2)]
         self.run_worker(tasks, per_replica=2)
         heartbeat = json.loads((self.work / "heartbeat.json").read_text())
@@ -1090,6 +1133,70 @@ class WorkerTests(unittest.TestCase):
         b.filter_task_file(source, destination, keep)
         kept = [json.loads(line)["row_id"] for line in destination.read_text().splitlines()]
         self.assertEqual(kept, [tasks[1]["row_id"], tasks[3]["row_id"]])
+
+    def test_worker_last_activity_tracks_heartbeat(self):
+        handle = types.SimpleNamespace(started_at=time.time() - 100)
+        heartbeat = self.work / "heartbeat.json"
+        self.assertLessEqual(b._worker_last_activity(handle, heartbeat), time.time() - 99)
+        heartbeat.write_text("{}")
+        self.assertGreaterEqual(b._worker_last_activity(handle, heartbeat), time.time() - 1)
+
+    def test_stop_flag_records_signal_name(self):
+        flag = b.StopFlag()
+        self.assertFalse(flag.requested)
+        flag.handle(signal.SIGTERM, None)
+        self.assertTrue(flag.requested)
+        self.assertEqual(flag.signal_name, "SIGTERM")
+
+
+class RunArgumentTests(unittest.TestCase):
+    def parse(self, *extra):
+        return b.build_parser().parse_args(
+            ["run", "--work", "/tmp/w", "--vllm-sif", "/tmp/v.sif", *extra])
+
+    def test_chunk_bounds_are_validated(self):
+        b.validate_run_args(self.parse())
+        for extra in (["--start-index", "-1"], ["--end-index", "100000"],
+                      ["--start-index", "10", "--end-index", "5"],
+                      ["--max-rows-this-run", "0"], ["--max-runtime-minutes", "0"],
+                      ["--worker-restarts", "-1"], ["--warmup-samples", "-1"],
+                      ["--poll-seconds", "0"], ["--stale-claim-seconds", "0"],
+                      ["--worker-timeout", "0"], ["--max-transient-attempts", "0"],
+                      ["--retry-backoff-base-seconds", "-1"]):
+            with self.assertRaises(b.ConfigError, msg=str(extra)):
+                b.validate_run_args(self.parse(*extra))
+
+    def test_module_import_does_not_require_heavy_dependencies(self):
+        """Importing the module must not pull in pyarrow, PIL, datasets or vLLM."""
+        program = (
+            "import importlib.util, sys;"
+            "spec = importlib.util.spec_from_file_location('b', sys.argv[1]);"
+            "module = importlib.util.module_from_spec(spec); sys.modules['b'] = module;"
+            "spec.loader.exec_module(module);"
+            "heavy = [name for name in ('pyarrow', 'PIL', 'datasets', 'vllm', 'torch')"
+            " if name in sys.modules];"
+            "print(','.join(heavy))"
+        )
+        result = subprocess.run([sys.executable, "-c", program,
+                                 str(Path(b.__file__).resolve())],
+                                capture_output=True, text=True, check=True)
+        self.assertEqual(result.stdout.strip(), "")
+
+    def test_manifest_verify_rejects_rejected_row_without_reason(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            make_work_fixture(work, rows=3)
+            lines = b.manifest_path(work).read_text().splitlines()
+            entry = json.loads(lines[1])
+            entry["status"] = "rejected"
+            entry["rejection_reason"] = None
+            lines[1] = json.dumps(entry, ensure_ascii=False, sort_keys=True)
+            b.manifest_path(work).write_text("\n".join(lines) + "\n")
+            meta = json.loads(b.manifest_meta_path(work).read_text())
+            meta["manifest_sha256"] = b.sha256_file(b.manifest_path(work))
+            b.manifest_meta_path(work).write_text(json.dumps(meta))
+            with self.assertRaisesRegex(b.ManifestError, "no rejection reason"):
+                b.verify_manifest(work, quick=True)
 
 
 class AssignmentTests(unittest.TestCase):

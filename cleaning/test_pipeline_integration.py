@@ -631,6 +631,52 @@ class AuditAndStatusTests(unittest.TestCase):
         self.assertTrue({"export.only_complete_rows", "export.rows_map_to_manifest"} & failed,
                         failed)
 
+    def test_audit_fails_on_duplicate_ids(self):
+        # The primary key makes duplicates impossible through the API; the audit
+        # still has to catch a hand-modified ledger.
+        with b.Ledger(self.work).open() as ledger:
+            ledger.conn.execute("ALTER TABLE rows RENAME TO rows_original")
+            ledger.conn.execute("CREATE TABLE rows AS SELECT * FROM rows_original")
+            ledger.conn.execute(
+                "INSERT INTO rows (row_id, source_row_index, state, image_sha256, "
+                "tikz_sha256, updated_at) SELECT row_id, 500, state, image_sha256, "
+                "tikz_sha256, updated_at FROM rows_original LIMIT 1")
+        report = b.run_audit(self.work)
+        failed = {check["name"] for check in report["checks"] if check["status"] == "fail"}
+        self.assertIn("ledger.no_duplicate_ids", failed)
+
+    @unittest.skipUnless(HAS_PYARROW, "pyarrow is required for export tests")
+    def test_export_after_partial_run_then_completion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            make_work_fixture(work, rows=6)
+            with slurm_env():
+                self.assertEqual(b.cmd_run(
+                    run_args(work, "--max-rows-this-run", "2"),
+                    deps=LocalDeps(LocalSpawner(lambda job: FakeEngine(job)))), 3)
+            partial = b.export_dataset(work, shard_size=1)
+            self.assertEqual(partial["rows"], 2)
+            self.assertEqual(partial["shards"], 2)
+            with slurm_env():
+                self.assertEqual(b.cmd_run(
+                    run_args(work), deps=LocalDeps(LocalSpawner(lambda job: FakeEngine(job)))), 0)
+            final = b.export_dataset(work, shard_size=1)
+            self.assertEqual(final["rows"], 6)
+            self.assertEqual(final["shards"], 6)
+            self.assertEqual(len(list((work / "export" / "shards").glob("*.parquet"))), 6)
+
+    @unittest.skipUnless(HAS_PYARROW, "pyarrow is required for export tests")
+    def test_atomic_shard_tmp_files_are_never_treated_as_shards(self):
+        b.export_dataset(self.work, shard_size=5)
+        stray = self.work / "export" / "shards" / "shard-99999.parquet.tmp"
+        stray.write_text("interrupted write")
+        report = b.run_audit(self.work)
+        self.assertEqual([check for check in report["checks"] if check["status"] == "fail"], [])
+        # A re-export rebuilds the real shards and leaves the stray file untouched.
+        meta = b.export_dataset(self.work, shard_size=5)
+        self.assertEqual(meta["rows"], 8)
+        self.assertTrue(stray.is_file())
+
     def test_validate_command_reports_and_fails_on_corruption(self):
         output = io.StringIO()
         with contextlib.redirect_stdout(output):
