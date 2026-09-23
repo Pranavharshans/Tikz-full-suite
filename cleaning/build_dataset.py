@@ -29,6 +29,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -1300,6 +1301,11 @@ class Ledger:
         return [dict(row) for row in self.conn.execute(
             "SELECT * FROM attempts ORDER BY row_id, attempt_id")]
 
+    def next_retry_time(self) -> float | None:
+        row = self.conn.execute(
+            "SELECT MIN(not_before) AS t FROM rows WHERE state = ?", (STATE_RETRYABLE,)).fetchone()
+        return row["t"] if row and row["t"] is not None else None
+
     def complete_rows(self) -> list[dict]:
         return [dict(row) for row in self.conn.execute(
             "SELECT * FROM rows WHERE state = ? ORDER BY source_row_index", (STATE_COMPLETE,))]
@@ -1378,66 +1384,75 @@ class Ledger:
     def record_result(self, result: dict, *, policy: RetryPolicy,
                       now: float | None = None) -> str:
         """Commit one worker result transactionally and return the new row state."""
-        now = time.time() if now is None else now
-        row_id = result["row_id"]
         with self.transaction():
-            row = self.conn.execute("SELECT * FROM rows WHERE row_id = ?", (row_id,)).fetchone()
-            if row is None:
-                raise LedgerError(f"Result for unknown row {row_id}")
-            if row["state"] == STATE_COMPLETE:
-                # Crash between commit and result-file consumption: verify and no-op.
-                if row["instruction"] != result.get("instruction"):
-                    raise LedgerError(
-                        f"Row {row_id} is already complete with a different instruction; "
-                        "refusing to overwrite a completed caption")
-                return STATE_COMPLETE
-            if row["state"] == STATE_REJECTED:
-                return STATE_REJECTED  # terminal; late results are ignored
-            attempt = self._open_attempt(row_id, result.get("worker"))
-            if attempt is not None:
-                # Represent the just-finished attempt by its own result so the
-                # retry budget and truncation escalation see it immediately.
-                attempts = [dict(result) if row["attempt_id"] == attempt["attempt_id"] else row
-                            for row in self._attempts(row_id)]
-                decision = decide_result(result, attempts, policy)
-                self._close_attempt(attempt["attempt_id"], result, decision.state, now)
-            else:
-                # Recovered result from a crashed run: no open attempt remains.
-                attempts = self._attempts(row_id) + [dict(result)]
-                decision = decide_result(result, attempts, policy)
-                attempt_no = row["attempt_count"] + 1
-                self.conn.execute(
-                    "INSERT INTO attempts (row_id, attempt_no, attempt_kind, state, worker, "
-                    "max_tokens, started_at, ended_at) VALUES (?, ?, 'recovered', ?, ?, ?, ?, ?)",
-                    (row_id, attempt_no, decision.state, result.get("worker"),
-                     result.get("max_tokens"), now, now))
-                self._close_attempt(self.conn.execute("SELECT last_insert_rowid()").fetchone()[0],
-                                    result, decision.state, now)
-                self.conn.execute(
-                    "UPDATE rows SET attempt_count = ? WHERE row_id = ?", (attempt_no, row_id))
-            if decision.state == STATE_COMPLETE:
-                self.conn.execute(
-                    "UPDATE rows SET state = ?, instruction = ?, finish_reason = ?, "
-                    "prompt_tokens = ?, completion_tokens = ?, model_revision = ?, "
-                    "prompt_sha256 = ?, config_hash = ?, completed_at = ?, "
-                    "last_error_category = NULL, last_error_detail = NULL, updated_at = ? "
-                    "WHERE row_id = ?",
-                    (STATE_COMPLETE, result.get("instruction"), result.get("finish_reason"),
-                     result.get("prompt_tokens"), result.get("completion_tokens"),
-                     result.get("model_revision"), result.get("prompt_sha256"),
-                     result.get("config_hash"), now, now, row_id))
-            elif decision.state == STATE_RETRYABLE:
-                self.conn.execute(
-                    "UPDATE rows SET state = ?, not_before = ?, last_error_category = ?, "
-                    "last_error_detail = ?, updated_at = ? WHERE row_id = ?",
-                    (STATE_RETRYABLE, now + decision.backoff_seconds, decision.reason,
-                     decision.detail, now, row_id))
-            else:
-                self.conn.execute(
-                    "UPDATE rows SET state = ?, rejection_reason = ?, last_error_category = ?, "
-                    "last_error_detail = ?, updated_at = ? WHERE row_id = ?",
-                    (STATE_REJECTED, decision.reason, decision.category, decision.detail,
-                     now, row_id))
+            return self._record_result_locked(result, policy, time.time() if now is None else now)
+
+    def record_results(self, results, *, policy: RetryPolicy,
+                       now: float | None = None) -> list[str]:
+        """Commit a batch of results in one transaction."""
+        moment = time.time() if now is None else now
+        with self.transaction():
+            return [self._record_result_locked(result, policy, moment) for result in results]
+
+    def _record_result_locked(self, result: dict, policy: RetryPolicy, now: float) -> str:
+        row_id = result["row_id"]
+        row = self.conn.execute("SELECT * FROM rows WHERE row_id = ?", (row_id,)).fetchone()
+        if row is None:
+            raise LedgerError(f"Result for unknown row {row_id}")
+        if row["state"] == STATE_COMPLETE:
+            # Crash between commit and result-file consumption: verify and no-op.
+            if row["instruction"] != result.get("instruction"):
+                raise LedgerError(
+                    f"Row {row_id} is already complete with a different instruction; "
+                    "refusing to overwrite a completed caption")
+            return STATE_COMPLETE
+        if row["state"] == STATE_REJECTED:
+            return STATE_REJECTED  # terminal; late results are ignored
+        attempt = self._open_attempt(row_id, result.get("worker"))
+        if attempt is not None:
+            # Represent the just-finished attempt by its own result so the
+            # retry budget and truncation escalation see it immediately.
+            attempts = [dict(result) if row["attempt_id"] == attempt["attempt_id"] else row
+                        for row in self._attempts(row_id)]
+            decision = decide_result(result, attempts, policy)
+            self._close_attempt(attempt["attempt_id"], result, decision.state, now)
+        else:
+            # Recovered result from a crashed run: no open attempt remains.
+            attempts = self._attempts(row_id) + [dict(result)]
+            decision = decide_result(result, attempts, policy)
+            attempt_no = row["attempt_count"] + 1
+            self.conn.execute(
+                "INSERT INTO attempts (row_id, attempt_no, attempt_kind, state, worker, "
+                "max_tokens, started_at, ended_at) VALUES (?, ?, 'recovered', ?, ?, ?, ?, ?)",
+                (row_id, attempt_no, decision.state, result.get("worker"),
+                 result.get("max_tokens"), now, now))
+            self._close_attempt(self.conn.execute("SELECT last_insert_rowid()").fetchone()[0],
+                                result, decision.state, now)
+            self.conn.execute(
+                "UPDATE rows SET attempt_count = ? WHERE row_id = ?", (attempt_no, row_id))
+        if decision.state == STATE_COMPLETE:
+            self.conn.execute(
+                "UPDATE rows SET state = ?, instruction = ?, finish_reason = ?, "
+                "prompt_tokens = ?, completion_tokens = ?, model_revision = ?, "
+                "prompt_sha256 = ?, config_hash = ?, completed_at = ?, "
+                "last_error_category = NULL, last_error_detail = NULL, updated_at = ? "
+                "WHERE row_id = ?",
+                (STATE_COMPLETE, result.get("instruction"), result.get("finish_reason"),
+                 result.get("prompt_tokens"), result.get("completion_tokens"),
+                 result.get("model_revision"), result.get("prompt_sha256"),
+                 result.get("config_hash"), now, now, row_id))
+        elif decision.state == STATE_RETRYABLE:
+            self.conn.execute(
+                "UPDATE rows SET state = ?, not_before = ?, last_error_category = ?, "
+                "last_error_detail = ?, updated_at = ? WHERE row_id = ?",
+                (STATE_RETRYABLE, now + decision.backoff_seconds, decision.reason,
+                 decision.detail, now, row_id))
+        else:
+            self.conn.execute(
+                "UPDATE rows SET state = ?, rejection_reason = ?, last_error_category = ?, "
+                "last_error_detail = ?, updated_at = ? WHERE row_id = ?",
+                (STATE_REJECTED, decision.reason, decision.category, decision.detail,
+                 now, row_id))
         return decision.state
 
     def reclaim_stale(self, stale_seconds: float, *, policy: RetryPolicy,
@@ -1531,6 +1546,876 @@ def ledger_identity_from_config(config: RunConfig, meta: dict) -> dict:
         "model_revision": config.model.revision,
         "prompt_sha256": config.prompt.sha256,
     }
+
+
+# ---------------------------------------------------------------------------
+# Inference worker (runs inside the engine container, one per GPU)
+# ---------------------------------------------------------------------------
+
+
+class WorkerError(RuntimeError):
+    """Raised when the engine cannot be trusted to associate outputs with rows."""
+
+
+@dataclass
+class EngineOutput:
+    prompt: str | None
+    text: str
+    finish_reason: str | None
+    prompt_tokens: int | None
+    completion_tokens: int | None
+
+
+def build_messages(prompt_text: str, task: dict) -> list:
+    """System prompt plus the image and the TikZ source wrapped as data."""
+    return [
+        {"role": "system", "content": prompt_text},
+        {"role": "user", "content": [
+            {"type": "image", "image": task["image"]},
+            {"type": "text", "text": "<source>\n" + task["tikz_code"] + "\n</source>"},
+        ]},
+    ]
+
+
+class ProcessorPromptBuilder:
+    """Real prompt builder: chat template plus multimodal token accounting."""
+
+    def __init__(self, job: dict):
+        from transformers import AutoProcessor
+        self.processor = AutoProcessor.from_pretrained(job["config"]["model_path"])
+
+    def __call__(self, task: dict, config: dict):
+        from PIL import Image
+        prompt = self.processor.apply_chat_template(
+            build_messages(config["prompt"], task), tokenize=False,
+            add_generation_prompt=True, enable_thinking=False)
+        with Image.open(task["image"]) as image:
+            pixels = image.convert("RGB")
+            encoded = self.processor(text=[prompt], images=[pixels], return_tensors="pt")
+        return prompt, pixels, int(encoded["input_ids"].shape[-1])
+
+
+class VllmOfflineEngine:
+    """Real engine: vLLM offline, TP1, greedy, MTP, prefix caching disabled."""
+
+    def __init__(self, job: dict):
+        from vllm import LLM
+        config = job["config"]
+        options = dict(model=config["model_path"], tensor_parallel_size=1,
+                       max_model_len=config["context"],
+                       max_num_seqs=config["per_replica_concurrency"],
+                       max_num_batched_tokens=config["batch_token_budget"],
+                       enable_chunked_prefill=True, enable_prefix_caching=False,
+                       mm_processor_cache_gb=0,
+                       gpu_memory_utilization=config["gpu_memory_utilization"])
+        options.update(bench.vllm_runtime_options())
+        if config["mtp"]:
+            options["speculative_config"] = dict(method="mtp",
+                                                 num_speculative_tokens=config["mtp"])
+        bench.dump(Path(job["engine_options_path"]), options)
+        self.llm = LLM(**options)
+        import vllm
+        bench.dump(Path(job["versions_path"]),
+                   dict(python=sys.version, engine=vllm.__version__))
+
+    def generate(self, items: list) -> list[EngineOutput]:
+        from vllm import SamplingParams
+        inputs = [dict(prompt=item["prompt"],
+                       multi_modal_data={"image": item["image"]}) for item in items]
+        params = [SamplingParams(max_tokens=item["max_tokens"], temperature=0.0)
+                  for item in items]
+        outputs = self.llm.generate(inputs, params, use_tqdm=True)
+        results = []
+        for output in outputs:
+            completion = output.outputs[0]
+            results.append(EngineOutput(
+                prompt=getattr(output, "prompt", None), text=completion.text,
+                finish_reason=completion.finish_reason,
+                prompt_tokens=len(output.prompt_token_ids) if output.prompt_token_ids else None,
+                completion_tokens=len(completion.token_ids)))
+        return results
+
+
+def write_json_atomic(path, value) -> None:
+    bench.dump(path, value)
+
+
+def worker_base_result(task: dict, config: dict, worker: str, batch_index: int) -> dict:
+    return dict(row_id=task["row_id"], source_row_index=task["source_row_index"],
+                worker=worker, batch_index=batch_index, max_tokens=task["max_tokens"],
+                ok=False, instruction=None, text=None, finish_reason=None,
+                prompt_tokens=None, completion_tokens=None,
+                error_category=None, error_detail=None,
+                image_sha256=task["image_sha256"], tikz_sha256=task["tikz_sha256"],
+                model_revision=config["model_revision"],
+                prompt_sha256=config["prompt_sha256"], config_hash=config["config_hash"])
+
+
+def error_result(task: dict, config: dict, worker: str, batch_index: int,
+                 category: str, detail: str) -> dict:
+    result = worker_base_result(task, config, worker, batch_index)
+    result.update(error_category=category, error_detail=detail)
+    return result
+
+
+def prepare_task(task: dict, builder, config: dict, worker: str, batch_index: int):
+    """Verify source identity, then build the prompt.  Returns a result dict on failure."""
+    try:
+        raw = Path(task["image"]).read_bytes()
+    except OSError as exc:
+        return error_result(task, config, worker, batch_index, "io",
+                            f"image read failed: {exc!r}")
+    if sha256_bytes(raw) != task["image_sha256"]:
+        return error_result(task, config, worker, batch_index, "integrity",
+                            "image checksum mismatch")
+    if sha256_text(task["tikz_code"]) != task["tikz_sha256"]:
+        return error_result(task, config, worker, batch_index, "integrity",
+                            "tikz checksum mismatch")
+    try:
+        prompt, image, length = builder(task, config)
+    except Exception as exc:
+        return error_result(task, config, worker, batch_index, "decode",
+                            f"prompt build failed: {exc!r}")
+    if length >= config["context"]:
+        return error_result(task, config, worker, batch_index, "input_too_long",
+                            f"input {length} tokens >= context {config['context']}")
+    return dict(task=task, prompt=prompt, image=image, length=length,
+                max_tokens=task["max_tokens"])
+
+
+def generated_result(item: dict, output: EngineOutput, config: dict, worker: str,
+                     batch_index: int) -> dict:
+    task = item["task"]
+    text = output.text or ""
+    ok = output.finish_reason == "stop" and bool(text.strip())
+    result = worker_base_result(task, config, worker, batch_index)
+    result.update(ok=ok, instruction=text.strip() if ok else None, text=text,
+                  finish_reason=output.finish_reason,
+                  prompt_tokens=output.prompt_tokens,
+                  completion_tokens=output.completion_tokens)
+    return result
+
+
+def validate_outputs(outputs: list, items: list) -> None:
+    """Refuse to trust engine outputs whose association with inputs is unclear."""
+    if len(outputs) != len(items):
+        raise WorkerError(f"engine returned {len(outputs)} outputs for {len(items)} inputs")
+    for item, output in zip(items, outputs):
+        if output.prompt is not None and output.prompt != item["prompt"]:
+            raise WorkerError(
+                f"engine prompt for {item['task']['row_id']} does not match the request")
+
+
+def write_heartbeat(job: dict, batch_index: int, rows_done: int) -> None:
+    write_json_atomic(job["heartbeat_path"], dict(
+        worker=job["worker_index"], generation=job["generation"],
+        batch_index=batch_index, rows_done=rows_done, updated_at=time.time()))
+
+
+def process_batch(*, job: dict, batch: list, batch_index: int, engine, builder,
+                  results_dir: Path, rows_done: int):
+    """Run one microbatch.  Returns (rows_done, engine_error)."""
+    config = job["config"]
+    worker = f"worker-{job['worker_index']}"
+    results, items = [], []
+    for task in batch:
+        prepared = prepare_task(task, builder, config, worker, batch_index)
+        if isinstance(prepared, dict) and "task" not in prepared:
+            results.append(prepared)
+        else:
+            items.append(prepared)
+    engine_error = None
+    if items:
+        try:
+            outputs = engine.generate([dict(prompt=item["prompt"], image=item["image"],
+                                            max_tokens=item["max_tokens"],
+                                            row_id=item["task"]["row_id"]) for item in items])
+            validate_outputs(outputs, items)
+        except Exception as exc:
+            engine_error = exc
+            for item in items:
+                results.append(error_result(item["task"], config, worker, batch_index,
+                                            "engine_transient", f"generate failed: {exc!r}"))
+        else:
+            for item, output in zip(items, outputs):
+                results.append(generated_result(item, output, config, worker, batch_index))
+    payload = dict(run_id=job["run_id"], worker=worker, worker_index=job["worker_index"],
+                   generation=job["generation"], batch_index=batch_index, results=results)
+    write_json_atomic(results_dir / f"batch-{job['generation']}-{batch_index:05d}.json", payload)
+    rows_done += len(results)
+    write_heartbeat(job, batch_index, rows_done)
+    return rows_done, engine_error
+
+
+def read_first_task(tasks_path) -> dict | None:
+    with Path(tasks_path).open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if line.strip():
+                return json.loads(line)
+    return None
+
+
+def run_worker(job_path, *, engine_factory=None, prompt_builder_factory=None) -> int:
+    """Worker entry point.  Writes one atomic result file per microbatch."""
+    job = json.loads(Path(job_path).read_text(encoding="utf-8"))
+    config = job["config"]
+    worker = f"worker-{job['worker_index']}"
+    results_dir = Path(job["results_dir"])
+    results_dir.mkdir(parents=True, exist_ok=True)
+    stop_path = Path(job["stop_path"])
+    tasks_path = Path(job["tasks_path"])
+
+    def log(message):
+        print(f"[{worker} gen{job['generation']}] {message}", flush=True)
+
+    try:
+        builder = (prompt_builder_factory or ProcessorPromptBuilder)(job)
+        engine = (engine_factory or VllmOfflineEngine)(job)
+    except Exception as exc:
+        log(f"engine startup failed: {exc!r}")
+        return 3
+    first = read_first_task(tasks_path)
+    if first is not None and config.get("warmup_samples", 1) > 0:
+        try:
+            prepared = prepare_task(first, builder, config, worker, -1)
+            if "task" in prepared:
+                outputs = engine.generate([dict(prompt=prepared["prompt"],
+                                                image=prepared["image"],
+                                                max_tokens=prepared["max_tokens"],
+                                                row_id=prepared["task"]["row_id"])])
+                if not outputs or not (outputs[0].text or "").strip():
+                    log("warmup produced no output")
+                    return 3
+                log("warmup complete")
+            else:
+                log(f"warmup row skipped: {prepared.get('error_detail')}")
+        except Exception as exc:
+            log(f"warmup failed: {exc!r}")
+            return 3
+    batch_index = 0
+    rows_done = 0
+    engine_failed = False
+    try:
+        with tasks_path.open("r", encoding="utf-8") as handle:
+            batch = []
+            for line in handle:
+                if not line.strip():
+                    continue
+                batch.append(json.loads(line))
+                if len(batch) >= config["per_replica_concurrency"]:
+                    if stop_path.exists():
+                        log("stop requested; exiting before next batch")
+                        return 0
+                    rows_done, engine_error = process_batch(
+                        job=job, batch=batch, batch_index=batch_index, engine=engine,
+                        builder=builder, results_dir=results_dir, rows_done=rows_done)
+                    batch_index += 1
+                    if engine_error is not None:
+                        log(f"engine failure; exiting for restart: {engine_error!r}")
+                        engine_failed = True
+                        break
+                    batch = []
+            if batch and not engine_failed and not stop_path.exists():
+                rows_done, engine_error = process_batch(
+                    job=job, batch=batch, batch_index=batch_index, engine=engine,
+                    builder=builder, results_dir=results_dir, rows_done=rows_done)
+                if engine_error is not None:
+                    log(f"engine failure; exiting for restart: {engine_error!r}")
+                    engine_failed = True
+    except Exception as exc:
+        log(f"worker crashed: {exc!r}")
+        return 3
+    log(f"finished {rows_done} rows")
+    return 3 if engine_failed else 0
+
+
+# ---------------------------------------------------------------------------
+# Inference controller
+# ---------------------------------------------------------------------------
+
+
+class PipelineIdentityError(RuntimeError):
+    """Raised when a result cannot be trusted to belong to this run and row."""
+
+
+class StopFlag:
+    """Cooperative SIGTERM/SIGINT handling for the controller."""
+
+    def __init__(self):
+        self.requested = False
+        self.signal_name = None
+
+    def handle(self, signum, frame):
+        self.requested = True
+        self.signal_name = signal.Signals(signum).name
+
+    class _Installer:
+        def __init__(self, flag):
+            self.flag = flag
+            self.previous = {}
+
+        def __enter__(self):
+            for sig in (signal.SIGTERM, signal.SIGINT):
+                self.previous[sig] = signal.getsignal(sig)
+                signal.signal(sig, self.flag.handle)
+            return self.flag
+
+        def __exit__(self, *exc_info):
+            for sig, handler in self.previous.items():
+                signal.signal(sig, handler)
+            return False
+
+    def installed(self):
+        return StopFlag._Installer(self)
+
+
+class SubprocessHandle:
+    """A running engine worker process."""
+
+    def __init__(self, process, log_handle):
+        self.process = process
+        self.log = log_handle
+
+    def poll(self):
+        return self.process.poll()
+
+    @property
+    def returncode(self):
+        return self.process.returncode
+
+    def terminate(self):
+        if self.process.poll() is None:
+            os.killpg(self.process.pid, signal.SIGTERM)
+
+    def kill(self):
+        if self.process.poll() is None:
+            os.killpg(self.process.pid, signal.SIGKILL)
+
+    def wait(self, timeout=None):
+        try:
+            return self.process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return None
+
+    def close(self):
+        self.log.close()
+
+
+def container_sha256(path, cache_path=None) -> str:
+    """Hash the immutable SIF bytes, cached by path/size/mtime."""
+    path = Path(path).resolve()
+    stat = path.stat()
+    key = f"{path}|{stat.st_size}|{int(stat.st_mtime)}"
+    if cache_path is not None and Path(cache_path).is_file():
+        cached = json.loads(Path(cache_path).read_text())
+        if cached.get("key") == key:
+            return cached["sha256"]
+    digest = sha256_file(path)
+    if cache_path is not None:
+        bench.dump(cache_path, dict(key=key, sha256=digest))
+    return digest
+
+
+class PipelineDeps:
+    """Injectable seams for the controller (tests replace spawner and probes)."""
+
+    def container_sha256(self, path, work) -> str:
+        return container_sha256(path, Path(work) / "runtime" / "container-sha256.json")
+
+    def probe_gpus(self) -> list[str]:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=60)
+        if result.returncode != 0:
+            raise SystemExit(f"nvidia-smi failed: {result.stderr.strip()}")
+        return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+    def spawn_worker(self, *, job_path, worker_index, device, args, work):
+        env = dict(os.environ)
+        env["APPTAINERENV_CUDA_VISIBLE_DEVICES"] = device
+        env["APPTAINERENV_NCCL_P2P_DISABLE"] = "1" if args.nccl_p2p == "disabled" else "0"
+        env["APPTAINERENV_no_proxy"] = "127.0.0.1,localhost,::1"
+        env["APPTAINERENV_NO_PROXY"] = env["APPTAINERENV_no_proxy"]
+        env["APPTAINERENV_HF_HUB_OFFLINE"] = "1"
+        env["APPTAINERENV_TRANSFORMERS_OFFLINE"] = "1"
+        binds = {str(Path(work).resolve()), str(HERE)}
+        model_path = Path(args.model_path).resolve()
+        binds.add(str(model_path))
+        command = ["apptainer", "exec", "--nv"]
+        for path in sorted(binds):
+            command += ["--bind", path]
+        command += [str(Path(args.vllm_sif).resolve()), "python3",
+                    str(Path(__file__).resolve()), "worker", "--job", str(job_path)]
+        log_path = Path(work) / "runtime" / "logs" / f"worker-{worker_index}.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log = log_path.open("w")
+        process = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT,
+                                   start_new_session=True)
+        return SubprocessHandle(process, log)
+
+    def sleep(self, seconds: float) -> None:
+        time.sleep(seconds)
+
+
+def balanced_assignment(eligible, index, workers: int) -> dict:
+    """Deterministic length-balanced assignment; per-worker rows stay index-ordered."""
+    ordered = sorted(eligible, key=lambda row: (-index[row["row_id"]]["tikz_chars"],
+                                                row["source_row_index"]))
+    loads = [0] * workers
+    buckets: list[list] = [[] for _ in range(workers)]
+    for row in ordered:
+        target = min(range(workers), key=lambda worker: (loads[worker], worker))
+        buckets[target].append(row)
+        loads[target] += index[row["row_id"]]["tikz_chars"] + 1024
+    for bucket in buckets:
+        bucket.sort(key=lambda row: row["source_row_index"])
+    return {f"worker-{worker}": [row["row_id"] for row in buckets[worker]]
+            for worker in range(workers)}
+
+
+def write_task_files(work, claims: dict, generation: int) -> dict:
+    """Stream the manifest once and write one task file per worker."""
+    work = Path(work)
+    runtime = work / "runtime" / "tasks"
+    runtime.mkdir(parents=True, exist_ok=True)
+    worker_of = {}
+    claim_of = {}
+    for worker, rows in claims.items():
+        for row in rows:
+            worker_of[row["row_id"]] = worker
+            claim_of[row["row_id"]] = row
+    paths, handles = {}, {}
+    for worker in claims:
+        paths[worker] = runtime / f"{worker}-gen{generation}.jsonl"
+        handles[worker] = paths[worker].with_suffix(".jsonl.tmp").open("w", encoding="utf-8")
+    try:
+        for entry in iter_manifest(work):
+            row_id = entry["row_id"]
+            worker = worker_of.get(row_id)
+            if worker is None:
+                continue
+            claim = claim_of[row_id]
+            task = dict(row_id=row_id, source_row_index=entry["source_row_index"],
+                        image=str(work / entry["image"]),
+                        image_sha256=entry["image_sha256"], tikz_code=entry["tikz_code"],
+                        tikz_sha256=entry["tikz_sha256"], max_tokens=claim["max_tokens"],
+                        attempt_no=claim["attempt_no"])
+            handles[worker].write(json.dumps(task, ensure_ascii=False) + "\n")
+        for handle in handles.values():
+            handle.flush()
+            os.fsync(handle.fileno())
+    finally:
+        for handle in handles.values():
+            handle.close()
+    for worker, path in paths.items():
+        os.replace(path.with_suffix(".jsonl.tmp"), path)
+    return paths
+
+
+def write_worker_job(path, *, args, config, work, worker_index: int, generation: int,
+                     tasks_path) -> Path:
+    work = Path(work)
+    job = dict(
+        run_id=config.run_id(), worker_index=worker_index, generation=generation,
+        tasks_path=str(tasks_path),
+        results_dir=str(work / "runtime" / "results" / f"worker-{worker_index}"),
+        heartbeat_path=str(work / "runtime" / "heartbeats" / f"worker-{worker_index}.json"),
+        stop_path=str(work / "runtime" / "stop"),
+        engine_options_path=str(work / "runtime" / "logs" / f"worker-{worker_index}-engine-options.json"),
+        versions_path=str(work / "runtime" / "logs" / f"worker-{worker_index}-versions.json"),
+        config=dict(
+            model_path=config.model.path, model_revision=config.model.revision,
+            prompt=config.prompt.text, prompt_version=config.prompt.version,
+            prompt_sha256=config.prompt.sha256, context=config.inference.context,
+            per_replica_concurrency=config.inference.per_replica_concurrency(worker_index),
+            batch_token_budget=config.inference.batch_token_budget, mtp=config.inference.mtp,
+            gpu_memory_utilization=config.inference.gpu_memory_utilization,
+            max_output_tokens=config.inference.max_output_tokens,
+            truncation_retry_tokens=config.inference.truncation_retry_tokens,
+            warmup_samples=args.warmup_samples, config_hash=config.identity_sha256()))
+    bench.dump(path, job)
+    return Path(path)
+
+
+def validate_result_identity(result: dict, config, index: dict) -> str | None:
+    """Fatal identity checks raise; source checksum drift returns an integrity reason."""
+    row_id = result.get("row_id")
+    meta_row = index.get(row_id)
+    if meta_row is None:
+        raise PipelineIdentityError(f"Result references unknown row {row_id!r}")
+    if result.get("source_row_index") != meta_row["source_row_index"]:
+        raise PipelineIdentityError(f"Result source index mismatch for row {row_id}")
+    if result.get("config_hash") != config.identity_sha256():
+        raise PipelineIdentityError(f"Result config hash mismatch for row {row_id}")
+    if result.get("prompt_sha256") != config.prompt.sha256:
+        raise PipelineIdentityError(f"Result prompt hash mismatch for row {row_id}")
+    if result.get("model_revision") != config.model.revision:
+        raise PipelineIdentityError(f"Result model revision mismatch for row {row_id}")
+    if result.get("image_sha256") != meta_row["image_sha256"]:
+        return "image checksum mismatch"
+    if result.get("tikz_sha256") != meta_row["tikz_sha256"]:
+        return "tikz checksum mismatch"
+    return None
+
+
+def ingest_result_files(*, ledger, work, config, index, policy) -> dict:
+    """Commit every unconsumed result file, then move it to consumed/."""
+    work = Path(work)
+    results_root = work / "runtime" / "results"
+    consumed_root = work / "runtime" / "consumed"
+    seen: dict[str, set] = {}
+    if not results_root.is_dir():
+        return seen
+    for path in sorted(results_root.glob("worker-*/*.json")):
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("run_id") != config.run_id():
+            raise PipelineIdentityError(
+                f"Result file {path} belongs to run {data.get('run_id')!r}, not {config.run_id()!r}")
+        worker = data.get("worker")
+        if worker != f"worker-{data.get('worker_index')}":
+            raise PipelineIdentityError(f"Result file {path} has an inconsistent worker label")
+        results, row_ids = [], []
+        for result in data.get("results", []):
+            if result.get("worker") != worker:
+                raise PipelineIdentityError(
+                    f"Result for {result.get('row_id')} claims worker {result.get('worker')!r} "
+                    f"but arrived in {worker}'s file")
+            if result["row_id"] in row_ids:
+                raise PipelineIdentityError(
+                    f"Duplicate result for {result['row_id']} inside {path}")
+            reason = validate_result_identity(result, config, index)
+            if reason is not None:
+                result = dict(result, ok=False, instruction=None, finish_reason=None,
+                              error_category="integrity", error_detail=reason)
+            row = ledger.get(result["row_id"])
+            if row is None:
+                raise PipelineIdentityError(f"Result for unknown row {result['row_id']}")
+            if row["state"] == STATE_RUNNING and row["worker"] != worker:
+                raise PipelineIdentityError(
+                    f"Row {result['row_id']} is claimed by {row['worker']!r} but a result "
+                    f"arrived from {worker!r}")
+            results.append(result)
+            row_ids.append(result["row_id"])
+        ledger.record_results(results, policy=policy)
+        destination = consumed_root / worker / path.name
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(path, destination)
+        seen.setdefault(worker, set()).update(row_ids)
+    return seen
+
+
+def filter_task_file(source, destination, keep_row_ids) -> Path:
+    """Rewrite an existing task file keeping only the rows still outstanding."""
+    source, destination = Path(source), Path(destination)
+    temporary = destination.with_suffix(destination.suffix + ".tmp")
+    with source.open("r", encoding="utf-8") as reader, temporary.open("w", encoding="utf-8") as writer:
+        for line in reader:
+            if not line.strip():
+                continue
+            task = json.loads(line)
+            if task["row_id"] in keep_row_ids:
+                writer.write(json.dumps(task, ensure_ascii=False) + "\n")
+        writer.flush()
+        os.fsync(writer.fileno())
+    os.replace(temporary, destination)
+    return destination
+
+
+def _worker_last_activity(handle, heartbeat_path) -> float:
+    latest = getattr(handle, "started_at", 0.0)
+    try:
+        latest = max(latest, Path(heartbeat_path).stat().st_mtime)
+    except OSError:
+        pass
+    return latest
+
+
+def run_wave(*, args, config, work, deps, ledger, index, policy, wave, stop_flag,
+             deadline, claimed_so_far: int) -> int:
+    """Claim rows, run both replicas to completion, reclaim what they left.
+
+    Returns the number of rows claimed in this wave.
+    """
+    work = Path(work)
+    remaining = None
+    if args.max_rows_this_run:
+        remaining = args.max_rows_this_run - claimed_so_far
+        if remaining <= 0:
+            return 0
+    eligible = ledger.eligible(start_index=args.start_index, end_index=args.end_index,
+                               limit=remaining)
+    if not eligible:
+        return 0
+    assignments = balanced_assignment(eligible, index, workers=config.inference.replicas)
+    claims = ledger.claim(assignments, policy=policy)
+    claimed_count = sum(len(rows) for rows in claims.values())
+    print(f"wave {wave}: claimed {claimed_count} rows", flush=True)
+    task_paths = write_task_files(work, claims, wave)
+    handles, outstanding, restarts, stall_deadline = {}, {}, {}, {}
+    devices = [part for part in os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",") if part]
+    worker_indexes = sorted(int(worker.split("-")[1]) for worker in claims)
+
+    def start(worker_index):
+        worker = f"worker-{worker_index}"
+        if restarts[worker_index] == 0:
+            tasks_for_worker = task_paths[worker]
+        else:
+            tasks_for_worker = work / "runtime" / "tasks" / (
+                f"{worker}-gen{wave}-r{restarts[worker_index]}.jsonl")
+            filter_task_file(task_paths[worker], tasks_for_worker, outstanding[worker_index])
+        job_path = work / "runtime" / "jobs" / f"{worker}-gen{wave}-r{restarts[worker_index]}.json"
+        job_path.parent.mkdir(parents=True, exist_ok=True)
+        write_worker_job(job_path, args=args, config=config, work=work,
+                         worker_index=worker_index, generation=wave,
+                         tasks_path=tasks_for_worker)
+        handle = deps.spawn_worker(job_path=job_path, worker_index=worker_index,
+                                   device=devices[worker_index], args=args, work=work)
+        handle.started_at = time.time()
+        handles[worker_index] = handle
+
+    for worker_index in worker_indexes:
+        worker = f"worker-{worker_index}"
+        outstanding[worker_index] = {row["row_id"] for row in claims[worker]}
+        restarts[worker_index] = 0
+        start(worker_index)
+
+    def ingest():
+        ingested = ingest_result_files(ledger=ledger, work=work, config=config,
+                                       index=index, policy=policy)
+        for worker_index in handles:
+            worker = f"worker-{worker_index}"
+            if worker in ingested:
+                outstanding[worker_index] -= ingested[worker]
+        return ingested
+
+    def release_outstanding(category):
+        for worker_index, rows in outstanding.items():
+            if rows:
+                ledger.release_running(worker=f"worker-{worker_index}",
+                                       category=category, policy=policy)
+                outstanding[worker_index] = set()
+
+    try:
+        while True:
+            ingest()
+            if stop_flag.requested:
+                _request_stop(work)
+                _drain_workers(args, handles)
+                ingest()
+                release_outstanding("run_interrupted")
+                return claimed_count
+            if deadline is not None and time.time() > deadline:
+                _request_stop(work)
+                print("Runtime budget reached; stopping workers", flush=True)
+                _drain_workers(args, handles)
+                ingest()
+                release_outstanding("run_interrupted")
+                return claimed_count
+            now = time.time()
+            for worker_index, handle in list(handles.items()):
+                worker = f"worker-{worker_index}"
+                heartbeat = work / "runtime" / "heartbeats" / f"{worker}.json"
+                if handle.poll() is None:
+                    last = _worker_last_activity(handle, heartbeat)
+                    if worker_index not in stall_deadline and now - last > args.worker_timeout:
+                        print(f"{worker} stalled for {args.worker_timeout}s; terminating",
+                              flush=True)
+                        handle.terminate()
+                        stall_deadline[worker_index] = now + 60
+                    elif worker_index in stall_deadline and now > stall_deadline[worker_index]:
+                        print(f"{worker} did not exit; killing", flush=True)
+                        handle.kill()
+                    continue
+                # Worker exited: sweep its final results, then restart or release.
+                ingest()
+                if outstanding[worker_index]:
+                    if restarts[worker_index] >= args.worker_restarts:
+                        print(f"{worker} exited rc={handle.returncode} with "
+                              f"{len(outstanding[worker_index])} rows left; releasing",
+                              flush=True)
+                        ledger.release_running(worker=worker, category="worker_lost",
+                                               policy=policy)
+                        outstanding[worker_index] = set()
+                    else:
+                        restarts[worker_index] += 1
+                        print(f"{worker} exited rc={handle.returncode}; restart "
+                              f"{restarts[worker_index]}/{args.worker_restarts}", flush=True)
+                        handle.close()
+                        start(worker_index)
+            if all(handle.poll() is not None for handle in handles.values()) and \
+                    not any(outstanding.values()):
+                return claimed_count
+            deps.sleep(args.poll_seconds)
+    finally:
+        for handle in handles.values():
+            handle.close()
+
+
+def _request_stop(work) -> None:
+    stop = Path(work) / "runtime" / "stop"
+    stop.parent.mkdir(parents=True, exist_ok=True)
+    stop.touch()
+
+
+def _drain_workers(args, handles) -> None:
+    deadline = time.time() + args.shutdown_grace_seconds
+    while time.time() < deadline:
+        if all(handle.poll() is not None for handle in handles.values()):
+            return
+        time.sleep(1)
+    for handle in handles.values():
+        if handle.poll() is None:
+            handle.terminate()
+    deadline = time.time() + 30
+    while time.time() < deadline:
+        if all(handle.poll() is not None for handle in handles.values()):
+            return
+        time.sleep(1)
+    for handle in handles.values():
+        if handle.poll() is None:
+            handle.kill()
+
+
+def run_pipeline(args, config, meta, deps, stop_flag=None) -> dict:
+    """Wave-based controller: claim, run, ingest, reclaim, repeat."""
+    work = Path(args.work).resolve()
+    stop_flag = stop_flag or StopFlag()
+    policy = RetryPolicy(max_transient_attempts=args.max_transient_attempts,
+                         backoff_base_seconds=args.retry_backoff_base_seconds,
+                         backoff_cap_seconds=args.retry_backoff_cap_seconds,
+                         normal_max_tokens=config.inference.max_output_tokens,
+                         truncation_max_tokens=config.inference.truncation_retry_tokens)
+    index = manifest_index(work)
+    started = time.monotonic()
+    deadline = started + args.max_runtime_minutes * 60 if args.max_runtime_minutes else None
+    ledger = Ledger(work).open()
+    claimed_so_far = 0
+    try:
+        # A leftover stop marker from an interrupted run must not stop this one.
+        stop_path = work / "runtime" / "stop"
+        if stop_path.exists():
+            stop_path.unlink()
+        ledger.initialize(ledger_identity_from_config(config, meta))
+        seeded = ledger.seed(iter_manifest(work), rows_frozen=meta["rows_frozen"])
+        if seeded["inserted"]:
+            print(f"Ledger seeded: {seeded['inserted']} rows "
+                  f"({seeded['rejected']} manifest-rejected)", flush=True)
+        resumed = ingest_result_files(ledger=ledger, work=work, config=config, index=index,
+                                      policy=policy)
+        if resumed:
+            print(f"Recovered results from a previous run: "
+                  f"{sum(len(rows) for rows in resumed.values())} rows", flush=True)
+        reclaimed = ledger.reclaim_stale(args.stale_claim_seconds, policy=policy)
+        if reclaimed:
+            print(f"Reclaimed {reclaimed} stale running rows", flush=True)
+        if args.reprocess_rejected:
+            moved = ledger.reprocess_rejected(policy=policy)
+            print(f"Reprocessing {moved} rejected rows at the operator's request", flush=True)
+        wave = 0
+        while True:
+            if stop_flag.requested:
+                print(f"Stop requested ({stop_flag.signal_name}); no new claims", flush=True)
+                break
+            if deadline is not None and time.monotonic() > deadline:
+                print("Runtime budget reached; no new claims", flush=True)
+                break
+            if args.max_rows_this_run and claimed_so_far >= args.max_rows_this_run:
+                print("Row budget reached; no new claims", flush=True)
+                break
+            if not ledger.eligible(start_index=args.start_index, end_index=args.end_index,
+                                   limit=1):
+                next_retry = ledger.next_retry_time()
+                now = time.time()
+                if (next_retry is not None and next_retry - now <= args.retry_wait_seconds
+                        and (deadline is None or now + (next_retry - now) < deadline)):
+                    wait = max(0.0, next_retry - now)
+                    print(f"Waiting {wait:.0f}s for retry backoff", flush=True)
+                    deps.sleep(wait)
+                    continue
+                break
+            claimed_so_far += run_wave(
+                args=args, config=config, work=work, deps=deps, ledger=ledger, index=index,
+                policy=policy, wave=wave + 1, stop_flag=stop_flag, deadline=deadline,
+                claimed_so_far=claimed_so_far)
+            wave += 1
+        counts = ledger.counts()
+        states = counts["states"]
+        remaining = states["pending"] + states["retryable"] + states["running"]
+        elapsed = time.monotonic() - started
+        print(f"Run finished in {elapsed / 60:.1f} min: {states}", flush=True)
+        if counts["last_complete_at"] and counts["first_complete_at"]:
+            active = max(1.0, counts["last_complete_at"] - counts["first_complete_at"])
+            print(f"Throughput: {states['complete'] / active * 3600:.1f} successful samples/hour "
+                  f"(generation window)", flush=True)
+        checkpoint = ledger.checkpoint()
+        print(f"Ledger checkpoint: {checkpoint}", flush=True)
+        return dict(states=states, remaining=remaining, elapsed_s=elapsed,
+                    exit_code=0 if remaining == 0 else 3)
+    finally:
+        ledger.close()
+
+
+def validate_run_args(args) -> None:
+    if not 0 <= args.start_index <= args.end_index <= ROW_LIMIT - 1:
+        raise ConfigError(
+            f"Chunk bounds must satisfy 0 <= start <= end <= {ROW_LIMIT - 1}; got "
+            f"{args.start_index}..{args.end_index}")
+    if args.max_rows_this_run is not None and args.max_rows_this_run < 1:
+        raise ConfigError("--max-rows-this-run must be positive")
+    if args.max_runtime_minutes is not None and args.max_runtime_minutes <= 0:
+        raise ConfigError("--max-runtime-minutes must be positive")
+    if args.worker_restarts < 0:
+        raise ConfigError("--worker-restarts cannot be negative")
+    if args.warmup_samples < 0:
+        raise ConfigError("--warmup-samples cannot be negative")
+    for name in ("stale_claim_seconds", "worker_timeout", "poll_seconds"):
+        if getattr(args, name) <= 0:
+            raise ConfigError(f"--{name.replace('_', '-')} must be positive")
+    for name in ("shutdown_grace_seconds", "retry_wait_seconds"):
+        if getattr(args, name) < 0:
+            raise ConfigError(f"--{name.replace('_', '-')} cannot be negative")
+    if args.max_transient_attempts < 1:
+        raise ConfigError("--max-transient-attempts must be positive")
+    for name in ("retry_backoff_base_seconds", "retry_backoff_cap_seconds"):
+        if getattr(args, name) < 0:
+            raise ConfigError(f"--{name.replace('_', '-')} cannot be negative")
+
+
+def cmd_run(args, deps=None) -> int:
+    require_slurm(args, gpus=2)
+    validate_run_args(args)
+    deps = deps or PipelineDeps()
+    work = Path(args.work).resolve()
+    meta = verify_manifest(work, quick=True)
+    if meta.get("row_limit") != ROW_LIMIT and not args.allow_non_slurm:
+        raise ConfigError(
+            f"Manifest freezes {meta.get('row_limit')} rows; production requires {ROW_LIMIT}")
+    if not args.vllm_sif:
+        raise ConfigError("run requires --vllm-sif (the engine container)")
+    container = deps.container_sha256(args.vllm_sif, work)
+    config = config_from_args(args, manifest_meta=meta, container_sha256=container,
+                              require_pinned=True)
+    if not config.model.path:
+        raise ConfigError(
+            "The frozen manifest has no model snapshot path; rerun prepare with "
+            "--download-model (or place the snapshot and re-run prepare)")
+    args.model_path = config.model.path
+    if run_record_path(work).is_file():
+        verify_run_record(work, config)
+    else:
+        record = write_run_record(work, config)
+        print(f"Run identity recorded: {record['run_id']}", flush=True)
+    gpus = deps.probe_gpus()
+    if len(gpus) != 2:
+        raise SystemExit(f"Expected exactly 2 visible GPUs, found {len(gpus)}: {gpus}")
+    if not all("RTX PRO 6000" in name for name in gpus):
+        raise SystemExit(f"Expected RTX PRO 6000 GPUs for the production baseline, found {gpus}")
+    stop_flag = StopFlag()
+    with stop_flag.installed():
+        summary = run_pipeline(args, config, meta, deps, stop_flag)
+    if summary["exit_code"]:
+        print(f"{summary['remaining']} rows still need work; rerun to resume", flush=True)
+    return summary["exit_code"]
 
 
 # ---------------------------------------------------------------------------
@@ -1663,6 +2548,40 @@ def build_parser() -> argparse.ArgumentParser:
     checkpoint = subparsers.add_parser("checkpoint", help="Copy the ledger to a backup file")
     add_common_arguments(checkpoint)
     checkpoint.set_defaults(handler=cmd_checkpoint)
+
+    run = subparsers.add_parser(
+        "run", help="Run identity-safe inference until rows reach a terminal state")
+    add_common_arguments(run)
+    run.add_argument("--vllm-sif", default="", help="vLLM Apptainer image for engine workers")
+    run.add_argument("--max-rows-this-run", type=int, default=None,
+                     help="Bounded production chunk: stop claiming after this many rows")
+    run.add_argument("--max-runtime-minutes", type=float, default=None,
+                     help="Stop claiming and drain workers after this many minutes")
+    run.add_argument("--start-index", type=int, default=ROW_START)
+    run.add_argument("--end-index", type=int, default=ROW_LIMIT - 1)
+    run.add_argument("--worker-restarts", type=int, default=2,
+                     help="In-run restarts per worker before its rows are released")
+    run.add_argument("--stale-claim-seconds", type=float, default=3600,
+                     help="Running rows older than this are reclaimed at startup")
+    run.add_argument("--worker-timeout", type=float, default=1800,
+                     help="Kill a worker with no heartbeat for this many seconds")
+    run.add_argument("--poll-seconds", type=float, default=2.0)
+    run.add_argument("--shutdown-grace-seconds", type=float, default=120)
+    run.add_argument("--retry-wait-seconds", type=float, default=300,
+                     help="Wait this long for short retry backoffs before ending the run")
+    run.add_argument("--warmup-samples", type=int, default=1,
+                     help="Untimed warmup generations per worker (0 disables)")
+    run.add_argument("--reprocess-rejected", action="store_true",
+                     help="Explicitly move rejected rows back to pending")
+    run.add_argument("--max-transient-attempts", type=int, default=3,
+                     help="Bounded transient retry budget per row")
+    run.add_argument("--retry-backoff-base-seconds", type=float, default=30.0)
+    run.add_argument("--retry-backoff-cap-seconds", type=float, default=600.0)
+    run.set_defaults(handler=cmd_run)
+
+    worker = subparsers.add_parser("worker", help=argparse.SUPPRESS)
+    worker.add_argument("--job", required=True)
+    worker.set_defaults(handler=lambda args: run_worker(args.job))
     return parser
 
 
@@ -1675,7 +2594,8 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     try:
         return args.handler(args)
-    except (ConfigError, IdentityMismatch, PromptError, ManifestError) as exc:
+    except (ConfigError, IdentityMismatch, PromptError, ManifestError, LedgerError,
+            PipelineIdentityError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

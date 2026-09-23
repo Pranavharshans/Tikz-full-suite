@@ -811,5 +811,367 @@ class LedgerTransitionTests(unittest.TestCase):
         self.assertIn("engine_transient", counts["error_categories"])
 
 
+# ---------------------------------------------------------------------------
+# Feature 4: identity-safe inference
+# ---------------------------------------------------------------------------
+
+
+class FakeEngine:
+    """Deterministic fake engine: text is derived from the prompt's row id."""
+
+    def __init__(self, job, *, crash_rows=(), fail_rows=(), prompt_mismatch=False,
+                 short_batch=False, log_path=None):
+        self.job = job
+        self.crash_rows = set(crash_rows)
+        self.fail_rows = set(fail_rows)
+        self.prompt_mismatch = prompt_mismatch
+        self.short_batch = short_batch
+        self.log_path = log_path
+
+    def _log(self, row_id):
+        if self.log_path:
+            with open(self.log_path, "a") as handle:
+                handle.write(row_id + "\n")
+
+    def generate(self, items):
+        outputs = []
+        for index, item in enumerate(items):
+            row_id = item["row_id"]
+            if row_id in self.crash_rows:
+                raise SystemExit(137)  # simulate SIGKILL: no results are written
+            if row_id in self.fail_rows:
+                raise RuntimeError("simulated CUDA failure")
+            self._log(row_id)
+            text = f"Instruction for {row_id}"
+            outputs.append(b.EngineOutput(prompt=item["prompt"], text=text,
+                                          finish_reason="stop", prompt_tokens=12,
+                                          completion_tokens=len(text.split())))
+        if self.short_batch:
+            outputs = outputs[:-1]
+        if self.prompt_mismatch and outputs:
+            outputs[0].prompt = "wrong prompt"
+        return outputs
+
+
+class FakePromptBuilder:
+    def __init__(self, job):
+        self.job = job
+
+    def __call__(self, task, config):
+        prompt = f"PROMPT::{task['row_id']}::{config['prompt_sha256'][:8]}"
+        return prompt, None, task.get("length", 10)
+
+
+class LengthBuilder:
+    """Test builder that reports a fixed input length."""
+
+    def __init__(self, length):
+        self.length = length
+
+    def __call__(self, task, config):
+        return "prompt", None, self.length
+
+
+def make_work_fixture(work, rows=4, revision="1" * 40):
+    """Small frozen manifest with pinned model metadata (synthetic fixture)."""
+    entries = [fake_row(index) for index in range(rows)]
+    meta = b.freeze_source(iter(entries), work=work, dataset_id=b.DATASET_ID, revision=revision,
+                           split="train", limits=b.FreezeLimits(), row_limit=rows,
+                           meta_extra=dict(model_id=b.MODEL_ID, model_revision="2" * 40,
+                                           model_path="/fake/model"))
+    return meta, entries
+
+
+def worker_task(work, index, *, image_bytes=TINY_PNG, tikz=None, max_tokens=256):
+    tikz = tikz if tikz is not None else f"\\draw ({index},0);"
+    image = Path(work) / f"image-{index}.png"
+    image.write_bytes(image_bytes)
+    return dict(row_id=f"row-{index:04d}", source_row_index=index, image=str(image),
+                image_sha256=b.sha256_bytes(image_bytes), tikz_code=tikz,
+                tikz_sha256=b.sha256_text(tikz), max_tokens=max_tokens, attempt_no=1)
+
+
+def make_worker_job(work, tasks, *, per_replica=2, warmup=0, job_name="job.json"):
+    job = dict(run_id="run-test", worker_index=0, generation=1,
+               tasks_path=str(Path(work) / "tasks.jsonl"),
+               results_dir=str(Path(work) / "results"),
+               heartbeat_path=str(Path(work) / "heartbeat.json"),
+               stop_path=str(Path(work) / "stop"),
+               engine_options_path=str(Path(work) / "engine-options.json"),
+               versions_path=str(Path(work) / "versions.json"),
+               config=dict(model_path="/fake/model", model_revision="2" * 40,
+                           prompt="system prompt", prompt_version="caption-v1",
+                           prompt_sha256="3" * 64, context=32768,
+                           per_replica_concurrency=per_replica, batch_token_budget=16384,
+                           mtp=1, gpu_memory_utilization=0.9, max_output_tokens=256,
+                           truncation_retry_tokens=384, warmup_samples=warmup,
+                           config_hash="f" * 64))
+    with (Path(work) / "tasks.jsonl").open("w") as handle:
+        for task in tasks:
+            handle.write(json.dumps(task) + "\n")
+    job_path = Path(work) / job_name
+    b.bench.dump(job_path, job)
+    return job_path
+
+
+class WorkerTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.work = Path(self.directory.name)
+
+    def run_worker(self, tasks, *, engine=None, builder=None, per_replica=2, warmup=0):
+        job_path = make_worker_job(self.work, tasks, per_replica=per_replica, warmup=warmup)
+        engine_factory = (lambda job: engine) if engine is not None else \
+            (lambda job: FakeEngine(job))
+        builder_factory = (lambda job: builder) if builder is not None else \
+            (lambda job: FakePromptBuilder(job))
+        code = b.run_worker(job_path, engine_factory=engine_factory,
+                            prompt_builder_factory=builder_factory)
+        results = []
+        for path in sorted((self.work / "results").glob("*.json")):
+            results.extend(json.loads(path.read_text())["results"])
+        return code, {result["row_id"]: result for result in results}
+
+    def test_worker_associates_results_by_stable_id(self):
+        tasks = [worker_task(self.work, index) for index in range(3)]
+        code, results = self.run_worker(tasks, per_replica=2)
+        self.assertEqual(code, 0)
+        self.assertEqual(sorted(results), [f"row-{i:04d}" for i in range(3)])
+        for row_id, result in results.items():
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["instruction"], f"Instruction for {row_id}")
+            self.assertEqual(result["finish_reason"], "stop")
+            self.assertEqual(result["prompt_tokens"], 12)
+            self.assertEqual(result["config_hash"], "f" * 64)
+
+    def test_worker_flags_checksum_mismatches_without_generating(self):
+        tasks = [worker_task(self.work, index) for index in range(2)]
+        (Path(tasks[0]["image"])).write_bytes(b"corrupted")
+        tasks[1]["tikz_code"] = tasks[1]["tikz_code"] + "tampered"
+        code, results = self.run_worker(tasks, per_replica=2)
+        self.assertEqual(code, 0)
+        self.assertEqual(results[tasks[0]["row_id"]]["error_category"], "integrity")
+        self.assertIn("image checksum", results[tasks[0]["row_id"]]["error_detail"])
+        self.assertEqual(results[tasks[1]["row_id"]]["error_category"], "integrity")
+        self.assertIn("tikz checksum", results[tasks[1]["row_id"]]["error_detail"])
+        self.assertFalse(results[tasks[0]["row_id"]]["ok"])
+
+    def test_worker_rejects_inputs_over_context(self):
+        tasks = [worker_task(self.work, 0)]
+        code, results = self.run_worker(tasks, builder=LengthBuilder(32768))
+        self.assertEqual(code, 0)
+        self.assertEqual(results[tasks[0]["row_id"]]["error_category"], "input_too_long")
+
+    def test_worker_aborts_batch_on_prompt_mismatch(self):
+        tasks = [worker_task(self.work, index) for index in range(2)]
+        engine = FakeEngine(None, prompt_mismatch=True)
+        code, results = self.run_worker(tasks, engine=engine, per_replica=2)
+        self.assertEqual(code, 3)
+        self.assertEqual(len(results), 2)
+        for result in results.values():
+            self.assertFalse(result["ok"])
+            self.assertEqual(result["error_category"], "engine_transient")
+            self.assertIn("does not match", result["error_detail"])
+
+    def test_worker_aborts_batch_on_output_count_mismatch(self):
+        tasks = [worker_task(self.work, index) for index in range(3)]
+        engine = FakeEngine(None, short_batch=True)
+        code, results = self.run_worker(tasks, engine=engine, per_replica=3)
+        self.assertEqual(code, 3)
+        self.assertEqual(len(results), 3)
+        self.assertTrue(all(not result["ok"] for result in results.values()))
+
+    def test_worker_engine_failure_records_transient_for_whole_batch(self):
+        tasks = [worker_task(self.work, index) for index in range(2)]
+        engine = FakeEngine(None, fail_rows={tasks[1]["row_id"]})
+        code, results = self.run_worker(tasks, engine=engine, per_replica=2)
+        self.assertEqual(code, 3)
+        self.assertEqual(len(results), 2)
+        self.assertTrue(all(result["error_category"] == "engine_transient"
+                            for result in results.values()))
+
+    def test_worker_stops_between_batches(self):
+        tasks = [worker_task(self.work, index) for index in range(4)]
+        (self.work / "stop").touch()
+        code, results = self.run_worker(tasks, per_replica=2)
+        self.assertEqual(code, 0)
+        self.assertEqual(results, {})
+        self.assertFalse(any((self.work / "results").glob("*.json")))
+
+    def test_worker_writes_heartbeat(self):
+        tasks = [worker_task(self.work, index) for index in range(2)]
+        self.run_worker(tasks, per_replica=2)
+        heartbeat = json.loads((self.work / "heartbeat.json").read_text())
+        self.assertEqual(heartbeat["rows_done"], 2)
+        self.assertEqual(heartbeat["batch_index"], 0)
+
+    def test_task_filtering_keeps_only_outstanding_rows(self):
+        tasks = [worker_task(self.work, index) for index in range(4)]
+        source = self.work / "all.jsonl"
+        with source.open("w") as handle:
+            for task in tasks:
+                handle.write(json.dumps(task) + "\n")
+        keep = {tasks[1]["row_id"], tasks[3]["row_id"]}
+        destination = self.work / "filtered.jsonl"
+        b.filter_task_file(source, destination, keep)
+        kept = [json.loads(line)["row_id"] for line in destination.read_text().splitlines()]
+        self.assertEqual(kept, [tasks[1]["row_id"], tasks[3]["row_id"]])
+
+
+class AssignmentTests(unittest.TestCase):
+    def test_assignment_is_deterministic_and_balanced(self):
+        index = {f"row-{i}": dict(tikz_chars=i * 10, source_row_index=i) for i in range(10)}
+        eligible = [dict(row_id=f"row-{i}", source_row_index=i) for i in range(10)]
+        first = b.balanced_assignment(eligible, index, workers=2)
+        second = b.balanced_assignment(list(reversed(eligible)), index, workers=2)
+        self.assertEqual(first, second)
+        self.assertEqual(len(first["worker-0"]) + len(first["worker-1"]), 10)
+        self.assertEqual(sorted(first["worker-0"] + first["worker-1"]),
+                         sorted(row["row_id"] for row in eligible))
+        loads = []
+        for worker, rows in first.items():
+            loads.append(sum(index[row_id]["tikz_chars"] + 1024 for row_id in rows))
+        self.assertLessEqual(abs(loads[0] - loads[1]), 1024 + 90)
+
+
+class ResultIdentityTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.work = Path(self.directory.name)
+        self.meta, _fixture_rows = make_work_fixture(self.work, rows=4)
+        args = b.build_parser().parse_args(
+            ["run", "--work", str(self.work), "--allow-non-slurm", "--vllm-sif", "/tmp/vllm.sif"])
+        self.config = b.config_from_args(args, manifest_meta=self.meta,
+                                         container_sha256="b" * 64, require_pinned=True)
+        self.index = b.manifest_index(self.work)
+        self.entries = list(b.iter_manifest(self.work))
+        self.policy = b.RetryPolicy(backoff_base_seconds=0)
+        self.ledger = b.Ledger(self.work).open()
+        self.addCleanup(self.ledger.close)
+        self.ledger.initialize(b.ledger_identity_from_config(self.config, self.meta))
+        self.ledger.seed(iter(b.iter_manifest(self.work)), rows_frozen=4)
+
+    def claim_all(self):
+        assignment = b.balanced_assignment(
+            self.ledger.eligible(), self.index, workers=2)
+        return self.ledger.claim(assignment, policy=self.policy)
+
+    def write_result_file(self, worker, results, name="batch-1-00000.json", run_id=None):
+        directory = self.work / "runtime" / "results" / worker
+        directory.mkdir(parents=True, exist_ok=True)
+        payload = dict(run_id=run_id or self.config.run_id(), worker=worker,
+                       worker_index=int(worker.split("-")[1]), generation=1, batch_index=0,
+                       results=results)
+        (directory / name).write_text(json.dumps(payload))
+
+    def result_for(self, entry, *, worker="worker-0", ok=True, instruction=None):
+        return dict(row_id=entry["row_id"], source_row_index=entry["source_row_index"],
+                    worker=worker, batch_index=0, max_tokens=256, ok=ok,
+                    instruction=instruction if instruction is not None else f"Draw {entry['row_id']}",
+                    text=None, finish_reason="stop" if ok else None,
+                    prompt_tokens=10, completion_tokens=20, error_category=None,
+                    error_detail=None, image_sha256=entry["image_sha256"],
+                    tikz_sha256=entry["tikz_sha256"], model_revision=self.config.model.revision,
+                    prompt_sha256=self.config.prompt.sha256,
+                    config_hash=self.config.identity_sha256())
+
+    def test_ingest_commits_by_stable_id(self):
+        claims = self.claim_all()
+        worker = "worker-0" if claims["worker-0"] else "worker-1"
+        entries = [entry for entry in self.entries
+                   if entry["row_id"] in {row["row_id"] for row in claims[worker]}]
+        self.write_result_file(worker, [self.result_for(entry, worker=worker)
+                                        for entry in entries])
+        ingested = b.ingest_result_files(ledger=self.ledger, work=self.work, config=self.config,
+                                         index=self.index, policy=self.policy)
+        self.assertEqual(ingested[worker], {entry["row_id"] for entry in entries})
+        for entry in entries:
+            row = self.ledger.get(entry["row_id"])
+            self.assertEqual(row["state"], b.STATE_COMPLETE)
+            self.assertEqual(row["instruction"], f"Draw {entry['row_id']}")
+
+    def test_ingest_rejects_unknown_row_id(self):
+        self.claim_all()
+        bogus = dict(self.result_for(self.entries[0]), row_id="row-unknown")
+        self.write_result_file("worker-0", [bogus])
+        with self.assertRaisesRegex(b.PipelineIdentityError, "unknown row"):
+            b.ingest_result_files(ledger=self.ledger, work=self.work, config=self.config,
+                                  index=self.index, policy=self.policy)
+
+    def test_ingest_rejects_foreign_run_id(self):
+        self.claim_all()
+        self.write_result_file("worker-0", [self.result_for(self.entries[0])],
+                               run_id="run-someone-else")
+        with self.assertRaisesRegex(b.PipelineIdentityError, "belongs to run"):
+            b.ingest_result_files(ledger=self.ledger, work=self.work, config=self.config,
+                                  index=self.index, policy=self.policy)
+
+    def test_ingest_rejects_worker_ownership_mismatch(self):
+        self.claim_all()
+        entry = self.entries[0]
+        self.write_result_file("worker-1", [self.result_for(entry, worker="worker-1")])
+        # The row was claimed by whichever worker the assignment chose; find it.
+        owner = self.ledger.get(entry["row_id"])["worker"]
+        other = "worker-1" if owner == "worker-0" else "worker-0"
+        # Rewrite the file as if it came from the other worker.
+        for path in (self.work / "runtime" / "results").glob("worker-*/*.json"):
+            payload = json.loads(path.read_text())
+            payload["worker"] = other
+            payload["worker_index"] = int(other.split("-")[1])
+            payload["results"][0]["worker"] = other
+            path.write_text(json.dumps(payload))
+        with self.assertRaises(b.PipelineIdentityError):
+            b.ingest_result_files(ledger=self.ledger, work=self.work, config=self.config,
+                                  index=self.index, policy=self.policy)
+
+    def test_ingest_rejects_config_and_prompt_drift(self):
+        self.claim_all()
+        for field, value in (("config_hash", "0" * 64), ("prompt_sha256", "0" * 64),
+                             ("model_revision", "9" * 40)):
+            result = dict(self.result_for(self.entries[0]), **{field: value})
+            self.write_result_file("worker-0", [result], name=f"batch-{field}.json")
+            with self.assertRaisesRegex(b.PipelineIdentityError, "mismatch"):
+                b.ingest_result_files(ledger=self.ledger, work=self.work, config=self.config,
+                                      index=self.index, policy=self.policy)
+
+    def test_ingest_turns_source_checksum_drift_into_integrity_rejection(self):
+        self.claim_all()
+        entry = self.entries[0]
+        result = dict(self.result_for(entry), image_sha256="0" * 64)
+        self.write_result_file("worker-0", [result])
+        b.ingest_result_files(ledger=self.ledger, work=self.work, config=self.config,
+                              index=self.index, policy=self.policy)
+        row = self.ledger.get(entry["row_id"])
+        self.assertEqual(row["state"], b.STATE_REJECTED)
+        self.assertEqual(row["rejection_reason"], "integrity")
+
+    def test_ingest_is_order_independent(self):
+        claims = self.claim_all()
+        payloads = []
+        for worker, rows in claims.items():
+            entries = [entry for entry in self.entries
+                       if entry["row_id"] in {row["row_id"] for row in rows}]
+            payloads.append((worker, [self.result_for(entry, worker=worker)
+                                      for entry in entries]))
+        for worker, results in reversed(payloads):
+            self.write_result_file(worker, results, name=f"batch-{worker}.json")
+        b.ingest_result_files(ledger=self.ledger, work=self.work, config=self.config,
+                              index=self.index, policy=self.policy)
+        for entry in self.entries:
+            row = self.ledger.get(entry["row_id"])
+            self.assertEqual(row["state"], b.STATE_COMPLETE)
+            self.assertEqual(row["instruction"], f"Draw {entry['row_id']}")
+
+    def test_duplicate_result_inside_file_is_fatal(self):
+        self.claim_all()
+        result = self.result_for(self.entries[0])
+        self.write_result_file("worker-0", [result, dict(result)])
+        with self.assertRaisesRegex(b.PipelineIdentityError, "Duplicate result"):
+            b.ingest_result_files(ledger=self.ledger, work=self.work, config=self.config,
+                                  index=self.index, policy=self.policy)
+
+
 if __name__ == "__main__":
     unittest.main()
