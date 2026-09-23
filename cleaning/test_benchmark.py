@@ -49,6 +49,25 @@ class Tests(unittest.TestCase):
         self.assertIn("#SBATCH --gres=gpu:a40:4", script)
         subprocess.run(["bash", "-n"], input=script, text=True, check=True)
 
+    def test_non_thinking_throughput_slurm_flags(self):
+        script = subprocess.check_output([
+            sys.executable, str(Path(b.__file__)), "--slurm-script",
+            "--throughput-screen", "--no-enable-thinking",
+            "--max-output-tokens", "256", "--warmup-samples", "1",
+            "--vllm-sif", "/tmp/vllm.sif", "--sglang-sif", "/tmp/sglang.sif"],
+            text=True)
+        self.assertIn("--throughput-screen", script)
+        self.assertIn("--no-enable-thinking", script)
+        self.assertIn("--max-output-tokens 256", script)
+        subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
+    def test_generation_settings(self):
+        thinking = b.generation_settings({"enable_thinking": True})
+        instruct = b.generation_settings({"enable_thinking": False})
+        self.assertEqual(thinking["temperature"], 1.0)
+        self.assertEqual(instruct["temperature"], .7)
+        self.assertEqual(instruct["presence_penalty"], 1.5)
+
     def test_vllm_runtime_workaround_and_metrics(self):
         opts = b.vllm_runtime_options()
         self.assertIs(opts["disable_custom_all_reduce"], True)
@@ -120,9 +139,11 @@ class Tests(unittest.TestCase):
         thread.start()
         try:
             with patch.object(b, "messages", return_value=[]):
+                job = dict(enable_thinking=True, reasoning_effort="xhigh",
+                           max_output_tokens=32768)
                 for finish, expected in [("stop",True),("length",False)]:
                     server.finish = finish
-                    row = b.http_request(server.server_port, {"id":"1"}, 20000, 5)
+                    row = b.http_request(server.server_port, {"id":"1"}, 20000, 5, job)
                     self.assertEqual(row["ok"], expected)
                     self.assertEqual(row["reasoning"], "analysis")
                     self.assertEqual(row["final"], "Draw a circle")

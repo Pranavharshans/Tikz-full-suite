@@ -171,10 +171,11 @@ def prepare(args):
                         seed=42, rows=rows))
 
 
-def messages(row, local=False):
+def messages(row, local=False, concise=False):
     url = row["image"] if local else "data:image/png;base64," + base64.b64encode(
         Path(row["image"]).read_bytes()).decode()
-    return [{"role": "system", "content": PROMPT}, {"role": "user", "content": [
+    prompt = PROMPT + ("\nKeep the instruction concise and under 120 words." if concise else "")
+    return [{"role": "system", "content": prompt}, {"role": "user", "content": [
         {"type": "image" if local else "image_url", **({"image": url} if local else {"image_url": {"url": url}})},
         {"type": "text", "text": "<source>\n" + row["tikz_code"] + "\n</source>"}]}]
 
@@ -186,15 +187,27 @@ def split_reasoning(text):
     return "", text.strip()
 
 
-def http_request(port, row, remaining, timeout):
+def generation_settings(job):
+    if job["enable_thinking"]:
+        return dict(temperature=1.0, top_p=.95, top_k=20,
+                    presence_penalty=0.0)
+    return dict(temperature=.7, top_p=.80, top_k=20,
+                presence_penalty=1.5)
+
+
+def http_request(port, row, remaining, timeout, job):
     started = time.monotonic()
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     content, reasoning, usage, finish, first = "", "", {}, None, None
     try:
-        payload = dict(model="tikz", messages=messages(row), temperature=1.0,
-                       top_p=.95, top_k=20, presence_penalty=0.0,
-                       chat_template_kwargs={"enable_thinking": True, "reasoning_effort": "xhigh"},
-                       max_tokens=remaining, stream=True, stream_options={"include_usage": True})
+        template = {"enable_thinking": job["enable_thinking"]}
+        if job["enable_thinking"]:
+            template["reasoning_effort"] = job["reasoning_effort"]
+        payload = dict(model="tikz", messages=messages(row, concise=not job["enable_thinking"]),
+                       chat_template_kwargs=template,
+                       max_tokens=min(remaining, job["max_output_tokens"]),
+                       stream=True, stream_options={"include_usage": True},
+                       **generation_settings(job))
         # Explicit context remainder prevents engines' small default output caps.
         conn.request("POST", "/v1/chat/completions", json.dumps(payload), {"Content-Type": "application/json"})
         response = conn.getresponse()
@@ -270,9 +283,12 @@ def worker(args):
     processor = AutoProcessor.from_pretrained(manifest["model_path"])
     items = []
     for row in job["rows"]:
-        msg = messages(row, local=True)
-        prompt = processor.apply_chat_template(msg, tokenize=False, add_generation_prompt=True,
-                                              enable_thinking=True, reasoning_effort="xhigh")
+        msg = messages(row, local=True, concise=not job["enable_thinking"])
+        template = {"enable_thinking": job["enable_thinking"]}
+        if job["enable_thinking"]:
+            template["reasoning_effort"] = job["reasoning_effort"]
+        prompt = processor.apply_chat_template(
+            msg, tokenize=False, add_generation_prompt=True, **template)
         with Image.open(row["image"]) as image:
             pixels = image.convert("RGB")
             encoded = processor(text=[prompt], images=[pixels], return_tensors="pt")
@@ -306,16 +322,18 @@ def worker(args):
                 for row, prompt, length in batch:
                     with Image.open(row["image"]) as image:
                         inputs.append(dict(prompt=prompt, multi_modal_data={"image": image.convert("RGB")}))
-                    params.append(SamplingParams(temperature=1., top_p=.95, top_k=20,
-                                                 max_tokens=job["context"]-length, seed=42))
+                    params.append(SamplingParams(
+                        max_tokens=min(job["context"]-length, job["max_output_tokens"]),
+                        seed=42, **generation_settings(job)))
                 tick = time.monotonic()
                 answers = llm.generate(inputs, params, use_tqdm=True)
                 records = []
                 for (row, _, _), answer in zip(batch, answers):
                     generated = answer.outputs[0]
                     thought, final = split_reasoning(generated.text)
-                    records.append(dict(id=row["id"], ok=generated.finish_reason == "stop" and bool(final)
-                                        and "</think>" in generated.text,
+                    valid_thinking = not job["enable_thinking"] or "</think>" in generated.text
+                    records.append(dict(id=row["id"], ok=generated.finish_reason == "stop"
+                                        and bool(final) and valid_thinking,
                                         final=final, reasoning=thought, finish_reason=generated.finish_reason,
                                         usage=dict(prompt_tokens=len(answer.prompt_token_ids),
                                                    completion_tokens=len(generated.token_ids)),
@@ -379,7 +397,7 @@ def worker(args):
                     raise RuntimeError("Server startup failed; inspect server.log")
                 time.sleep(2)
         for row, _, length in items[:job.get("warmup_samples", 5)]:
-            result = http_request(port, row, job["context"]-length, job["request_timeout"])
+            result = http_request(port, row, job["context"]-length, job["request_timeout"], job)
             if not result["ok"]:
                 raise RuntimeError(f"Warmup failed: {result}")
         def metrics(name):
@@ -393,7 +411,8 @@ def worker(args):
         started = time.monotonic()
         records = []
         with futures.ThreadPoolExecutor(max_workers=concurrency) as pool, (out / "requests.jsonl").open("w") as f:
-            tasks = [pool.submit(http_request, port, row, job["context"]-length, job["request_timeout"])
+            tasks = [pool.submit(http_request, port, row, job["context"]-length,
+                                 job["request_timeout"], job)
                      for row, _, length in items]
             for task in futures.as_completed(tasks):
                 result = task.result()
@@ -414,6 +433,9 @@ def run_config(args, cfg, manifest):
     sample_count = len(manifest["rows"])
     fingerprint = digest(dict(config=cfg, manifest=manifest, context=args.context,
                               warmup_samples=args.warmup_samples,
+                              enable_thinking=args.enable_thinking,
+                              reasoning_effort=args.reasoning_effort,
+                              max_output_tokens=args.max_output_tokens,
                               nccl_p2p=args.nccl_p2p,
                               request_timeout=args.request_timeout, config_timeout=args.config_timeout,
                               script=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
@@ -448,6 +470,9 @@ def run_config(args, cfg, manifest):
             spec = dict(config=cfg, manifest=manifest, rows=shard, output=str(folder),
                         nccl_p2p=args.nccl_p2p,
                         warmup_samples=args.warmup_samples,
+                        enable_thinking=args.enable_thinking,
+                        reasoning_effort=args.reasoning_effort,
+                        max_output_tokens=args.max_output_tokens,
                         concurrency=concurrency, context=args.context, port=19000+index,
                         startup_timeout=args.startup_timeout, request_timeout=args.request_timeout)
             dump(folder / "job.json", spec)
@@ -526,6 +551,11 @@ def main():
     parser.add_argument("--split-screen", action="store_true",
                         help="Concurrency-sized screening, then equal-100-sample stage confirmations")
     parser.add_argument("--warmup-samples", type=int, default=5)
+    parser.add_argument("--throughput-screen", action="store_true",
+                        help="Run only bounded non-thinking vLLM offline throughput candidates")
+    parser.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--reasoning-effort", choices=("low", "medium", "xhigh"), default="xhigh")
+    parser.add_argument("--max-output-tokens", type=int, default=32768)
     args = parser.parse_args()
     if args.warmup_samples < 1:
         parser.error("--warmup-samples must be positive")
@@ -547,7 +577,11 @@ def main():
                           "--nccl-p2p", args.nccl_p2p,
                           "--context", str(args.context), "--startup-timeout", str(args.startup_timeout),
                           "--request-timeout", str(args.request_timeout), "--config-timeout", str(args.config_timeout),
-                          "--warmup-samples", str(args.warmup_samples)] +
+                          "--warmup-samples", str(args.warmup_samples),
+                          "--reasoning-effort", args.reasoning_effort,
+                          "--max-output-tokens", str(args.max_output_tokens)] +
+                         (["--enable-thinking"] if args.enable_thinking else ["--no-enable-thinking"]) +
+                         (["--throughput-screen"] if args.throughput_screen else []) +
                          (["--split-screen"] if args.split_screen else []))
         print("#!/bin/bash -l\n#SBATCH --job-name=tikz-bench\n#SBATCH --partition=a40\n"
               "#SBATCH --gres=gpu:a40:4\n#SBATCH --nodes=1\n#SBATCH --ntasks=1\n"
@@ -603,6 +637,26 @@ def main():
                 h.update(chunk)
         container_hashes[path] = h.hexdigest()
     manifest["container_sha256"] = container_hashes
+    if args.throughput_screen:
+        if args.enable_thinking:
+            raise SystemExit("--throughput-screen requires --no-enable-thinking")
+        configs = [
+            config(engine="vllm-offline", tp=2, replicas=1, mtp=2, concurrency=32),
+            config(engine="vllm-offline", tp=2, replicas=2, mtp=2, concurrency=64),
+            config(engine="vllm-offline", tp=2, replicas=2, mtp=2, concurrency=100),
+        ]
+        results = []
+        for cfg in configs:
+            print("throughput", "samples=100", json.dumps(cfg), flush=True)
+            results.append(run_config(args, cfg, manifest))
+            dump(root / "throughput-results.json", results)
+        fields = sorted(set().union(*(r.keys() for r in results)))
+        with (root / "throughput-summary.csv").open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(results)
+        print("Throughput screen complete:", root / "throughput-summary.csv")
+        return
     results, winner = [], None
     for phase in ("engines", "mtp", "topology", "scheduling"):
         phase_results = []

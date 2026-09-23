@@ -126,6 +126,29 @@ does not guarantee completion of all stages or even the active configuration.
 Run only one orchestrator against a work directory at a time; do not edit/pull the
 runner while a job is active. Old 100-sample mode remains available without the flag.
 
+### Focused non-thinking throughput screen
+
+`--throughput-screen --no-enable-thinking --max-output-tokens 256` runs only
+three bounded vLLM-offline MTP2 candidates: one TP2 replica at concurrency 32,
+then two TP2 replicas at aggregate concurrency 64 and 100. Each candidate uses
+the same 100 frozen samples. Non-thinking mode uses Qwen's recommended instruct
+sampling and asks for an instruction under 120 words. A request that exhausts
+the 256-token ceiling is recorded as failed rather than accepted as a complete
+caption.
+
+This mode writes `throughput-results.json` and `throughput-summary.csv`; it does
+not overwrite the original staged benchmark summary. It is a focused capacity
+probe, not a replacement for caption-quality review. Generate its Slurm script
+with:
+
+```bash
+python3 cleaning/benchmark.py --slurm-script \
+  --throughput-screen --no-enable-thinking --max-output-tokens 256 \
+  --warmup-samples 1 --work /absolute/benchmark-data \
+  --vllm-sif /absolute/containers/vllm.sif \
+  --sglang-sif /absolute/containers/sglang.sif > throughput.sbatch
+```
+
 ### Tests
 
 ```bash
