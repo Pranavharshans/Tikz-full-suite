@@ -104,7 +104,30 @@ For first-time preparation in a separate container virtual environment, pass
 `--prepare-python /absolute/path/preparation-env/bin/python` when generating the
 Slurm script. The generator binds that environment into the container.
 
-## Alex A40 runtime findings (2026-09-22)
+## Alex A40 runtime findings (updated 2026-09-23)
+
+Current status: offline vLLM TP2 now has successful one-sample eager and compiled
+tests, plus two successful ten-sample compiled trials at concurrency 4 with an
+engine restart (job 4298526). Both NCCL P2P and vLLM custom all-reduce were
+disabled. GPU memory was released after the second trial, despite forced-cleanup
+warnings. Trial 2 completed its measured batch in 113.91 seconds. Its cumulative
+metrics (including warmup) reported 12,984 draft tokens and 9,741 accepted tokens
+(75%); this establishes active MTP, not a speedup over an MTP-off baseline.
+
+The runner now sets `disable_custom_all_reduce=True` for offline vLLM and
+`--disable-custom-all-reduce` for vLLM HTTP. Compiled execution stays enabled.
+Offline stats are explicitly enabled for MTP metrics, and SGLang is launched
+with `--enable-metrics`. Offline engine options are saved in `engine-options.json`;
+warmup and measured generation now report progress in worker logs. Changes to
+the script hash invalidate old resume identities automatically.
+
+The full sweep is experimental: vLLM HTTP, SGLang, TP4, two replicas, and higher
+concurrency have not been validated by these smoke tests. SGLang retains its own
+custom-collective defaults; its NCCL P2P setting still comes from the runner.
+GPU-pair changes and warmed caches prevent attributing all earlier stalls to
+one root cause. Caption quality has not been reviewed from the saved outputs.
+
+### Earlier diagnostic history
 
 The runner now defaults to `--nccl-p2p disabled`, explicitly setting
 `NCCL_P2P_DISABLE=1` on the host and through `APPTAINERENV_NCCL_P2P_DISABLE`
@@ -129,8 +152,7 @@ Evidence from user-run jobs on a0429:
   TP1's useful stack was not captured. This identifies where TP0 was sampled,
   but does not prove a driver bug, cache corruption, or MTP failure.
 
-No completed caption-generation benchmark has been demonstrated by these logs.
-Do not resubmit a full sweep assuming the remaining issue is fixed. The next
-diagnostic should isolate CUDA/Triton kernel loading in the same container.
-Do not delete existing caches as an unverified fix. Diagnostic container commands
+Those early logs did not demonstrate completed generation. Subsequent tests
+above establish a working configuration, but not the exact cause of the earlier
+kernel-loading stall. Do not delete existing caches as an unverified fix. Diagnostic container commands
 must use `python3` (the image did not provide a `python` executable).

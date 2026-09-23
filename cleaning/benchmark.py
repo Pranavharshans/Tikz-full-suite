@@ -43,6 +43,17 @@ def digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
 
 
+def vllm_runtime_options():
+    # Alex A40 smoke tests passed with NCCL P2P and custom all-reduce disabled.
+    # Keep compilation enabled and expose speculative-decoding counters.
+    return dict(disable_custom_all_reduce=True, disable_log_stats=False,
+                enforce_eager=False)
+
+
+def vllm_runtime_flags():
+    return ["--disable-custom-all-reduce"]
+
+
 def config(engine="vllm-http", tp=2, replicas=1, mtp=2, concurrency=8,
            order="random", chunked=True, budget=16384, repeat=0):
     return dict(engine=engine, tp=tp, replicas=replicas, mtp=mtp,
@@ -260,6 +271,8 @@ def worker(args):
                         max_num_seqs=concurrency, max_num_batched_tokens=cfg["budget"],
                         enable_chunked_prefill=cfg["chunked"], enable_prefix_caching=False,
                         mm_processor_cache_gb=0, gpu_memory_utilization=.90)
+            opts.update(vllm_runtime_options())
+            dump(out / "engine-options.json", opts)
             if cfg["mtp"]:
                 opts["speculative_config"] = dict(method="mtp", num_speculative_tokens=cfg["mtp"])
             llm = LLM(**opts)
@@ -272,7 +285,7 @@ def worker(args):
                     params.append(SamplingParams(temperature=1., top_p=.95, top_k=20,
                                                  max_tokens=job["context"]-length, seed=42))
                 tick = time.monotonic()
-                answers = llm.generate(inputs, params, use_tqdm=False)
+                answers = llm.generate(inputs, params, use_tqdm=True)
                 records = []
                 for (row, _, _), answer in zip(batch, answers):
                     generated = answer.outputs[0]
@@ -284,6 +297,7 @@ def worker(args):
                                                    completion_tokens=len(generated.token_ids)),
                                         batch_wall_s=time.monotonic()-tick))
                 return records
+            print("Starting untimed offline warmup", flush=True)
             warmup = offline(items[:min(5, len(items))])
             if not all(r["ok"] for r in warmup):
                 raise RuntimeError("Offline warmup failed or hit context limit")
@@ -294,6 +308,7 @@ def worker(args):
                     (out / name).write_text(f"unavailable: {exc}")
             offline_metrics("metrics-before.txt")
             barrier(job)
+            print(f"Starting measured offline batch: {len(items)} samples", flush=True)
             # Offline queues the full shard; max_num_seqs controls active sequences.
             started = time.monotonic()
             records = offline(items)
@@ -313,6 +328,7 @@ def worker(args):
                    "--no-enable-prefix-caching", "--mm-processor-cache-gb", "0", "--reasoning-parser", "qwen3",
                    "--generation-config", "vllm",
                    "--enable-chunked-prefill" if cfg["chunked"] else "--no-enable-chunked-prefill"]
+            cmd += vllm_runtime_flags()
             if cfg["mtp"]:
                 cmd += ["--speculative-config", json.dumps(dict(method="mtp", num_speculative_tokens=cfg["mtp"]))]
         else:
@@ -321,7 +337,8 @@ def worker(args):
                    "--tp-size", str(cfg["tp"]), "--context-length", str(job["context"]),
                    "--max-running-requests", str(concurrency), "--max-prefill-tokens", str(cfg["budget"]),
                    "--chunked-prefill-size", str(cfg["budget"] if cfg["chunked"] else -1),
-                   "--mem-fraction-static", ".90", "--disable-radix-cache", "--reasoning-parser", "qwen3"]
+                   "--mem-fraction-static", ".90", "--disable-radix-cache", "--reasoning-parser", "qwen3",
+                   "--enable-metrics"]
             if cfg["mtp"]:
                 cmd += ["--speculative-algorithm", "NEXTN", "--speculative-num-steps", str(cfg["mtp"]),
                         "--speculative-eagle-topk", "1", "--speculative-num-draft-tokens", str(cfg["mtp"]+1)]

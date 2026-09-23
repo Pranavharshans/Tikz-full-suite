@@ -17,6 +17,13 @@ spec.loader.exec_module(b)
 
 
 class Tests(unittest.TestCase):
+    def test_vllm_runtime_workaround_and_metrics(self):
+        opts = b.vllm_runtime_options()
+        self.assertIs(opts["disable_custom_all_reduce"], True)
+        self.assertIs(opts["disable_log_stats"], False)
+        self.assertIs(opts["enforce_eager"], False)
+        self.assertIn("--disable-custom-all-reduce", b.vllm_runtime_flags())
+
     def test_slurm_p2p_workaround(self):
         command = [sys.executable, str(Path(b.__file__)), "--slurm-script",
                    "--vllm-sif", "/tmp/vllm.sif", "--sglang-sif", "/tmp/sglang.sif"]
