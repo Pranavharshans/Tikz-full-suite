@@ -553,10 +553,14 @@ def main():
     parser.add_argument("--warmup-samples", type=int, default=5)
     parser.add_argument("--throughput-screen", action="store_true",
                         help="Run only bounded non-thinking vLLM offline throughput candidates")
+    parser.add_argument("--rtx-throughput-screen", action="store_true",
+                        help="Run bounded TP1 throughput candidates on two RTX PRO GPUs")
     parser.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--reasoning-effort", choices=("low", "medium", "xhigh"), default="xhigh")
     parser.add_argument("--max-output-tokens", type=int, default=32768)
     args = parser.parse_args()
+    if args.throughput_screen and args.rtx_throughput_screen:
+        parser.error("Choose only one throughput screen")
     if args.warmup_samples < 1:
         parser.error("--warmup-samples must be positive")
     if args.slurm_script:
@@ -582,9 +586,12 @@ def main():
                           "--max-output-tokens", str(args.max_output_tokens)] +
                          (["--enable-thinking"] if args.enable_thinking else ["--no-enable-thinking"]) +
                          (["--throughput-screen"] if args.throughput_screen else []) +
+                         (["--rtx-throughput-screen"] if args.rtx_throughput_screen else []) +
                          (["--split-screen"] if args.split_screen else []))
-        print("#!/bin/bash -l\n#SBATCH --job-name=tikz-bench\n#SBATCH --partition=a40\n"
-              "#SBATCH --gres=gpu:a40:4\n#SBATCH --nodes=1\n#SBATCH --ntasks=1\n"
+        partition = "rtxpro6k" if args.rtx_throughput_screen else "a40"
+        gres = "gpu:rtxpro6k:2" if args.rtx_throughput_screen else "gpu:a40:4"
+        print(f"#!/bin/bash -l\n#SBATCH --job-name=tikz-bench\n#SBATCH --partition={partition}\n"
+              f"#SBATCH --gres={gres}\n#SBATCH --nodes=1\n#SBATCH --ntasks=1\n"
               "#SBATCH --cpus-per-task=64\n#SBATCH --time=24:00:00\n#SBATCH --export=NONE\n"
               "#SBATCH --output=slurm-tikz-%j.out\nset -euo pipefail\nunset SLURM_EXPORT_ENV\n"
               "command -v apptainer >/dev/null || module load apptainer\n"
@@ -609,8 +616,10 @@ def main():
         prepare(args)
     if not args.run:
         return
-    if not os.environ.get("SLURM_JOB_ID") or len(os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")) != 4:
-        raise SystemExit("Run only inside a Slurm allocation exposing exactly four GPUs")
+    expected_gpus = 2 if args.rtx_throughput_screen else 4
+    visible_gpus = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+    if not os.environ.get("SLURM_JOB_ID") or len(visible_gpus) != expected_gpus:
+        raise SystemExit(f"Run only inside a Slurm allocation exposing exactly {expected_gpus} GPUs")
     # Explicit container override is necessary even when the host variable is set.
     p2p_disable = "1" if args.nccl_p2p == "disabled" else "0"
     os.environ["NCCL_P2P_DISABLE"] = p2p_disable
@@ -637,6 +646,27 @@ def main():
                 h.update(chunk)
         container_hashes[path] = h.hexdigest()
     manifest["container_sha256"] = container_hashes
+    if args.rtx_throughput_screen:
+        if args.enable_thinking:
+            raise SystemExit("--rtx-throughput-screen requires --no-enable-thinking")
+        configs = [
+            config(engine="vllm-offline", tp=1, replicas=1, mtp=2, concurrency=32),
+            *[config(engine="vllm-offline", tp=1, replicas=2, mtp=mtp, concurrency=64)
+              for mtp in (0, 1, 2, 3)],
+            config(engine="vllm-offline", tp=1, replicas=2, mtp=2, concurrency=100),
+        ]
+        results = []
+        for cfg in configs:
+            print("rtx-throughput", "samples=100", json.dumps(cfg), flush=True)
+            results.append(run_config(args, cfg, manifest))
+            dump(root / "rtx-throughput-results.json", results)
+        fields = sorted(set().union(*(r.keys() for r in results)))
+        with (root / "rtx-throughput-summary.csv").open("w", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(results)
+        print("RTX throughput screen complete:", root / "rtx-throughput-summary.csv")
+        return
     if args.throughput_screen:
         if args.enable_thinking:
             raise SystemExit("--throughput-screen requires --no-enable-thinking")

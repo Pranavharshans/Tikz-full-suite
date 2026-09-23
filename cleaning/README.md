@@ -149,6 +149,13 @@ python3 cleaning/benchmark.py --slurm-script \
   --sglang-sif /absolute/containers/sglang.sif > throughput.sbatch
 ```
 
+For two 96GB RTX PRO 6000 Blackwell GPUs, use `--rtx-throughput-screen` instead.
+That isolated mode uses TP1 and tests one replica at concurrency 32, two replicas
+at aggregate concurrency 64 with MTP 0/1/2/3, and two replicas at aggregate
+concurrency 100 with MTP2. It writes `rtx-throughput-results.json` and
+`rtx-throughput-summary.csv`, requests the `rtxpro6k` partition and exactly two
+GPUs, and retains the same non-thinking 256-token quality controls.
+
 ### Tests
 
 ```bash

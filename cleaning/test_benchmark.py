@@ -61,6 +61,19 @@ class Tests(unittest.TestCase):
         self.assertIn("--max-output-tokens 256", script)
         subprocess.run(["bash", "-n"], input=script, text=True, check=True)
 
+    def test_rtx_throughput_slurm_flags(self):
+        script = subprocess.check_output([
+            sys.executable, str(Path(b.__file__)), "--slurm-script",
+            "--rtx-throughput-screen", "--no-enable-thinking",
+            "--max-output-tokens", "256", "--warmup-samples", "1",
+            "--vllm-sif", "/tmp/vllm.sif", "--sglang-sif", "/tmp/sglang.sif"],
+            text=True)
+        self.assertIn("--rtx-throughput-screen", script)
+        self.assertIn("#SBATCH --partition=rtxpro6k", script)
+        self.assertIn("#SBATCH --gres=gpu:rtxpro6k:2", script)
+        self.assertNotIn("#SBATCH --partition=a40", script)
+        subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
     def test_generation_settings(self):
         thinking = b.generation_settings({"enable_thinking": True})
         instruct = b.generation_settings({"enable_thinking": False})
