@@ -525,6 +525,16 @@ class ExportTests(unittest.TestCase):
             with self.assertRaisesRegex(b.ExportError, "nothing to export"):
                 b.export_dataset(work)
 
+    def test_export_error_is_handled_cleanly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            make_work_fixture(work, rows=3)
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                self.assertEqual(b.main(["export", "--work", str(work),
+                                         "--allow-non-slurm"]), 2)
+            self.assertIn("error: No run record", stderr.getvalue())
+
     def test_export_cli_requires_slurm_guard(self):
         args = b.build_parser().parse_args(
             ["export", "--work", str(self.work), "--shard-size", "5"])

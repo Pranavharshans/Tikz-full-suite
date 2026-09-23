@@ -966,7 +966,9 @@ def cmd_prepare(args, deps=None) -> int:
         meta = verify_manifest(work, quick=True)
         check_manifest_agreement(args, meta)
         model_path = meta.get("model_path", "")
-        if args.download_model and not model_path:
+        if args.download_model and (not model_path or not Path(model_path).is_dir()):
+            if model_path:
+                print(f"Recorded model snapshot is missing ({model_path}); re-downloading")
             model_path = deps.download_model(args, meta["model_revision"])
             meta["model_path"] = model_path
             bench.dump(manifest_meta_path(work), meta)
@@ -2021,7 +2023,7 @@ class PipelineDeps:
                     str(Path(__file__).resolve()), "worker", "--job", str(job_path)]
         log_path = Path(work) / "runtime" / "logs" / f"worker-{worker_index}.log"
         log_path.parent.mkdir(parents=True, exist_ok=True)
-        log = log_path.open("w")
+        log = log_path.open("a")  # restarts append so earlier evidence survives
         process = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT,
                                    start_new_session=True)
         return SubprocessHandle(process, log)
@@ -3643,7 +3645,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--retry-backoff-cap-seconds", type=float, default=600.0)
     run.set_defaults(handler=cmd_run)
 
-    worker = subparsers.add_parser("worker", help=argparse.SUPPRESS)
+    worker = subparsers.add_parser(
+        "worker", help="Internal engine-worker entry point (started by run inside the container)")
     worker.add_argument("--job", required=True)
     worker.set_defaults(handler=lambda args: run_worker(args.job))
 
@@ -3713,7 +3716,7 @@ def main(argv=None) -> int:
     try:
         return args.handler(args)
     except (ConfigError, IdentityMismatch, PromptError, ManifestError, LedgerError,
-            PipelineIdentityError) as exc:
+            PipelineIdentityError, ExportError, WorkerError) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2
 

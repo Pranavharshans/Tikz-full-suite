@@ -490,6 +490,23 @@ class FreezeTests(unittest.TestCase):
             with self.assertRaisesRegex(b.ManifestError, "Stable id mismatch"):
                 b.verify_manifest(work, quick=True)
 
+    def test_prepare_redownloads_missing_model_snapshot(self):
+        rows = [fake_row(index) for index in range(4)]
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            deps = FakePrepareDeps(rows, model_path=str(work / "model-ok"))
+            Path(deps.model_path).mkdir()
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(b.cmd_prepare(prepare_args(work, "--row-limit", "4"), deps), 0)
+            # Simulate a moved or removed cache between runs.
+            meta = json.loads(b.manifest_meta_path(work).read_text())
+            meta["model_path"] = str(work / "gone")
+            b.manifest_meta_path(work).write_text(json.dumps(meta))
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(b.cmd_prepare(prepare_args(work, "--row-limit", "4"), deps), 0)
+            self.assertEqual(json.loads(b.manifest_meta_path(work).read_text())["model_path"],
+                             deps.model_path)
+
     def test_manifest_hash_mismatch_detected(self):
         rows = [fake_row(i) for i in range(4)]
         with tempfile.TemporaryDirectory() as directory:
