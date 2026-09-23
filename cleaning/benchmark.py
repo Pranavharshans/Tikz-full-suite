@@ -86,6 +86,30 @@ def best(results, require_mtp=False):
     return max(eligible, key=lambda r: r["samples_per_gpu_hour"])["config"]
 
 
+def screen_size(concurrency):
+    return min(100, max(16, 2 * concurrency))
+
+
+def screen_manifest(manifest, count):
+    # Deterministic nested prefixes, interleaving four source-length strata.
+    rows = sorted(manifest["rows"], key=lambda r: (len(r["tikz_code"]), str(r["id"])))
+    groups = [rows[i*25:(i+1)*25] for i in range(4)]
+    rng = random.Random(42)
+    for group in groups:
+        rng.shuffle(group)
+    ordered = [row for batch in zip(*groups) for row in batch]
+    return dict(manifest, rows=ordered[:count])
+
+
+def shortlist(results):
+    eligible = [r for r in results if r.get("successful") == r.get("samples", 100)
+                and not r.get("failed") and r["config"]["mtp"]]
+    unique = {}
+    for result in sorted(eligible, key=lambda r: r["samples_per_gpu_hour"], reverse=True):
+        unique.setdefault(digest(result["config"]), result)
+    return list(unique.values())[:3]
+
+
 def prepare(args):
     root = Path(args.work).resolve()
     manifest = root / "dataset.json"
@@ -298,7 +322,7 @@ def worker(args):
                                         batch_wall_s=time.monotonic()-tick))
                 return records
             print("Starting untimed offline warmup", flush=True)
-            warmup = offline(items[:min(5, len(items))])
+            warmup = offline(items[:min(job.get("warmup_samples", 5), len(items))])
             if not all(r["ok"] for r in warmup):
                 raise RuntimeError("Offline warmup failed or hit context limit")
             def offline_metrics(name):
@@ -354,7 +378,7 @@ def worker(args):
                 if server.poll() is not None or time.monotonic() > deadline:
                     raise RuntimeError("Server startup failed; inspect server.log")
                 time.sleep(2)
-        for row, _, length in items[:5]:
+        for row, _, length in items[:job.get("warmup_samples", 5)]:
             result = http_request(port, row, job["context"]-length, job["request_timeout"])
             if not result["ok"]:
                 raise RuntimeError(f"Warmup failed: {result}")
@@ -387,7 +411,9 @@ def worker(args):
 
 
 def run_config(args, cfg, manifest):
+    sample_count = len(manifest["rows"])
     fingerprint = digest(dict(config=cfg, manifest=manifest, context=args.context,
+                              warmup_samples=args.warmup_samples,
                               nccl_p2p=args.nccl_p2p,
                               request_timeout=args.request_timeout, config_timeout=args.config_timeout,
                               script=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
@@ -395,6 +421,8 @@ def run_config(args, cfg, manifest):
     target = Path(args.work).resolve() / "runs" / fingerprint[:16]
     if (target / "summary.json").exists():
         return json.loads((target / "summary.json").read_text())
+    if args.split_screen and (target / "failure.json").exists():
+        return json.loads((target / "failure.json").read_text())
     target.mkdir(parents=True, exist_ok=True)
     # Incomplete configurations are rerun in full; never combine partial timing.
     for stale in [target / "go", *target.glob("replica-*/ready"), *target.glob("replica-*/result.json")]:
@@ -419,6 +447,7 @@ def run_config(args, cfg, manifest):
             concurrency = cfg["concurrency"]//cfg["replicas"] + (index < cfg["concurrency"]%cfg["replicas"])
             spec = dict(config=cfg, manifest=manifest, rows=shard, output=str(folder),
                         nccl_p2p=args.nccl_p2p,
+                        warmup_samples=args.warmup_samples,
                         concurrency=concurrency, context=args.context, port=19000+index,
                         startup_timeout=args.startup_timeout, request_timeout=args.request_timeout)
             dump(folder / "job.json", spec)
@@ -452,18 +481,20 @@ def run_config(args, cfg, manifest):
         latencies = sorted(r["latency_s"] for r in records if r.get("ok") and "latency_s" in r)
         def percentile(p):
             return latencies[min(len(latencies)-1, int((len(latencies)-1)*p))] if latencies else None
-        summary = dict(config=cfg, fingerprint=fingerprint, successful=ok, failed=100-ok,
+        summary = dict(config=cfg, fingerprint=fingerprint, samples=sample_count,
+                       successful=ok, failed=sample_count-ok,
                        wall_s=wall, startup_inclusive_s=total, samples_s=ok/wall,
                        samples_per_gpu_hour=ok*3600/(wall*cfg["tp"]*cfg["replicas"]),
                        completion_tokens=sum(r.get("usage", {}).get("completion_tokens", 0) for r in records),
                        latency_p50_s=percentile(.5), latency_p95_s=percentile(.95),
                        path=str(target))
-        if len({r["id"] for r in records}) != 100:
+        if len(records) != sample_count or {r["id"] for r in records} != {r["id"] for r in rows}:
             raise RuntimeError("Missing/duplicate sample IDs")
         dump(target / "summary.json", summary)
         return summary
     except Exception as exc:
-        result = dict(config=cfg, successful=0, failed=100, error=str(exc), path=str(target))
+        result = dict(config=cfg, samples=sample_count, successful=0,
+                      failed=sample_count, error=str(exc), path=str(target))
         dump(target / "failure.json", result)
         return result
     finally:
@@ -492,7 +523,12 @@ def main():
     parser.add_argument("--startup-timeout", type=int, default=1800)
     parser.add_argument("--request-timeout", type=int, default=1800)
     parser.add_argument("--config-timeout", type=int, default=14400)
+    parser.add_argument("--split-screen", action="store_true",
+                        help="Concurrency-sized screening, then equal-100-sample stage confirmations")
+    parser.add_argument("--warmup-samples", type=int, default=5)
     args = parser.parse_args()
+    if args.warmup_samples < 1:
+        parser.error("--warmup-samples must be positive")
     if args.slurm_script:
         if not args.vllm_sif or not args.sglang_sif:
             parser.error("--slurm-script requires both engine SIF paths")
@@ -510,7 +546,9 @@ def main():
                           "--vllm-sif", vllm, "--sglang-sif", sglang,
                           "--nccl-p2p", args.nccl_p2p,
                           "--context", str(args.context), "--startup-timeout", str(args.startup_timeout),
-                          "--request-timeout", str(args.request_timeout), "--config-timeout", str(args.config_timeout)])
+                          "--request-timeout", str(args.request_timeout), "--config-timeout", str(args.config_timeout),
+                          "--warmup-samples", str(args.warmup_samples)] +
+                         (["--split-screen"] if args.split_screen else []))
         print("#!/bin/bash -l\n#SBATCH --job-name=tikz-bench\n#SBATCH --partition=a40\n"
               "#SBATCH --gres=gpu:a40:4\n#SBATCH --nodes=1\n#SBATCH --ntasks=1\n"
               "#SBATCH --cpus-per-task=64\n#SBATCH --time=24:00:00\n#SBATCH --export=NONE\n"
@@ -525,8 +563,13 @@ def main():
     if args.worker:
         return worker(args)
     if args.plan:
-        print(json.dumps({p:len(phase_configs(p, config())) for p in
-                          ("engines", "mtp", "topology", "scheduling")}, indent=2))
+        plan = {p:len(phase_configs(p, config())) for p in
+                ("engines", "mtp", "topology", "scheduling")}
+        if args.split_screen:
+            plan["samples_by_concurrency"] = {c:screen_size(c) for c in (1,2,4,8,16,32,64,100)}
+            plan["stage_confirmation_runs_up_to"] = 12
+            plan["final_repeat_runs_up_to"] = 9
+        print(json.dumps(plan, indent=2))
         return
     if args.prepare:
         prepare(args)
@@ -563,9 +606,14 @@ def main():
     results, winner = [], None
     for phase in ("engines", "mtp", "topology", "scheduling"):
         phase_results = []
-        for cfg in phase_configs(phase, winner):
-            print(phase, json.dumps(cfg), flush=True)
-            result = run_config(args, cfg, manifest)
+        configs = phase_configs(phase, winner)
+        if args.split_screen:
+            priority = {8:0, 16:1, 32:2, 4:3, 64:4, 100:5, 2:6, 1:7}
+            configs.sort(key=lambda c: priority[c["concurrency"]])
+        for cfg in configs:
+            selected = screen_manifest(manifest, screen_size(cfg["concurrency"])) if args.split_screen else manifest
+            print(phase, f"samples={len(selected['rows'])}", json.dumps(cfg), flush=True)
+            result = run_config(args, cfg, selected)
             phase_results.append(result)
             results.append(result)
             dump(root / "results.json", results)
@@ -574,6 +622,15 @@ def main():
                 writer = csv.DictWriter(f, fieldnames=fields)
                 writer.writeheader()
                 writer.writerows(results)
+        if args.split_screen:
+            confirmed = []
+            for candidate in shortlist(phase_results):
+                print(phase, "confirmation samples=100", json.dumps(candidate["config"]), flush=True)
+                result = run_config(args, candidate["config"], screen_manifest(manifest, 100))
+                confirmed.append(result)
+                results.append(result)
+                dump(root / "results.json", results)
+            phase_results = confirmed
         winner = best(phase_results, require_mtp=True)
         dump(root / f"winner-{phase}.json", winner)
     finalists = sorted([r for r in phase_results if r.get("successful") == 100],

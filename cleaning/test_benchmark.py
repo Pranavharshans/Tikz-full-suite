@@ -17,6 +17,38 @@ spec.loader.exec_module(b)
 
 
 class Tests(unittest.TestCase):
+    def test_screen_sizes_and_nested_samples(self):
+        expected = {1:16, 2:16, 4:16, 8:16, 16:32, 32:64, 64:100, 100:100}
+        manifest = dict(rows=[dict(id=str(i), tikz_code="x" * i) for i in range(100)])
+        for concurrency, count in expected.items():
+            self.assertEqual(b.screen_size(concurrency), count)
+            rows = b.screen_manifest(manifest, count)["rows"]
+            self.assertEqual(len(rows), count)
+            self.assertEqual(len({r["id"] for r in rows}), count)
+            self.assertGreaterEqual(count, concurrency)
+            self.assertEqual(rows, b.screen_manifest(manifest, 100)["rows"][:count])
+        reversed_manifest = dict(rows=list(reversed(manifest["rows"])))
+        self.assertEqual(b.screen_manifest(manifest, 16), b.screen_manifest(reversed_manifest, 16))
+        strata = [int(r["id"]) // 25 for r in b.screen_manifest(manifest, 16)["rows"]]
+        self.assertEqual([strata.count(i) for i in range(4)], [4]*4)
+
+    def test_shortlist_never_treats_screen_as_final_winner(self):
+        rows = [dict(config=b.config(mtp=m), samples=n, successful=ok, failed=n-ok,
+                     samples_per_gpu_hour=speed) for m,n,ok,speed in
+                [(0,16,16,999), (2,16,15,900), (2,16,16,80), (3,100,100,70)]]
+        self.assertEqual(len(b.shortlist(rows)), 2)
+        self.assertEqual(b.best(rows, True)["mtp"], 3)
+
+    def test_split_slurm_flags(self):
+        script = subprocess.check_output([
+            sys.executable, str(Path(b.__file__)), "--slurm-script", "--split-screen",
+            "--warmup-samples", "1", "--vllm-sif", "/tmp/vllm.sif",
+            "--sglang-sif", "/tmp/sglang.sif"], text=True)
+        self.assertIn("--split-screen", script)
+        self.assertIn("--warmup-samples 1", script)
+        self.assertIn("#SBATCH --gres=gpu:a40:4", script)
+        subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
     def test_vllm_runtime_workaround_and_metrics(self):
         opts = b.vllm_runtime_options()
         self.assertIs(opts["disable_custom_all_reduce"], True)

@@ -90,6 +90,44 @@ TP2-only tests, so allocation billing can be higher than that ranking suggests.
 
 ## Local validation
 
+### Split screening on four A40s
+
+Pass `--split-screen --warmup-samples 1` when generating the Slurm script.
+The frozen dataset remains 100 samples; only screening subsets change:
+
+| Global concurrency | Measured screening samples |
+| --- | --- |
+| 1, 2, 4, 8 | 16 |
+| 16 | 32 |
+| 32 | 64 |
+| 64, 100 | 100 |
+
+All original staged settings remain; this is not the full Cartesian product.
+Concurrency 8/16/32 is attempted before the slower 1/2 settings. Each engine
+instance gets one untimed warmup request with the command above. Subsets are
+deterministic nested prefixes interleaving four TikZ source-length strata.
+They are not stratified by unknown output length or measured image complexity.
+Counts are global across replicas, not counts per GPU. High concurrency is an
+upper bound: the queue drains, and memory limits may reduce active concurrency.
+
+Unequal-subset throughput is only a screening heuristic; it can mis-rank candidates.
+At each stage the top three successful MTP-enabled candidates are compared again
+on the same 100 samples before selecting the next stage's winner. The final three
+receive three further 100-sample repeats. This means 67 screening runs, up to 12
+stage confirmations, and up to nine repeats (88 logical runs); matching cached
+runs may be reused. This reduces sample work, not necessarily the number of launches.
+More extensive screening may be needed if rankings are close.
+
+Split mode resumes completed runs and recorded failures instead of repeatedly
+retrying unsupported settings. Interrupted runs without a result rerun from scratch.
+To retry a recorded failure, preserve its log and move its `failure.json` aside.
+No individual offline sample checkpoint is claimed. A short Slurm allocation
+does not guarantee completion of all stages or even the active configuration.
+Run only one orchestrator against a work directory at a time; do not edit/pull the
+runner while a job is active. Old 100-sample mode remains available without the flag.
+
+### Tests
+
 ```bash
 python3 -m unittest discover -s cleaning -p 'test_*.py' -v
 python3 cleaning/benchmark.py --plan
