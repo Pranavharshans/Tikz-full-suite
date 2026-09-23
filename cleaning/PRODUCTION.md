@@ -240,6 +240,8 @@ python3 cleaning/build_dataset.py slurm-script \
   --work /home/atuin/v123be/v123be62/tikz-caption-benchmark/pilot-v2-first-20 \
   --vllm-sif /home/atuin/v123be/v123be62/tikz-caption-benchmark/containers/vllm.sif \
   --model-cache-dir /home/atuin/v123be/v123be62/tikz-caption-benchmark/benchmark-data-nvfp4/hf \
+  --prepare-python /home/atuin/v123be/v123be62/tikz-caption-benchmark/preparation-env/bin/python \
+  --export-python /home/atuin/v123be/v123be62/tikz-caption-benchmark/preparation-env/bin/python \
   --wall-time 00:20:00 \
   --max-runtime-minutes 15 \
   --gpus 1 --replicas 1 \
