@@ -958,6 +958,582 @@ def cmd_prepare(args, deps=None) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Durable state ledger
+# ---------------------------------------------------------------------------
+
+LEDGER_FILE = "ledger.sqlite3"
+LEDGER_BACKUP_DIR = "ledger-backups"
+
+# Transient categories consume the bounded retry budget; interruption categories
+# do not, because they say nothing about the row itself.
+TRANSIENT_CATEGORIES = frozenset({
+    "engine_transient", "engine_fatal", "timeout", "io", "transport", "decode",
+    "worker_lost", "worker_stall",
+})
+NON_COUNTING_CATEGORIES = frozenset({"stale_claim", "run_interrupted"})
+PERMANENT_CATEGORIES = frozenset({
+    "input_invalid", "integrity", "input_too_long", "truncated_at_ceiling",
+    "transient_exhausted", "invalid_instruction",
+})
+
+LEDGER_SCHEMA = """
+CREATE TABLE IF NOT EXISTS meta (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS rows (
+    row_id TEXT PRIMARY KEY,
+    source_row_index INTEGER NOT NULL UNIQUE,
+    state TEXT NOT NULL CHECK (state IN ('pending','running','retryable','complete','rejected')),
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    claimed_at REAL,
+    worker TEXT,
+    not_before REAL NOT NULL DEFAULT 0,
+    last_error_category TEXT,
+    last_error_detail TEXT,
+    rejection_reason TEXT,
+    completed_at REAL,
+    instruction TEXT,
+    finish_reason TEXT,
+    prompt_tokens INTEGER,
+    completion_tokens INTEGER,
+    model_revision TEXT,
+    prompt_sha256 TEXT,
+    config_hash TEXT,
+    image_sha256 TEXT NOT NULL,
+    tikz_sha256 TEXT NOT NULL,
+    updated_at REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS attempts (
+    attempt_id INTEGER PRIMARY KEY AUTOINCREMENT,
+    row_id TEXT NOT NULL REFERENCES rows(row_id),
+    attempt_no INTEGER NOT NULL,
+    attempt_kind TEXT NOT NULL,
+    state TEXT NOT NULL,
+    worker TEXT,
+    max_tokens INTEGER,
+    started_at REAL NOT NULL,
+    ended_at REAL,
+    finish_reason TEXT,
+    error_category TEXT,
+    error_detail TEXT,
+    prompt_tokens INTEGER,
+    completion_tokens INTEGER,
+    instruction TEXT,
+    model_revision TEXT,
+    prompt_sha256 TEXT,
+    config_hash TEXT
+);
+CREATE INDEX IF NOT EXISTS attempts_by_row ON attempts(row_id);
+CREATE INDEX IF NOT EXISTS rows_by_state ON rows(state, source_row_index);
+"""
+
+LEDGER_META_KEYS = ("schema_version", "run_id", "identity_sha256", "manifest_sha256",
+                    "dataset_revision", "model_revision", "prompt_sha256")
+
+
+class LedgerError(RuntimeError):
+    """Raised on invalid ledger transitions or identity drift."""
+
+
+@dataclass(frozen=True)
+class RetryPolicy:
+    max_transient_attempts: int = 3
+    backoff_base_seconds: float = 30.0
+    backoff_cap_seconds: float = 600.0
+    normal_max_tokens: int = 256
+    truncation_max_tokens: int = 384
+
+    @classmethod
+    def from_inference(cls, inference) -> "RetryPolicy":
+        return cls(normal_max_tokens=inference.max_output_tokens,
+                   truncation_max_tokens=inference.truncation_retry_tokens)
+
+
+@dataclass(frozen=True)
+class Decision:
+    state: str
+    reason: str
+    category: str
+    backoff_seconds: float = 0.0
+    detail: str = ""
+
+
+def next_max_tokens(attempts, policy: RetryPolicy) -> int:
+    """Escalate to the retry ceiling once a 256-token attempt truncated."""
+    if any((attempt.get("max_tokens") or 0) >= policy.truncation_max_tokens
+           for attempt in attempts):
+        return policy.truncation_max_tokens
+    if any(attempt.get("finish_reason") == "length" for attempt in attempts):
+        return policy.truncation_max_tokens
+    return policy.normal_max_tokens
+
+
+def decide_result(result: dict, attempts, policy: RetryPolicy) -> Decision:
+    """Map a finished attempt (and the row's history) to the next row state.
+
+    Pure function: no I/O, fully unit-testable.  ``attempts`` includes the
+    attempt that just finished.
+    """
+    if (result.get("ok") and result.get("finish_reason") == "stop"
+            and (result.get("instruction") or "").strip()):
+        return Decision(STATE_COMPLETE, "ok", "none")
+    category = result.get("error_category") or "engine_transient"
+    detail = result.get("error_detail") or ""
+    if category in ("integrity", "input_too_long"):
+        return Decision(STATE_REJECTED, category, category, detail=detail)
+    if result.get("finish_reason") == "length":
+        retry_attempted = any((attempt.get("max_tokens") or 0) >= policy.truncation_max_tokens
+                              for attempt in attempts)
+        if retry_attempted:
+            return Decision(STATE_REJECTED, "truncated_at_ceiling", "truncation",
+                            detail=f"output still truncated at {policy.truncation_max_tokens} tokens")
+        return Decision(STATE_RETRYABLE, "truncated", "truncation",
+                        detail=f"retry at {policy.truncation_max_tokens} tokens")
+    counted = [attempt for attempt in attempts
+               if attempt.get("error_category") in TRANSIENT_CATEGORIES]
+    if len(counted) >= policy.max_transient_attempts:
+        return Decision(STATE_REJECTED, "transient_exhausted", "transient",
+                        detail=f"{len(counted)} transient attempts: {detail}")
+    if category in NON_COUNTING_CATEGORIES:
+        return Decision(STATE_RETRYABLE, category, "transient", detail=detail)
+    backoff = min(policy.backoff_cap_seconds,
+                  policy.backoff_base_seconds * 2 ** max(0, len(counted) - 1))
+    return Decision(STATE_RETRYABLE, category, "transient", backoff_seconds=backoff,
+                    detail=detail)
+
+
+class Ledger:
+    """SQLite state ledger.  Only the controller process writes to it."""
+
+    def __init__(self, work, read_only: bool = False):
+        self.work = Path(work)
+        self.path = self.work / LEDGER_FILE
+        self.read_only = read_only
+        self.conn: sqlite3.Connection | None = None
+
+    # -- lifecycle ---------------------------------------------------------
+
+    def open(self) -> "Ledger":
+        if self.conn is not None:
+            return self
+        if self.read_only:
+            if not self.path.is_file():
+                raise LedgerError(f"No ledger at {self.path}")
+            self.conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True, timeout=30)
+        else:
+            self.work.mkdir(parents=True, exist_ok=True)
+            self.conn = sqlite3.connect(str(self.path), timeout=30, isolation_level=None)
+            self.conn.execute("PRAGMA journal_mode=DELETE")
+            self.conn.execute("PRAGMA synchronous=FULL")
+            self.conn.execute("PRAGMA busy_timeout=30000")
+            self.conn.execute("PRAGMA foreign_keys=ON")
+            self.conn.executescript(LEDGER_SCHEMA)
+        self.conn.row_factory = sqlite3.Row
+        return self
+
+    def close(self) -> None:
+        if self.conn is not None:
+            self.conn.close()
+            self.conn = None
+
+    def __enter__(self):
+        return self.open()
+
+    def __exit__(self, *exc_info):
+        self.close()
+
+    def transaction(self):
+        ledger = self
+
+        class _Transaction:
+            def __enter__(self):
+                ledger.conn.execute("BEGIN IMMEDIATE")
+                return ledger
+
+            def __exit__(self, exc_type, exc, tb):
+                if exc_type is None:
+                    ledger.conn.execute("COMMIT")
+                else:
+                    ledger.conn.execute("ROLLBACK")
+                return False
+        if self.read_only:
+            raise LedgerError("Read-only ledger cannot start a write transaction")
+        return _Transaction()
+
+    # -- identity ----------------------------------------------------------
+
+    def initialize(self, values: dict) -> None:
+        """Create or extend ledger metadata; refuses conflicting values."""
+        missing = [key for key in LEDGER_META_KEYS if key not in values]
+        if missing:
+            raise LedgerError(f"Ledger identity missing keys: {missing}")
+        with self.transaction():
+            for key in LEDGER_META_KEYS:
+                self.conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES (?, ?)",
+                                  (key, str(values[key])))
+            self.conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('tool_version', ?)",
+                              (TOOL_VERSION,))
+            self.conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('created_at', ?)",
+                              (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),))
+        self.verify_identity(values)
+
+    def meta(self) -> dict:
+        return {row["key"]: row["value"] for row in self.conn.execute("SELECT key, value FROM meta")}
+
+    def verify_identity(self, values: dict) -> dict:
+        stored = self.meta()
+        differences = [f"{key}: ledger {stored.get(key)!r} != requested {values[key]!r}"
+                       for key in LEDGER_META_KEYS
+                       if stored.get(key) != str(values[key])]
+        if differences:
+            raise LedgerError(
+                "Ledger belongs to a different run identity:\n  " + "\n  ".join(differences))
+        return stored
+
+    # -- seeding -----------------------------------------------------------
+
+    def seed(self, entries, *, rows_frozen: int) -> dict:
+        """Idempotently load frozen manifest rows into the ledger.
+
+        Valid rows become pending; manifest-invalid rows become rejected with
+        their recorded reason.  Existing rows are verified, never overwritten.
+        """
+        counts = {"inserted": 0, "existing": 0, "rejected": 0}
+        now = time.time()
+        with self.transaction():
+            for entry in entries:
+                state = STATE_PENDING if entry["status"] == "valid" else STATE_REJECTED
+                reason = entry.get("rejection_reason")
+                existing = self.conn.execute(
+                    "SELECT row_id, source_row_index, image_sha256, tikz_sha256, state "
+                    "FROM rows WHERE row_id = ?", (entry["row_id"],)).fetchone()
+                if existing is not None:
+                    if (existing["source_row_index"] != entry["source_row_index"]
+                            or existing["image_sha256"] != entry["image_sha256"]
+                            or existing["tikz_sha256"] != entry["tikz_sha256"]):
+                        raise LedgerError(
+                            f"Ledger row {entry['row_id']} does not match the frozen manifest")
+                    counts["existing"] += 1
+                    continue
+                self.conn.execute(
+                    "INSERT INTO rows (row_id, source_row_index, state, rejection_reason, "
+                    "last_error_category, last_error_detail, image_sha256, tikz_sha256, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (entry["row_id"], entry["source_row_index"], state, reason,
+                     "input_invalid" if state == STATE_REJECTED else None,
+                     reason, entry["image_sha256"], entry["tikz_sha256"], now))
+                counts["inserted"] += 1
+                if state == STATE_REJECTED:
+                    counts["rejected"] += 1
+            total = self.conn.execute("SELECT COUNT(*) FROM rows").fetchone()[0]
+            if total != rows_frozen:
+                raise LedgerError(
+                    f"Ledger holds {total} rows but the manifest froze {rows_frozen}; "
+                    "the ledger and manifest do not belong together")
+        return counts
+
+    # -- queries -----------------------------------------------------------
+
+    def get(self, row_id: str) -> dict | None:
+        row = self.conn.execute("SELECT * FROM rows WHERE row_id = ?", (row_id,)).fetchone()
+        return dict(row) if row else None
+
+    def eligible(self, *, start_index: int = 0, end_index: int = ROW_LIMIT - 1,
+                 limit: int | None = None, now: float | None = None) -> list[dict]:
+        now = time.time() if now is None else now
+        sql = ("SELECT row_id, source_row_index, attempt_count FROM rows "
+               "WHERE state IN (?, ?) AND not_before <= ? AND source_row_index BETWEEN ? AND ? "
+               "ORDER BY source_row_index")
+        parameters: list = [STATE_PENDING, STATE_RETRYABLE, now, start_index, end_index]
+        if limit is not None:
+            sql += " LIMIT ?"
+            parameters.append(limit)
+        return [dict(row) for row in self.conn.execute(sql, parameters)]
+
+    def counts(self) -> dict:
+        states = {state: 0 for state in STATES}
+        for row in self.conn.execute("SELECT state, COUNT(*) AS n FROM rows GROUP BY state"):
+            states[row["state"]] = row["n"]
+        attempts = self.conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0]
+        truncations = self.conn.execute(
+            "SELECT COUNT(*) FROM attempts WHERE finish_reason = 'length'").fetchone()[0]
+        errors = {row["error_category"]: row["n"] for row in self.conn.execute(
+            "SELECT error_category, COUNT(*) AS n FROM attempts "
+            "WHERE error_category IS NOT NULL GROUP BY error_category")}
+        reasons = {row["rejection_reason"]: row["n"] for row in self.conn.execute(
+            "SELECT rejection_reason, COUNT(*) AS n FROM rows WHERE state = ? "
+            "GROUP BY rejection_reason", (STATE_REJECTED,))}
+        tokens = self.conn.execute(
+            "SELECT COALESCE(SUM(prompt_tokens),0) AS p, COALESCE(SUM(completion_tokens),0) AS c "
+            "FROM rows WHERE state = ?", (STATE_COMPLETE,)).fetchone()
+        window = self.conn.execute(
+            "SELECT MIN(claimed_at) AS first_claim, MAX(completed_at) AS last_complete, "
+            "MIN(completed_at) AS first_complete FROM rows").fetchone()
+        return {
+            "total": sum(states.values()),
+            "states": states,
+            "attempts": attempts,
+            "truncation_attempts": truncations,
+            "error_categories": errors,
+            "rejection_reasons": reasons,
+            "prompt_tokens": tokens["p"],
+            "completion_tokens": tokens["c"],
+            "first_claim_at": window["first_claim"],
+            "first_complete_at": window["first_complete"],
+            "last_complete_at": window["last_complete"],
+        }
+
+    def attempts_for(self, row_ids) -> dict:
+        result: dict[str, list[dict]] = {row_id: [] for row_id in row_ids}
+        row_ids = list(row_ids)
+        for start in range(0, len(row_ids), 500):
+            chunk = row_ids[start:start + 500]
+            placeholders = ",".join("?" * len(chunk))
+            for row in self.conn.execute(
+                    f"SELECT * FROM attempts WHERE row_id IN ({placeholders}) "
+                    "ORDER BY attempt_id", chunk):
+                result[row["row_id"]].append(dict(row))
+        return result
+
+    def all_attempts(self) -> list[dict]:
+        return [dict(row) for row in self.conn.execute(
+            "SELECT * FROM attempts ORDER BY row_id, attempt_id")]
+
+    def complete_rows(self) -> list[dict]:
+        return [dict(row) for row in self.conn.execute(
+            "SELECT * FROM rows WHERE state = ? ORDER BY source_row_index", (STATE_COMPLETE,))]
+
+    def rejected_rows(self) -> list[dict]:
+        return [dict(row) for row in self.conn.execute(
+            "SELECT * FROM rows WHERE state = ? ORDER BY source_row_index", (STATE_REJECTED,))]
+
+    # -- claims and transitions -------------------------------------------
+
+    def claim(self, assignments: dict, *, policy: RetryPolicy,
+              now: float | None = None) -> dict:
+        """Atomically move rows to running and open one attempt per row."""
+        now = time.time() if now is None else now
+        claimed: dict[str, list[dict]] = {}
+        with self.transaction():
+            for worker, row_ids in assignments.items():
+                claimed[worker] = []
+                for row_id in row_ids:
+                    row = self.conn.execute(
+                        "SELECT * FROM rows WHERE row_id = ?", (row_id,)).fetchone()
+                    if row is None:
+                        raise LedgerError(f"Claim for unknown row {row_id}")
+                    if row["state"] not in (STATE_PENDING, STATE_RETRYABLE):
+                        raise LedgerError(
+                            f"Claim conflict for {row_id}: state is {row['state']}")
+                    if row["not_before"] > now:
+                        raise LedgerError(
+                            f"Claim conflict for {row_id}: not_before {row['not_before']} > {now}")
+                    attempts = self._attempts(row_id)
+                    max_tokens = next_max_tokens(attempts, policy)
+                    attempt_kind = ("truncation_retry"
+                                    if max_tokens > policy.normal_max_tokens else "normal")
+                    attempt_no = row["attempt_count"] + 1
+                    self.conn.execute(
+                        "UPDATE rows SET state = ?, claimed_at = ?, worker = ?, "
+                        "attempt_count = ?, updated_at = ? WHERE row_id = ?",
+                        (STATE_RUNNING, now, worker, attempt_no, now, row_id))
+                    self.conn.execute(
+                        "INSERT INTO attempts (row_id, attempt_no, attempt_kind, state, worker, "
+                        "max_tokens, started_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (row_id, attempt_no, attempt_kind, STATE_RUNNING, worker, max_tokens, now))
+                    claimed[worker].append({
+                        "row_id": row_id,
+                        "source_row_index": row["source_row_index"],
+                        "attempt_no": attempt_no,
+                        "attempt_kind": attempt_kind,
+                        "max_tokens": max_tokens,
+                    })
+        return claimed
+
+    def _attempts(self, row_id: str) -> list[dict]:
+        return [dict(row) for row in self.conn.execute(
+            "SELECT * FROM attempts WHERE row_id = ? ORDER BY attempt_id", (row_id,))]
+
+    def _open_attempt(self, row_id: str, worker: str | None = None):
+        sql = "SELECT * FROM attempts WHERE row_id = ? AND state = ?"
+        parameters: list = [row_id, STATE_RUNNING]
+        if worker is not None:
+            sql += " AND worker = ?"
+            parameters.append(worker)
+        sql += " ORDER BY attempt_id DESC LIMIT 1"
+        return self.conn.execute(sql, parameters).fetchone()
+
+    def _close_attempt(self, attempt_id: int, result: dict, state: str, now: float) -> None:
+        self.conn.execute(
+            "UPDATE attempts SET state = ?, ended_at = ?, finish_reason = ?, error_category = ?, "
+            "error_detail = ?, prompt_tokens = ?, completion_tokens = ?, instruction = ?, "
+            "model_revision = ?, prompt_sha256 = ?, config_hash = ? WHERE attempt_id = ?",
+            (state, now, result.get("finish_reason"), result.get("error_category"),
+             result.get("error_detail"), result.get("prompt_tokens"),
+             result.get("completion_tokens"), result.get("instruction"),
+             result.get("model_revision"), result.get("prompt_sha256"),
+             result.get("config_hash"), attempt_id))
+
+    def record_result(self, result: dict, *, policy: RetryPolicy,
+                      now: float | None = None) -> str:
+        """Commit one worker result transactionally and return the new row state."""
+        now = time.time() if now is None else now
+        row_id = result["row_id"]
+        with self.transaction():
+            row = self.conn.execute("SELECT * FROM rows WHERE row_id = ?", (row_id,)).fetchone()
+            if row is None:
+                raise LedgerError(f"Result for unknown row {row_id}")
+            if row["state"] == STATE_COMPLETE:
+                # Crash between commit and result-file consumption: verify and no-op.
+                if row["instruction"] != result.get("instruction"):
+                    raise LedgerError(
+                        f"Row {row_id} is already complete with a different instruction; "
+                        "refusing to overwrite a completed caption")
+                return STATE_COMPLETE
+            if row["state"] == STATE_REJECTED:
+                return STATE_REJECTED  # terminal; late results are ignored
+            attempt = self._open_attempt(row_id, result.get("worker"))
+            if attempt is not None:
+                # Represent the just-finished attempt by its own result so the
+                # retry budget and truncation escalation see it immediately.
+                attempts = [dict(result) if row["attempt_id"] == attempt["attempt_id"] else row
+                            for row in self._attempts(row_id)]
+                decision = decide_result(result, attempts, policy)
+                self._close_attempt(attempt["attempt_id"], result, decision.state, now)
+            else:
+                # Recovered result from a crashed run: no open attempt remains.
+                attempts = self._attempts(row_id) + [dict(result)]
+                decision = decide_result(result, attempts, policy)
+                attempt_no = row["attempt_count"] + 1
+                self.conn.execute(
+                    "INSERT INTO attempts (row_id, attempt_no, attempt_kind, state, worker, "
+                    "max_tokens, started_at, ended_at) VALUES (?, ?, 'recovered', ?, ?, ?, ?, ?)",
+                    (row_id, attempt_no, decision.state, result.get("worker"),
+                     result.get("max_tokens"), now, now))
+                self._close_attempt(self.conn.execute("SELECT last_insert_rowid()").fetchone()[0],
+                                    result, decision.state, now)
+                self.conn.execute(
+                    "UPDATE rows SET attempt_count = ? WHERE row_id = ?", (attempt_no, row_id))
+            if decision.state == STATE_COMPLETE:
+                self.conn.execute(
+                    "UPDATE rows SET state = ?, instruction = ?, finish_reason = ?, "
+                    "prompt_tokens = ?, completion_tokens = ?, model_revision = ?, "
+                    "prompt_sha256 = ?, config_hash = ?, completed_at = ?, "
+                    "last_error_category = NULL, last_error_detail = NULL, updated_at = ? "
+                    "WHERE row_id = ?",
+                    (STATE_COMPLETE, result.get("instruction"), result.get("finish_reason"),
+                     result.get("prompt_tokens"), result.get("completion_tokens"),
+                     result.get("model_revision"), result.get("prompt_sha256"),
+                     result.get("config_hash"), now, now, row_id))
+            elif decision.state == STATE_RETRYABLE:
+                self.conn.execute(
+                    "UPDATE rows SET state = ?, not_before = ?, last_error_category = ?, "
+                    "last_error_detail = ?, updated_at = ? WHERE row_id = ?",
+                    (STATE_RETRYABLE, now + decision.backoff_seconds, decision.reason,
+                     decision.detail, now, row_id))
+            else:
+                self.conn.execute(
+                    "UPDATE rows SET state = ?, rejection_reason = ?, last_error_category = ?, "
+                    "last_error_detail = ?, updated_at = ? WHERE row_id = ?",
+                    (STATE_REJECTED, decision.reason, decision.category, decision.detail,
+                     now, row_id))
+        return decision.state
+
+    def reclaim_stale(self, stale_seconds: float, *, policy: RetryPolicy,
+                      now: float | None = None) -> int:
+        """Return rows whose worker vanished to retryable without consuming budget."""
+        now = time.time() if now is None else now
+        return self._release(category="stale_claim", policy=policy, now=now,
+                             older_than=now - stale_seconds)
+
+    def release_running(self, *, worker: str | None = None, category: str,
+                        policy: RetryPolicy, now: float | None = None) -> int:
+        """Release a dead worker's rows (or all running rows) with retry accounting."""
+        if category not in TRANSIENT_CATEGORIES and category not in NON_COUNTING_CATEGORIES:
+            raise LedgerError(f"Unknown release category {category!r}")
+        now = time.time() if now is None else now
+        return self._release(category=category, policy=policy, now=now, worker=worker)
+
+    def _release(self, *, category: str, policy: RetryPolicy, now: float,
+                 worker: str | None = None, older_than: float | None = None) -> int:
+        sql = "SELECT row_id FROM rows WHERE state = ?"
+        parameters: list = [STATE_RUNNING]
+        if worker is not None:
+            sql += " AND worker = ?"
+            parameters.append(worker)
+        if older_than is not None:
+            sql += " AND claimed_at < ?"
+            parameters.append(older_than)
+        row_ids = [row["row_id"] for row in self.conn.execute(sql, parameters)]
+        released = 0
+        with self.transaction():
+            for row_id in row_ids:
+                row = self.conn.execute("SELECT * FROM rows WHERE row_id = ?", (row_id,)).fetchone()
+                attempts = self._attempts(row_id)
+                placeholder = {"error_category": category, "error_detail": f"released as {category}"}
+                synthetic = attempts + [dict(placeholder, max_tokens=None)]
+                decision = decide_result(dict(placeholder, ok=False), synthetic, policy)
+                open_attempt = self._open_attempt(row_id)
+                if open_attempt is not None:
+                    self._close_attempt(open_attempt["attempt_id"], placeholder, "lost", now)
+                if decision.state == STATE_REJECTED:
+                    self.conn.execute(
+                        "UPDATE rows SET state = ?, rejection_reason = ?, last_error_category = ?, "
+                        "last_error_detail = ?, updated_at = ? WHERE row_id = ?",
+                        (STATE_REJECTED, decision.reason, decision.category, decision.detail,
+                         now, row_id))
+                else:
+                    self.conn.execute(
+                        "UPDATE rows SET state = ?, not_before = ?, last_error_category = ?, "
+                        "last_error_detail = ?, updated_at = ? WHERE row_id = ?",
+                        (STATE_RETRYABLE, now + decision.backoff_seconds, category,
+                         decision.detail, now, row_id))
+                released += 1
+        return released
+
+    def reprocess_rejected(self, *, policy: RetryPolicy, now: float | None = None) -> int:
+        """Explicitly move rejected rows back to pending, preserving attempt history."""
+        now = time.time() if now is None else now
+        with self.transaction():
+            cursor = self.conn.execute(
+                "UPDATE rows SET state = ?, rejection_reason = NULL, not_before = 0, "
+                "updated_at = ? WHERE state = ? AND COALESCE(last_error_category, '') "
+                "!= 'input_invalid'", (STATE_PENDING, now, STATE_REJECTED))
+            return cursor.rowcount
+
+    # -- backup ------------------------------------------------------------
+
+    def checkpoint(self, destination: Path | None = None) -> Path:
+        directory = Path(destination) if destination else self.work / LEDGER_BACKUP_DIR
+        directory.mkdir(parents=True, exist_ok=True)
+        stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+        target = directory / f"ledger-{stamp}.sqlite3"
+        suffix = 0
+        while target.exists():
+            suffix += 1
+            target = directory / f"ledger-{stamp}-{suffix}.sqlite3"
+        backup = sqlite3.connect(str(target))
+        try:
+            self.conn.backup(backup)
+        finally:
+            backup.close()
+        return target
+
+
+def ledger_identity_from_config(config: RunConfig, meta: dict) -> dict:
+    return {
+        "schema_version": LEDGER_SCHEMA_VERSION,
+        "run_id": config.run_id(),
+        "identity_sha256": config.identity_sha256(),
+        "manifest_sha256": meta["manifest_sha256"],
+        "dataset_revision": config.dataset.revision,
+        "model_revision": config.model.revision,
+        "prompt_sha256": config.prompt.sha256,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Slurm guard
 # ---------------------------------------------------------------------------
 
@@ -1019,6 +1595,19 @@ def cmd_plan(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Commands: checkpoint
+# ---------------------------------------------------------------------------
+
+
+def cmd_checkpoint(args) -> int:
+    work = Path(args.work).resolve()
+    with Ledger(work, read_only=True) as ledger:
+        target = ledger.checkpoint()
+    print(f"Ledger checkpoint: {target}")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1070,6 +1659,10 @@ def build_parser() -> argparse.ArgumentParser:
                          help="Bounded sample used for the disk-space estimate")
     prepare.add_argument("--row-limit", type=int, default=ROW_LIMIT, help=argparse.SUPPRESS)
     prepare.set_defaults(handler=cmd_prepare)
+
+    checkpoint = subparsers.add_parser("checkpoint", help="Copy the ledger to a backup file")
+    add_common_arguments(checkpoint)
+    checkpoint.set_defaults(handler=cmd_checkpoint)
     return parser
 
 

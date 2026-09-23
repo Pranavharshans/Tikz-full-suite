@@ -9,6 +9,7 @@ import dataclasses
 import importlib.util
 import io
 import json
+import sqlite3
 import sys
 import tempfile
 import types
@@ -496,6 +497,318 @@ class FreezeTests(unittest.TestCase):
             manifest.write_text(manifest.read_text() + "\n")
             with self.assertRaises(b.ManifestError):
                 b.verify_manifest(work, quick=True)
+
+
+# ---------------------------------------------------------------------------
+# Feature 3: durable state ledger
+# ---------------------------------------------------------------------------
+
+LEDGER_IDENTITY = dict(
+    schema_version=b.LEDGER_SCHEMA_VERSION,
+    run_id="run-0000000000000000",
+    identity_sha256="f" * 64,
+    manifest_sha256="a" * 64,
+    dataset_revision="1" * 40,
+    model_revision="2" * 40,
+    prompt_sha256="3" * 64,
+)
+
+
+def manifest_entries(count=6, invalid=()):
+    entries = []
+    for index in range(count):
+        tikz = f"\\draw ({index},0);"
+        status = "rejected" if index in invalid else "valid"
+        entries.append({
+            "row_id": b.stable_row_id("d", "r" * 40, "train", index,
+                                      b.sha256_text(tikz), b.sha256_bytes(TINY_PNG)),
+            "source_row_index": index,
+            "tikz_code": tikz,
+            "tikz_sha256": b.sha256_text(tikz),
+            "image": f"images/{index:06d}.png",
+            "image_sha256": b.sha256_bytes(TINY_PNG),
+            "status": status,
+            "rejection_reason": "invalid_image" if status == "rejected" else None,
+        })
+    return entries
+
+
+def open_seeded_ledger(work, entries, *, identity=None, rows_frozen=None):
+    ledger = b.Ledger(work).open()
+    ledger.initialize(identity or LEDGER_IDENTITY)
+    ledger.seed(entries, rows_frozen=rows_frozen if rows_frozen is not None else len(entries))
+    return ledger
+
+
+def ok_result(row_id, index, *, instruction="Draw a circle with a radius label",
+              max_tokens=256, worker="w0", finish="stop"):
+    return dict(row_id=row_id, source_row_index=index, worker=worker, max_tokens=max_tokens,
+                ok=finish == "stop", instruction=instruction if finish == "stop" else None,
+                finish_reason=finish, prompt_tokens=11, completion_tokens=22,
+                error_category=None, error_detail=None, model_revision="2" * 40,
+                prompt_sha256="3" * 64, config_hash="f" * 64)
+
+
+def fail_result(row_id, index, *, category="engine_transient", detail="cuda oops",
+                max_tokens=256, worker="w0", finish=None):
+    return dict(row_id=row_id, source_row_index=index, worker=worker, max_tokens=max_tokens,
+                ok=False, instruction=None, finish_reason=finish, prompt_tokens=None,
+                completion_tokens=None, error_category=category, error_detail=detail,
+                model_revision="2" * 40, prompt_sha256="3" * 64, config_hash="f" * 64)
+
+
+class LedgerIdentityTests(unittest.TestCase):
+    def test_identity_roundtrip_and_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with b.Ledger(directory).open() as ledger:
+                ledger.initialize(LEDGER_IDENTITY)
+                ledger.verify_identity(LEDGER_IDENTITY)
+                with self.assertRaisesRegex(b.LedgerError, "different run identity"):
+                    ledger.verify_identity(dict(LEDGER_IDENTITY, run_id="other"))
+            with self.assertRaisesRegex(b.LedgerError, "No ledger"):
+                b.Ledger(Path(directory) / "empty", read_only=True).open()
+
+    def test_seed_is_idempotent_and_verifies_manifest(self):
+        entries = manifest_entries(5)
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = open_seeded_ledger(directory, entries)
+            self.assertEqual(ledger.seed(entries, rows_frozen=5)["existing"], 5)
+            self.assertEqual(ledger.counts()["states"]["pending"], 5)
+            changed = [dict(entry) for entry in entries]
+            changed[2]["image_sha256"] = "0" * 64
+            with self.assertRaisesRegex(b.LedgerError, "does not match the frozen manifest"):
+                ledger.seed(changed, rows_frozen=5)
+            ledger.close()
+            with b.Ledger(directory).open() as fresh:
+                fresh.initialize(LEDGER_IDENTITY)
+                with self.assertRaisesRegex(b.LedgerError, "do not belong together"):
+                    fresh.seed(entries[:3], rows_frozen=3)
+
+    def test_seed_records_invalid_rows_as_rejected(self):
+        entries = manifest_entries(4, invalid=(1, 3))
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = open_seeded_ledger(directory, entries)
+            counts = ledger.counts()
+            self.assertEqual(counts["states"]["pending"], 2)
+            self.assertEqual(counts["states"]["rejected"], 2)
+            self.assertEqual(counts["rejection_reasons"], {"invalid_image": 2})
+            self.assertEqual(ledger.get(entries[1]["row_id"])["last_error_category"],
+                             "input_invalid")
+            ledger.close()
+
+
+class LedgerTransitionTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.entries = manifest_entries(6)
+        self.ledger = open_seeded_ledger(self.directory.name, self.entries)
+        self.addCleanup(self.ledger.close)
+        self.policy = b.RetryPolicy()
+
+    def ids(self, *indexes):
+        return [self.entries[index]["row_id"] for index in indexes]
+
+    def claim_one(self, index, worker="w0", now=None):
+        claimed = self.ledger.claim({worker: self.ids(index)}, policy=self.policy, now=now)
+        return claimed[worker][0]
+
+    def test_claim_opens_attempt_and_marks_running(self):
+        claim = self.claim_one(0)
+        self.assertEqual(claim["max_tokens"], 256)
+        self.assertEqual(claim["attempt_kind"], "normal")
+        self.assertEqual(claim["attempt_no"], 1)
+        row = self.ledger.get(self.ids(0)[0])
+        self.assertEqual(row["state"], b.STATE_RUNNING)
+        self.assertEqual(row["worker"], "w0")
+        self.assertEqual(row["attempt_count"], 1)
+        attempts = self.ledger.attempts_for(self.ids(0))[self.ids(0)[0]]
+        self.assertEqual([(a["state"], a["attempt_no"]) for a in attempts], [("running", 1)])
+        # A second claim on the same row is a hard conflict.
+        with self.assertRaisesRegex(b.LedgerError, "Claim conflict"):
+            self.ledger.claim({"w1": self.ids(0)}, policy=self.policy)
+
+    def test_eligible_excludes_running_complete_rejected(self):
+        self.claim_one(0)
+        self.ledger.record_result(ok_result(*self.ids(1), 1), policy=self.policy)
+        eligible = {row["source_row_index"] for row in self.ledger.eligible()}
+        self.assertEqual(eligible, {2, 3, 4, 5})
+
+    def test_complete_is_transactional_and_idempotent(self):
+        row_id = self.ids(0)[0]
+        self.claim_one(0)
+        state = self.ledger.record_result(ok_result(row_id, 0), policy=self.policy)
+        self.assertEqual(state, b.STATE_COMPLETE)
+        row = self.ledger.get(row_id)
+        self.assertEqual(row["instruction"], "Draw a circle with a radius label")
+        self.assertEqual(row["finish_reason"], "stop")
+        self.assertEqual((row["prompt_tokens"], row["completion_tokens"]), (11, 22))
+        self.assertIsNotNone(row["completed_at"])
+        # Re-ingesting the identical result is a no-op (crash before consumption).
+        self.assertEqual(self.ledger.record_result(ok_result(row_id, 0), policy=self.policy),
+                         b.STATE_COMPLETE)
+        # A different instruction must never overwrite a completed caption.
+        with self.assertRaisesRegex(b.LedgerError, "different instruction"):
+            self.ledger.record_result(
+                ok_result(row_id, 0, instruction="Something else entirely"),
+                policy=self.policy)
+        # Completed rows are never claimable again.
+        with self.assertRaisesRegex(b.LedgerError, "Claim conflict"):
+            self.ledger.claim({"w0": [row_id]}, policy=self.policy)
+
+    def test_transient_retry_budget_and_backoff(self):
+        row_id = self.ids(0)[0]
+        expected = [(1, 30.0, b.STATE_RETRYABLE), (2, 60.0, b.STATE_RETRYABLE),
+                    (3, None, b.STATE_REJECTED)]
+        for attempt, backoff, state in expected:
+            claim_time = 1000.0 * attempt
+            claimed = self.ledger.claim({"w0": [row_id]}, policy=self.policy, now=claim_time)
+            self.assertEqual(claimed["w0"][0]["attempt_no"], attempt)
+            result_state = self.ledger.record_result(fail_result(row_id, 0),
+                                                     policy=self.policy, now=claim_time)
+            self.assertEqual(result_state, state)
+            row = self.ledger.get(row_id)
+            if backoff is None:
+                self.assertEqual(row["rejection_reason"], "transient_exhausted")
+            else:
+                self.assertEqual(row["last_error_category"], "engine_transient")
+                self.assertAlmostEqual(row["not_before"], claim_time + backoff)
+                self.assertNotIn(row_id, [r["row_id"]
+                                          for r in self.ledger.eligible(now=claim_time)])
+                self.assertIn(row_id, [r["row_id"]
+                                       for r in self.ledger.eligible(now=claim_time + backoff + 1)])
+        attempts = self.ledger.attempts_for([row_id])[row_id]
+        self.assertEqual([a["state"] for a in attempts],
+                         ["retryable", "retryable", "rejected"])
+        self.assertEqual(len(attempts), 3)
+
+    def test_truncation_escalates_from_256_to_384_then_rejects(self):
+        row_id = self.ids(0)[0]
+        claim = self.claim_one(0)
+        self.assertEqual(claim["max_tokens"], 256)
+        state = self.ledger.record_result(
+            ok_result(row_id, 0, instruction=None, finish="length"), policy=self.policy)
+        self.assertEqual(state, b.STATE_RETRYABLE)
+        claim = self.ledger.claim({"w0": [row_id]}, policy=self.policy)
+        self.assertEqual(claim["w0"][0]["max_tokens"], 384)
+        self.assertEqual(claim["w0"][0]["attempt_kind"], "truncation_retry")
+        state = self.ledger.record_result(
+            ok_result(row_id, 0, instruction=None, finish="length", max_tokens=384),
+            policy=self.policy)
+        self.assertEqual(state, b.STATE_REJECTED)
+        self.assertEqual(self.ledger.get(row_id)["rejection_reason"], "truncated_at_ceiling")
+        attempts = self.ledger.attempts_for([row_id])[row_id]
+        self.assertEqual([a["max_tokens"] for a in attempts], [256, 384])
+        self.assertEqual([a["finish_reason"] for a in attempts], ["length", "length"])
+
+    def test_stale_claims_do_not_consume_retry_budget(self):
+        row_id = self.ids(0)[0]
+        for cycle in range(4):
+            claim_time = 200.0 + 10 * cycle
+            self.ledger.claim({"w0": [row_id]}, policy=self.policy, now=claim_time)
+            reclaimed = self.ledger.reclaim_stale(5.0, policy=self.policy, now=claim_time + 10)
+            self.assertEqual(reclaimed, 1)
+            row = self.ledger.get(row_id)
+            self.assertEqual(row["state"], b.STATE_RETRYABLE)
+            self.assertEqual(row["last_error_category"], "stale_claim")
+        attempts = self.ledger.attempts_for([row_id])[row_id]
+        self.assertEqual(len(attempts), 4)
+        self.assertTrue(all(attempt["state"] == "lost" for attempt in attempts))
+
+    def test_worker_loss_consumes_budget_and_eventually_rejects(self):
+        row_id = self.ids(0)[0]
+        for cycle in range(3):
+            self.ledger.claim({"w0": [row_id]}, policy=self.policy, now=1000.0 * (cycle + 1))
+            self.ledger.release_running(worker="w0", category="worker_lost",
+                                        policy=self.policy, now=1000.0 * (cycle + 1))
+        self.assertEqual(self.ledger.get(row_id)["state"], b.STATE_REJECTED)
+        self.assertEqual(self.ledger.get(row_id)["rejection_reason"], "transient_exhausted")
+
+    def test_run_interruption_does_not_consume_budget(self):
+        row_id = self.ids(0)[0]
+        for cycle in range(5):
+            now = 1000.0 * (cycle + 1)
+            self.ledger.claim({"w0": [row_id]}, policy=self.policy, now=now)
+            self.ledger.release_running(category="run_interrupted", policy=self.policy, now=now)
+        self.assertEqual(self.ledger.get(row_id)["state"], b.STATE_RETRYABLE)
+
+    def test_rejected_rows_stay_rejected_until_explicit_reprocessing(self):
+        entries = manifest_entries(4, invalid=(0,))
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = open_seeded_ledger(directory, entries)
+            row_id = entries[1]["row_id"]
+            ledger.claim({"w0": [row_id]}, policy=self.policy)
+            ledger.record_result(fail_result(row_id, 1, category="integrity",
+                                             detail="image checksum mismatch"),
+                                 policy=self.policy)
+            self.assertEqual(ledger.get(row_id)["state"], b.STATE_REJECTED)
+            self.assertEqual({row["source_row_index"] for row in ledger.eligible()}, {2, 3})
+            moved = ledger.reprocess_rejected(policy=self.policy)
+            self.assertEqual(moved, 1)  # input_invalid row is not reprocessed
+            self.assertEqual(ledger.get(row_id)["state"], b.STATE_PENDING)
+            self.assertEqual({row["source_row_index"] for row in ledger.eligible()}, {1, 2, 3})
+            self.assertEqual(ledger.get(entries[0]["row_id"])["state"], b.STATE_REJECTED)
+            # Attempt history survives reprocessing.
+            self.assertEqual(len(ledger.attempts_for([row_id])[row_id]), 1)
+            ledger.close()
+
+    def test_checkpoint_backup_is_readable(self):
+        row_id = self.ids(0)[0]
+        self.claim_one(0)
+        self.ledger.record_result(ok_result(row_id, 0), policy=self.policy)
+        target = self.ledger.checkpoint()
+        self.assertTrue(target.is_file())
+        backup = b.Ledger(Path(self.directory.name) / "unused", read_only=False)
+        backup.conn = sqlite3.connect(str(target))
+        backup.conn.row_factory = sqlite3.Row
+        try:
+            self.assertEqual(backup.counts()["states"]["complete"], 1)
+        finally:
+            backup.close()
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(b.main(["checkpoint", "--work", self.directory.name]), 0)
+        self.assertIn("Ledger checkpoint:", output.getvalue())
+
+    def test_crash_between_inference_and_commit_recovers(self):
+        row_id = self.ids(0)[0]
+        # The claim happened, then the process died before any result arrived.
+        self.ledger.claim({"w0": [row_id]}, policy=self.policy, now=100.0)
+        self.ledger.close()
+        recovered = b.Ledger(self.directory.name).open()
+        self.addCleanup(recovered.close)
+        recovered.initialize(LEDGER_IDENTITY)
+        self.assertEqual(recovered.reclaim_stale(10.0, policy=self.policy, now=200.0), 1)
+        self.assertEqual(recovered.get(row_id)["state"], b.STATE_RETRYABLE)
+        # Resume completes the row exactly once.
+        recovered.claim({"w0": [row_id]}, policy=self.policy, now=201.0)
+        self.assertEqual(recovered.record_result(ok_result(row_id, 0), policy=self.policy,
+                                                 now=202.0), b.STATE_COMPLETE)
+        self.assertEqual(recovered.get(row_id)["attempt_count"], 2)
+
+    def test_recovered_result_after_restart_is_accepted(self):
+        row_id = self.ids(0)[0]
+        self.ledger.claim({"w0": [row_id]}, policy=self.policy, now=100.0)
+        self.ledger.reclaim_stale(10.0, policy=self.policy, now=200.0)
+        # A result file written before the crash is ingested after restart.
+        state = self.ledger.record_result(ok_result(row_id, 0, worker="w0"),
+                                          policy=self.policy, now=201.0)
+        self.assertEqual(state, b.STATE_COMPLETE)
+        attempts = self.ledger.attempts_for([row_id])[row_id]
+        self.assertEqual([a["attempt_kind"] for a in attempts], ["normal", "recovered"])
+
+    def test_counts_aggregate(self):
+        self.claim_one(0)
+        self.ledger.record_result(ok_result(*self.ids(1), 1), policy=self.policy)
+        self.ledger.record_result(fail_result(*self.ids(2), 2), policy=self.policy)
+        counts = self.ledger.counts()
+        self.assertEqual(counts["total"], 6)
+        self.assertEqual(counts["states"], {"pending": 3, "running": 1, "retryable": 1,
+                                            "complete": 1, "rejected": 0})
+        self.assertEqual(counts["attempts"], 3)
+        self.assertEqual(counts["prompt_tokens"], 11)
+        self.assertEqual(counts["completion_tokens"], 22)
+        self.assertIn("engine_transient", counts["error_categories"])
 
 
 if __name__ == "__main__":
