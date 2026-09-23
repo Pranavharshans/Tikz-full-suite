@@ -478,7 +478,7 @@ def run_config(args, cfg, manifest):
                               greedy=args.greedy,
                               replicas_per_gpu=args.replicas_per_gpu,
                               gpu_memory_utilization=args.gpu_memory_utilization,
-                              kv_cache_memory_bytes=args.kv_cache_memory_gib * 1024**3,
+                              kv_cache_memory_bytes=int(args.kv_cache_memory_gib * 1024**3),
                               nccl_p2p=args.nccl_p2p,
                               request_timeout=args.request_timeout, config_timeout=args.config_timeout,
                               script=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
@@ -531,7 +531,7 @@ def run_config(args, cfg, manifest):
                         max_output_tokens=args.max_output_tokens,
                         greedy=args.greedy,
                         gpu_memory_utilization=args.gpu_memory_utilization,
-                        kv_cache_memory_bytes=args.kv_cache_memory_gib * 1024**3,
+                        kv_cache_memory_bytes=int(args.kv_cache_memory_gib * 1024**3),
                         concurrency=concurrency, context=args.context, port=19000+index,
                         startup_timeout=args.startup_timeout, request_timeout=args.request_timeout)
             dump(folder / "job.json", spec)
