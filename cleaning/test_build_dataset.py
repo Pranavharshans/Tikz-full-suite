@@ -179,7 +179,7 @@ class IdentityTests(unittest.TestCase):
         cases = [
             (dict(inference__enable_thinking=True), "Thinking must be explicitly disabled"),
             (dict(inference__replicas_per_gpu=2), "rejected topology"),
-            (dict(inference__replicas=4), "TP1 with exactly two replicas"),
+            (dict(inference__replicas=3), "one, two, or four replicas"),
             (dict(inference__greedy=False), "greedy"),
             (dict(inference__truncation_retry_tokens=256), "must exceed"),
             (dict(inference__context=1024), "at least 4096"),
@@ -1489,6 +1489,16 @@ class SlurmScriptTests(unittest.TestCase):
         self.assertIn("--max-instruction-words 300", script)
         subprocess.run(["bash", "-n"], input=script, text=True, check=True)
 
+    def test_script_supports_four_independent_tp1_replicas(self):
+        script = self.build(
+            "--gpus", "4", "--replicas", "4", "--concurrency", "128",
+            "--prompt-version", "caption-v2", "--max-output-tokens", "512",
+            "--truncation-retry-tokens", "768", "--max-instruction-words", "300")
+        self.assertIn("#SBATCH --gres=gpu:rtxpro6k:4", script)
+        self.assertIn("--replicas 4", script)
+        self.assertIn("--concurrency 128", script)
+        subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
     def test_script_rejects_gpu_replica_mismatch(self):
         args = b.build_parser().parse_args([
             "slurm-script", "--work", "/tmp/w", "--vllm-sif", "/tmp/v.sif",
@@ -1500,6 +1510,8 @@ class SlurmScriptTests(unittest.TestCase):
         script = self.build()
         self.assertIn("== status before ==", script)
         self.assertIn("== prepare (downloads stay inside the allocation) ==", script)
+        self.assertIn("prepare_rc=0", script)
+        self.assertIn("after publishing the verified manifest; continuing", script)
         self.assertIn("== run ==", script)
         self.assertIn("== status after ==", script)
         self.assertIn("== export ==", script)

@@ -45,7 +45,7 @@ summarized after the table.
 | --- | --- | --- | --- |
 | `plan` | Print resolved configuration and provisional run identity | nothing | none |
 | `prepare` | Freeze exactly the first 100,000 source rows into a manifest | `manifest.jsonl`, `manifest.meta.json`, `images/` | yes (no GPU count) |
-| `run` | Two-replica inference controller | `run.json`, `ledger.sqlite3`, `runtime/`, `ledger-backups/` | yes, exactly 2 visible GPUs, all named `RTX PRO 6000` |
+| `run` | Multi-replica inference controller | `run.json`, `ledger.sqlite3`, `runtime/`, `ledger-backups/` | yes, exactly as many visible RTX PRO 6000 GPUs as configured replicas |
 | `status` | Human-readable progress report (read-only) | nothing | none |
 | `validate` | Re-validate every accepted instruction | `WORK/validation-report.json` | none |
 | `audit` | Verify structural invariants; exit 1 on violation | `WORK/audit-report.json` | none |
@@ -58,7 +58,7 @@ Guards:
 
 - `prepare`, `run`, `export` call `require_slurm`. Without `SLURM_JOB_ID` they
   refuse with `Refusing to run outside a Slurm allocation`. `run` additionally
-  requires exactly two entries in `CUDA_VISIBLE_DEVICES`.
+  requires the visible GPU count to equal the configured replica count.
 - A hidden `--allow-non-slurm` flag exists for synthetic fixtures in tests
   only. It is suppressed from `--help` and is not a production option.
 - Exit codes: `0` success; `1` audit violations, validate failures, Slurm/GPU/
@@ -272,10 +272,10 @@ TP1 replicas at aggregate concurrency 64, 16K batch budget —
 **14,756.96 successful samples/hour** on two NVIDIA RTX PRO 6000 Blackwell
 96GB GPUs. The module records `MEASURED_SAMPLES_PER_HOUR = 14_756.96`; `plan`
 reports `estimated_generation_hours_at_baseline` (about 6.78 h for 100,000
-rows) as a reference, not a promise. The four-replica / two-replicas-per-GPU
-topology measured slower (11,685.80 samples/hour) and is explicitly rejected:
-`InferenceConfig.validate()` raises if `replicas_per_gpu != 1` or
-`(tensor_parallel, replicas) != (1, 2)`.
+rows) as a reference, not a promise. The rejected four-replica benchmark placed
+two replicas on each of two GPUs and measured slower (11,685.80 samples/hour).
+Four replicas across four physical GPUs are supported, while colocating multiple
+replicas on one GPU remains rejected (`replicas_per_gpu` must remain 1).
 
 ### 3.1 Fixed (no CLI switch; validated by `InferenceConfig.validate`)
 
@@ -283,7 +283,7 @@ topology measured slower (11,685.80 samples/hour) and is explicitly rejected:
 | --- | --- |
 | engine | `vllm-offline` |
 | tensor parallel | `1` |
-| replicas | `2` (one per GPU) |
+| replicas | `2` measured baseline; `4` supported for one replica per GPU |
 | replicas per GPU | `1` |
 | thinking | disabled |
 | decoding | greedy, `temperature=0.0` |

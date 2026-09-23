@@ -242,10 +242,10 @@ class InferenceConfig:
     def validate(self) -> None:
         if self.engine != "vllm-offline":
             raise ConfigError(f"Production engine is vllm-offline, got {self.engine!r}")
-        if self.tensor_parallel != 1 or self.replicas not in (1, 2):
+        if self.tensor_parallel != 1 or self.replicas not in (1, 2, 4):
             raise ConfigError(
-                "TP1 with exactly two replicas is the production topology; "
-                "an isolated pilot may use one replica "
+                "Supported topology is TP1 with one, two, or four replicas, "
+                "one replica per GPU "
                 f"(got tp={self.tensor_parallel}, replicas={self.replicas})")
         if self.replicas_per_gpu != 1:
             raise ConfigError("Colocated replicas are the rejected topology; replicas_per_gpu must be 1")
@@ -372,8 +372,9 @@ class RunConfig:
         if self.dataset.split != DATASET_SPLIT:
             raise ConfigError(f"Production split is {DATASET_SPLIT!r}, got {self.dataset.split!r}")
         self.inference.validate()
-        production = (self.dataset.row_start, self.dataset.row_limit,
-                      self.inference.replicas) == (ROW_START, ROW_LIMIT, 2)
+        production = (self.dataset.row_start == ROW_START
+                      and self.dataset.row_limit == ROW_LIMIT
+                      and self.inference.replicas in (2, 4))
         # Synthetic tests historically use short manifests with two fake workers;
         # command-level guards below restrict real shortened runs to one replica.
         pilot_or_fixture = (self.dataset.row_start == ROW_START
@@ -381,7 +382,7 @@ class RunConfig:
                             and self.inference.replicas in (1, 2))
         if not (production or pilot_or_fixture):
             raise ConfigError(
-                "Supported profiles are production (100,000 rows, two replicas) or "
+                "Supported profiles are production (100,000 rows, two or four replicas) or "
                 "an isolated pilot (1-1,000 rows from index 0, one replica)")
         self.validation.validate()
         if not self.prompt.text or self.prompt.sha256 != sha256_text(self.prompt.text):
@@ -3753,7 +3754,15 @@ def build_slurm_script(args) -> str:
         f"{status_command} || true",
         'if [ ! -f "$WORK/manifest.meta.json" ]; then',
         '  echo "== prepare (downloads stay inside the allocation) =="',
-        f"  {prepare_command}",
+        '  prepare_rc=0',
+        f"  {prepare_command} || prepare_rc=$?",
+        '  if [ ! -f "$WORK/manifest.meta.json" ]; then',
+        '    echo "Prepare failed with rc=$prepare_rc before publishing a verified manifest"',
+        '    exit "$prepare_rc"',
+        '  fi',
+        '  if [ "$prepare_rc" -ne 0 ]; then',
+        '    echo "Prepare exited rc=$prepare_rc after publishing the verified manifest; continuing"',
+        '  fi',
         "fi",
         'echo "== run =="',
         "run_rc=0",
@@ -3880,8 +3889,8 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--prompt-version", default=DEFAULT_PROMPT_VERSION)
     parser.add_argument("--row-limit", type=int, default=ROW_LIMIT,
                         help="Frozen source-row count (production: 100000; pilot: 1-1000)")
-    parser.add_argument("--replicas", type=int, choices=(1, 2), default=2,
-                        help="Independent TP1 replicas (production: 2; pilot: 1)")
+    parser.add_argument("--replicas", type=int, choices=(1, 2, 4), default=2,
+                        help="Independent TP1 replicas (production: 2 or 4; pilot: 1)")
     parser.add_argument("--concurrency", type=int, default=64, help="Aggregate in-flight requests")
     parser.add_argument("--mtp", type=int, choices=(0, 1, 2, 3), default=1)
     parser.add_argument("--batch-token-budget", type=int, default=16_384)
