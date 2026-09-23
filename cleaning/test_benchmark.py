@@ -82,6 +82,7 @@ class Tests(unittest.TestCase):
             "--throughput-mtp", "1", "--batch-token-budget", "32768",
             "--rtx-concurrencies", "64", "--greedy",
             "--model", "nvidia/Qwen3.8-27B-NVFP4",
+            "--replicas-per-gpu", "2", "--gpu-memory-utilization", "0.45",
             "--vllm-sif", "/tmp/vllm.sif",
             "--sglang-sif", "/tmp/sglang.sif"], text=True)
         self.assertIn("--rtx-concurrency-screen", script)
@@ -91,6 +92,8 @@ class Tests(unittest.TestCase):
         self.assertIn("--greedy", script)
         self.assertIn("--rtx-concurrencies 64", script)
         self.assertIn("--model nvidia/Qwen3.8-27B-NVFP4", script)
+        self.assertIn("--replicas-per-gpu 2", script)
+        self.assertIn("--gpu-memory-utilization 0.45", script)
         self.assertIn("#SBATCH --partition=rtxpro6k", script)
         self.assertIn("#SBATCH --gres=gpu:rtxpro6k:2", script)
         subprocess.run(["bash", "-n"], input=script, text=True, check=True)

@@ -192,6 +192,14 @@ the exact Hub revision and refuses to run when the requested model does not
 match the prepared manifest. Model download and preparation remain inside the
 generated Slurm job.
 
+For a bounded multi-engine sharing test on two 96GB RTX GPUs, use
+`--replicas-per-gpu 2 --gpu-memory-utilization 0.45`. The RTX concurrency mode
+then creates four independent TP1 replicas, maps two replicas to each physical
+GPU, and divides aggregate concurrency across all four. GPU-hour throughput is
+normalized by the two physical GPUs rather than the four engine processes.
+Sharing is intentionally rejected outside this TP1 RTX mode; it can OOM during
+model loading or CUDA-graph capture even when static weight arithmetic fits.
+
 ### Tests
 
 ```bash

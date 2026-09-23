@@ -342,7 +342,8 @@ def worker(args):
             opts = dict(model=model, tensor_parallel_size=cfg["tp"], max_model_len=job["context"],
                         max_num_seqs=concurrency, max_num_batched_tokens=cfg["budget"],
                         enable_chunked_prefill=cfg["chunked"], enable_prefix_caching=False,
-                        mm_processor_cache_gb=0, gpu_memory_utilization=.90)
+                        mm_processor_cache_gb=0,
+                        gpu_memory_utilization=job["gpu_memory_utilization"])
             opts.update(vllm_runtime_options())
             dump(out / "engine-options.json", opts)
             if cfg["mtp"]:
@@ -398,7 +399,8 @@ def worker(args):
             cmd = ["vllm", "serve", model, "--served-model-name", "tikz", "--host", "127.0.0.1",
                    "--port", str(port), "--tensor-parallel-size", str(cfg["tp"]),
                    "--max-model-len", str(job["context"]), "--max-num-seqs", str(concurrency),
-                   "--max-num-batched-tokens", str(cfg["budget"]), "--gpu-memory-utilization", ".90",
+                   "--max-num-batched-tokens", str(cfg["budget"]), "--gpu-memory-utilization",
+                   str(job["gpu_memory_utilization"]),
                    "--no-enable-prefix-caching", "--mm-processor-cache-gb", "0", "--reasoning-parser", "qwen3",
                    "--generation-config", "vllm",
                    "--enable-chunked-prefill" if cfg["chunked"] else "--no-enable-chunked-prefill"]
@@ -411,7 +413,8 @@ def worker(args):
                    "--tp-size", str(cfg["tp"]), "--context-length", str(job["context"]),
                    "--max-running-requests", str(concurrency), "--max-prefill-tokens", str(cfg["budget"]),
                    "--chunked-prefill-size", str(cfg["budget"] if cfg["chunked"] else -1),
-                   "--mem-fraction-static", ".90", "--disable-radix-cache", "--reasoning-parser", "qwen3",
+                   "--mem-fraction-static", str(job["gpu_memory_utilization"]),
+                   "--disable-radix-cache", "--reasoning-parser", "qwen3",
                    "--enable-metrics"]
             if cfg["mtp"]:
                 cmd += ["--speculative-algorithm", "NEXTN", "--speculative-num-steps", str(cfg["mtp"]),
@@ -469,6 +472,8 @@ def run_config(args, cfg, manifest):
                               reasoning_effort=args.reasoning_effort,
                               max_output_tokens=args.max_output_tokens,
                               greedy=args.greedy,
+                              replicas_per_gpu=args.replicas_per_gpu,
+                              gpu_memory_utilization=args.gpu_memory_utilization,
                               nccl_p2p=args.nccl_p2p,
                               request_timeout=args.request_timeout, config_timeout=args.config_timeout,
                               script=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
@@ -493,6 +498,19 @@ def run_config(args, cfg, manifest):
         loads[index] += len(row["tikz_code"])+1024
     processes, logs = [], []
     devices = os.environ["CUDA_VISIBLE_DEVICES"].split(",")
+    if args.replicas_per_gpu > 1:
+        if cfg["tp"] != 1:
+            raise ValueError("GPU sharing currently supports only TP1 replicas")
+        capacity = len(devices) * args.replicas_per_gpu
+        if cfg["replicas"] > capacity:
+            raise ValueError(f"{cfg['replicas']} replicas exceed shared GPU capacity {capacity}")
+        assignments = [[devices[index // args.replicas_per_gpu]]
+                       for index in range(cfg["replicas"])]
+    else:
+        assignments = [devices[index*cfg["tp"]:(index+1)*cfg["tp"]]
+                       for index in range(cfg["replicas"])]
+    if any(len(group) != cfg["tp"] for group in assignments):
+        raise ValueError("Insufficient visible GPUs for requested replica topology")
     started = time.monotonic()
     try:
         for index, shard in enumerate(shards):
@@ -507,12 +525,13 @@ def run_config(args, cfg, manifest):
                         reasoning_effort=args.reasoning_effort,
                         max_output_tokens=args.max_output_tokens,
                         greedy=args.greedy,
+                        gpu_memory_utilization=args.gpu_memory_utilization,
                         concurrency=concurrency, context=args.context, port=19000+index,
                         startup_timeout=args.startup_timeout, request_timeout=args.request_timeout)
             dump(folder / "job.json", spec)
             sif = args.sglang_sif if cfg["engine"] == "sglang-http" else args.vllm_sif
             env = dict(os.environ)
-            env["APPTAINERENV_CUDA_VISIBLE_DEVICES"] = ",".join(devices[index*cfg["tp"]:(index+1)*cfg["tp"]])
+            env["APPTAINERENV_CUDA_VISIBLE_DEVICES"] = ",".join(assignments[index])
             env["APPTAINERENV_no_proxy"] = "127.0.0.1,localhost,::1"
             env["APPTAINERENV_NO_PROXY"] = env["APPTAINERENV_no_proxy"]
             cmd = ["apptainer", "exec", "--nv", "--bind", str(Path(args.work).resolve()),
@@ -543,7 +562,7 @@ def run_config(args, cfg, manifest):
         summary = dict(config=cfg, fingerprint=fingerprint, samples=sample_count,
                        successful=ok, failed=sample_count-ok,
                        wall_s=wall, startup_inclusive_s=total, samples_s=ok/wall,
-                       samples_per_gpu_hour=ok*3600/(wall*cfg["tp"]*cfg["replicas"]),
+                       samples_per_gpu_hour=ok*3600/(wall*len({d for group in assignments for d in group})),
                        completion_tokens=sum(r.get("usage", {}).get("completion_tokens", 0) for r in records),
                        latency_p50_s=percentile(.5), latency_p95_s=percentile(.95),
                        path=str(target))
@@ -605,6 +624,10 @@ def main():
                         help="Use deterministic greedy decoding (temperature 0)")
     parser.add_argument("--batch-token-budget", type=int, default=16384,
                         help="max_num_batched_tokens/max prefill tokens for focused throughput modes")
+    parser.add_argument("--replicas-per-gpu", type=int, default=1,
+                        help="TP1 engine replicas sharing each physical GPU in RTX concurrency mode")
+    parser.add_argument("--gpu-memory-utilization", type=float, default=.90,
+                        help="Per-engine fraction of visible GPU memory reserved by the inference engine")
     args = parser.parse_args()
     throughput_modes = sum((args.throughput_screen, args.rtx_throughput_screen,
                             args.rtx_concurrency_screen))
@@ -616,6 +639,12 @@ def main():
         parser.error("--warmup-samples must be positive")
     if args.batch_token_budget < 1:
         parser.error("--batch-token-budget must be positive")
+    if args.replicas_per_gpu < 1:
+        parser.error("--replicas-per-gpu must be positive")
+    if not 0 < args.gpu_memory_utilization < 1:
+        parser.error("--gpu-memory-utilization must be between 0 and 1")
+    if args.replicas_per_gpu > 1 and not args.rtx_concurrency_screen:
+        parser.error("GPU sharing is supported only with --rtx-concurrency-screen")
     if args.slurm_script:
         if not args.vllm_sif or not args.sglang_sif:
             parser.error("--slurm-script requires both engine SIF paths")
@@ -641,6 +670,8 @@ def main():
                           "--reasoning-effort", args.reasoning_effort,
                           "--max-output-tokens", str(args.max_output_tokens),
                           "--batch-token-budget", str(args.batch_token_budget),
+                          "--replicas-per-gpu", str(args.replicas_per_gpu),
+                          "--gpu-memory-utilization", str(args.gpu_memory_utilization),
                           "--load-samples", str(args.load_samples),
                           "--rtx-concurrencies", ",".join(map(str, args.rtx_concurrencies)),
                           "--throughput-mtp", str(args.throughput_mtp)] +
@@ -717,7 +748,8 @@ def main():
         if args.load_samples < 256:
             raise SystemExit("--rtx-concurrency-screen requires at least 256 load requests")
         load = load_manifest(manifest, args.load_samples)
-        configs = [config(engine="vllm-offline", tp=1, replicas=2,
+        configs = [config(engine="vllm-offline", tp=1,
+                          replicas=2 * args.replicas_per_gpu,
                           mtp=args.throughput_mtp, concurrency=c,
                           budget=args.batch_token_budget)
                    for c in args.rtx_concurrencies]
