@@ -23,7 +23,9 @@ b = importlib.util.module_from_spec(SPEC)
 sys.modules["build_dataset"] = b
 SPEC.loader.exec_module(b)
 
-from test_build_dataset import FakeEngine, FakePromptBuilder, make_work_fixture  # noqa: E402
+from test_build_dataset import (  # noqa: E402
+    FakeEngine, FakePromptBuilder, TINY_PNG, make_work_fixture,
+)
 
 
 class LocalWorkerHandle:
@@ -502,6 +504,152 @@ class ExportTests(unittest.TestCase):
             self.assertEqual(b.main(["export", "--work", str(self.work), "--shard-size", "5",
                                      "--allow-non-slurm"]), 0)
         self.assertIn("Export complete: 11 rows in 3 shards", output.getvalue())
+
+
+class AuditAndStatusTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.work = Path(self.directory.name)
+        self.meta, _rows = make_work_fixture(self.work, rows=8)
+        self.entries = list(b.iter_manifest(self.work))
+        self.log = self.work / "generated.log"
+        with slurm_env():
+            self.assertEqual(b.cmd_run(run_args(self.work), deps=LocalDeps(
+                LocalSpawner(lambda job: FakeEngine(job, log_path=self.log)))), 0)
+
+    def export(self, shard_size=3):
+        return b.export_dataset(self.work, shard_size=shard_size)
+
+    def sql(self, statement, parameters=()):
+        with b.Ledger(self.work).open() as ledger:
+            ledger.conn.execute(statement, parameters)
+
+    def test_status_reports_progress_and_identity(self):
+        status = b.collect_status(self.work)
+        self.assertEqual(status["manifest"]["rows_frozen"], 8)
+        self.assertEqual(status["manifest"]["dataset_revision"], "1" * 40)
+        self.assertEqual(status["ledger"]["states"]["complete"], 8)
+        self.assertEqual(status["ledger"]["attempts"], 8)
+        self.assertIsNotNone(status["ledger"]["successful_per_hour_overall"])
+        self.assertEqual(status["ledger"]["completion_tokens"]["count"], 8)
+        self.assertGreater(status["ledger"]["completion_tokens"]["p95"], 0)
+        self.assertIsNotNone(status["ledger"]["estimated_remaining_seconds"])
+        self.assertEqual(status["ledger"]["estimated_remaining_seconds"], 0)
+        self.assertEqual(status["run"]["prompt"]["version"], "caption-v1")
+        self.assertIn("last_checkpoint", status)
+        rendered = b.render_status(status)
+        self.assertIn("complete=8", rendered)
+        self.assertIn("Run id:", rendered)
+        self.assertIn("Throughput:", rendered)
+
+    def test_status_without_manifest_warns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            status = b.collect_status(directory)
+            self.assertTrue(status["warnings"])
+            self.assertIn("No frozen manifest", b.render_status(status))
+
+    def test_status_cli_prints_json(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(b.main(["status", "--work", str(self.work), "--json"]), 0)
+        payload = json.loads(output.getvalue())
+        self.assertEqual(payload["ledger"]["states"]["complete"], 8)
+
+    @unittest.skipUnless(HAS_PYARROW, "pyarrow is required for export tests")
+    def test_audit_passes_on_a_healthy_run_and_export(self):
+        self.export()
+        report = b.run_audit(self.work)
+        failures = [check for check in report["checks"] if check["status"] == "fail"]
+        self.assertEqual(failures, [], failures)
+        self.assertEqual(report["violations"], 0)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(b.main(["audit", "--work", str(self.work), "--allow-non-slurm"]), 0)
+        self.assertIn("Audit: pass", output.getvalue())
+        self.assertTrue((self.work / "audit-report.json").is_file())
+
+    def test_audit_warns_when_no_export_exists(self):
+        report = b.run_audit(self.work)
+        self.assertEqual(report["violations"], 0)
+        self.assertTrue(any(check["name"] == "export.checked" and check["status"] == "warn"
+                            for check in report["checks"]))
+
+    def test_audit_fails_on_missing_ledger_row(self):
+        with b.Ledger(self.work).open() as ledger:
+            ledger.conn.execute("DELETE FROM attempts WHERE row_id = "
+                                "(SELECT row_id FROM rows WHERE source_row_index = 3)")
+            ledger.conn.execute("DELETE FROM rows WHERE source_row_index = 3")
+        report = b.run_audit(self.work)
+        self.assertGreater(report["violations"], 0)
+        failed = {check["name"] for check in report["checks"] if check["status"] == "fail"}
+        self.assertIn("ledger.row_count_matches_manifest", failed)
+        self.assertIn("ledger.row_set_matches_manifest", failed)
+
+    def test_audit_fails_on_complete_row_without_instruction(self):
+        self.sql("UPDATE rows SET instruction = NULL WHERE source_row_index = 2")
+        report = b.run_audit(self.work)
+        failed = {check["name"] for check in report["checks"] if check["status"] == "fail"}
+        self.assertIn("ledger.complete_rows_have_instructions", failed)
+
+    def test_audit_fails_on_instruction_reuse(self):
+        self.sql("UPDATE rows SET instruction = 'the same caption' WHERE source_row_index IN (1, 4)")
+        report = b.run_audit(self.work)
+        failed = {check["name"] for check in report["checks"] if check["status"] == "fail"}
+        self.assertIn("ledger.instructions_attached_to_one_row", failed)
+
+    def test_audit_fails_on_manifest_tampering(self):
+        with b.manifest_path(self.work).open("a") as handle:
+            handle.write("\n")
+        report = b.run_audit(self.work)
+        failed = {check["name"] for check in report["checks"] if check["status"] == "fail"}
+        self.assertIn("manifest.verified", failed)
+
+    @unittest.skipUnless(HAS_PYARROW, "pyarrow is required")
+    def test_audit_fails_on_export_checksum_and_membership_drift(self):
+        self.export()
+        checksums_path = self.work / "export" / "checksums.json"
+        checksums = json.loads(checksums_path.read_text())
+        checksums["shards"][0]["logical_sha256"] = "0" * 64
+        checksums_path.write_text(json.dumps(checksums))
+        report = b.run_audit(self.work)
+        failed = {check["name"] for check in report["checks"] if check["status"] == "fail"}
+        self.assertIn("export.checksums_match", failed)
+
+        # Inject a rejected id into a shard: membership checks must fail.
+        self.export()
+        import pyarrow.parquet as parquet
+        shard = sorted((self.work / "export" / "shards").glob("*.parquet"))[0]
+        table = parquet.read_table(shard)
+        rows = table.to_pylist()
+        rejected_id = b.stable_row_id(b.DATASET_ID, "1" * 40, "train", 99,
+                                      b.sha256_text("x"), b.sha256_bytes(TINY_PNG))
+        rows[0]["id"] = rejected_id
+        parquet.write_table(table.__class__.from_pylist(rows, schema=table.schema), shard)
+        report = b.run_audit(self.work)
+        failed = {check["name"] for check in report["checks"] if check["status"] == "fail"}
+        self.assertTrue({"export.only_complete_rows", "export.rows_map_to_manifest"} & failed,
+                        failed)
+
+    def test_validate_command_reports_and_fails_on_corruption(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(b.main(["validate", "--work", str(self.work),
+                                     "--allow-non-slurm"]), 0)
+        self.assertIn("Validation passed: 8 accepted rows", output.getvalue())
+        report = json.loads((self.work / "validation-report.json").read_text())
+        self.assertEqual(report["status"], "pass")
+
+        self.sql("UPDATE rows SET instruction = 'Convert the supplied image to TikZ' "
+                 "WHERE source_row_index = 1")
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(b.main(["validate", "--work", str(self.work),
+                                     "--allow-non-slurm"]), 1)
+        self.assertIn("Validation FAILED", output.getvalue())
+        report = json.loads((self.work / "validation-report.json").read_text())
+        self.assertEqual(report["status"], "fail")
+        self.assertIn("instruction:task_reference", report["failures"][0]["problems"])
 
 
 if __name__ == "__main__":

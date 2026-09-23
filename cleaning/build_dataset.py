@@ -2851,6 +2851,423 @@ def cmd_export(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Status and audit
+# ---------------------------------------------------------------------------
+
+
+def percentile(values: list, fraction: float):
+    if not values:
+        return None
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, int((len(ordered) - 1) * fraction))]
+
+
+def token_statistics(values: list) -> dict:
+    if not values:
+        return {"count": 0}
+    return {"count": len(values), "min": min(values), "max": max(values),
+            "mean": round(sum(values) / len(values), 1),
+            "p50": percentile(values, 0.5), "p95": percentile(values, 0.95)}
+
+
+def collect_status(work) -> dict:
+    """Read-only snapshot of manifest, run identity, ledger and throughput."""
+    work = Path(work).resolve()
+    status = {"work": str(work), "warnings": []}
+    if not manifest_meta_path(work).is_file():
+        status["warnings"].append(f"No frozen manifest under {work}; run prepare first")
+        return status
+    meta = verify_manifest(work, quick=True)
+    status["manifest"] = {
+        "dataset_id": meta["dataset_id"], "dataset_revision": meta["dataset_revision"],
+        "split": meta["split"], "rows_frozen": meta["rows_frozen"],
+        "valid_rows": meta["valid_rows"], "rejected_rows": meta["rejected_rows"],
+        "rejection_counts": meta.get("rejection_counts", {}),
+        "model_id": meta.get("model_id"), "model_revision": meta.get("model_revision"),
+        "manifest_sha256": meta["manifest_sha256"],
+    }
+    record = load_run_record(work)
+    if record is not None:
+        status["run"] = {
+            "run_id": record["run_id"], "identity_sha256": record["identity_sha256"],
+            "created_at": record.get("created_at"),
+            "prompt": record["identity"]["prompt"],
+            "git_commit": record.get("provenance", {}).get("git_commit"),
+        }
+    if not (work / LEDGER_FILE).is_file():
+        status["warnings"].append("Ledger does not exist yet; run has not started")
+        return status
+    now = time.time()
+    with Ledger(work, read_only=True) as ledger:
+        counts = ledger.counts()
+        prompt_tokens, completion_tokens, completions = [], [], []
+        for row in ledger.conn.execute(
+                "SELECT prompt_tokens, completion_tokens, completed_at FROM rows "
+                "WHERE state = ?", (STATE_COMPLETE,)):
+            if row["prompt_tokens"] is not None:
+                prompt_tokens.append(row["prompt_tokens"])
+            if row["completion_tokens"] is not None:
+                completion_tokens.append(row["completion_tokens"])
+            if row["completed_at"] is not None:
+                completions.append(row["completed_at"])
+        recent = [moment for moment in completions if moment >= now - 1800]
+        recent_rate = len(recent) / 1800 * 3600 if recent else None
+        overall_rate = None
+        if completions:
+            span = max(1.0, max(completions) - min(completions))
+            overall_rate = len(completions) / span * 3600
+        remaining = counts["states"]["pending"] + counts["states"]["retryable"] + \
+            counts["states"]["running"]
+        rate = recent_rate or overall_rate
+        status["ledger"] = {
+            "path": str(work / LEDGER_FILE),
+            "states": counts["states"], "total": counts["total"],
+            "attempts": counts["attempts"],
+            "truncation_attempts": counts["truncation_attempts"],
+            "error_categories": counts["error_categories"],
+            "rejection_reasons": counts["rejection_reasons"],
+            "successful_per_hour_recent": recent_rate,
+            "successful_per_hour_overall": overall_rate,
+            "estimated_remaining_seconds": (remaining / rate * 3600) if rate else None,
+            "prompt_tokens": token_statistics(prompt_tokens),
+            "completion_tokens": token_statistics(completion_tokens),
+            "first_complete_at": counts["first_complete_at"],
+            "last_complete_at": counts["last_complete_at"],
+        }
+    backups = sorted((work / LEDGER_BACKUP_DIR).glob("*.sqlite3"),
+                     key=lambda path: path.stat().st_mtime) if (work / LEDGER_BACKUP_DIR).is_dir() else []
+    if backups:
+        latest = backups[-1]
+        status["last_checkpoint"] = {"path": str(latest),
+                                     "at": latest.stat().st_mtime,
+                                     "count": len(backups)}
+    return status
+
+
+def render_status(status: dict) -> str:
+    lines = [f"Work directory: {status['work']}"]
+    for warning in status.get("warnings", []):
+        lines.append(f"WARNING: {warning}")
+    manifest = status.get("manifest")
+    if manifest:
+        lines.append(f"Dataset: {manifest['dataset_id']}@{manifest['dataset_revision']} "
+                     f"({manifest['split']}, {manifest['rows_frozen']} frozen rows)")
+        lines.append(f"Model:   {manifest['model_id']}@{manifest['model_revision']}")
+        lines.append(f"Manifest frozen rows={manifest['rows_frozen']} "
+                     f"valid={manifest['valid_rows']} rejected={manifest['rejected_rows']}")
+        if manifest["rejection_counts"]:
+            lines.append(f"  freeze rejections: {manifest['rejection_counts']}")
+    run = status.get("run")
+    if run:
+        lines.append(f"Run id:  {run['run_id']} (prompt {run['prompt']['version']}, "
+                     f"created {run['created_at']})")
+    ledger = status.get("ledger")
+    if ledger:
+        states = ledger["states"]
+        lines.append("Rows:    " + "  ".join(f"{name}={states[name]}" for name in STATES))
+        lines.append(f"Attempts: {ledger['attempts']} "
+                     f"(truncations {ledger['truncation_attempts']})")
+        if ledger["error_categories"]:
+            lines.append(f"Errors:   {ledger['error_categories']}")
+        if ledger["rejection_reasons"]:
+            lines.append(f"Rejected: {ledger['rejection_reasons']}")
+        recent = ledger["successful_per_hour_recent"]
+        overall = ledger["successful_per_hour_overall"]
+        lines.append(f"Throughput: {recent if recent is None else round(recent, 1)} "
+                     f"successful/hour (30 min window), "
+                     f"{overall if overall is None else round(overall, 1)} overall")
+        eta = ledger["estimated_remaining_seconds"]
+        if eta:
+            lines.append(f"ETA:      {eta / 3600:.1f} h for {states['pending'] + states['retryable'] + states['running']} "
+                         "remaining rows (recent rate)")
+        else:
+            lines.append("ETA:      unknown (no completed rows yet)")
+        for label, key in (("Prompt tokens", "prompt_tokens"),
+                           ("Output tokens", "completion_tokens")):
+            stats = ledger[key]
+            if stats.get("count"):
+                lines.append(f"{label}: mean {stats['mean']} p50 {stats['p50']} "
+                             f"p95 {stats['p95']} max {stats['max']}")
+    checkpoint = status.get("last_checkpoint")
+    if checkpoint:
+        lines.append(f"Last checkpoint: {checkpoint['path']} "
+                     f"({time.strftime('%Y-%m-%d %H:%M:%SZ', time.gmtime(checkpoint['at']))})")
+    return "\n".join(lines)
+
+
+def cmd_status(args) -> int:
+    status = collect_status(args.work)
+    if getattr(args, "json", False):
+        print(json.dumps(status, indent=2, sort_keys=True))
+    else:
+        print(render_status(status))
+    return 0
+
+
+class AuditReport:
+    def __init__(self):
+        self.checks: list[dict] = []
+
+    def check(self, name: str, ok: bool, detail: str = "") -> bool:
+        self.checks.append({"name": name, "status": "pass" if ok else "fail",
+                            "detail": detail})
+        return ok
+
+    def warn(self, name: str, detail: str) -> None:
+        self.checks.append({"name": name, "status": "warn", "detail": detail})
+
+    def to_dict(self) -> dict:
+        violations = [check for check in self.checks if check["status"] == "fail"]
+        return {"status": "fail" if violations else "pass",
+                "violations": len(violations),
+                "warnings": sum(1 for check in self.checks if check["status"] == "warn"),
+                "checks": self.checks}
+
+
+def collect_validation_failures(ledger, identity: dict, identity_sha256: str,
+                               index: dict) -> list[dict]:
+    policy = ValidationPolicy(min_chars=identity["validation"]["min_chars"],
+                              max_chars=identity["validation"]["max_chars"],
+                              max_words=identity["validation"]["max_words"])
+    failures = []
+    for row in ledger.conn.execute(
+            "SELECT row_id, source_row_index, instruction, image_sha256, tikz_sha256, "
+            "prompt_sha256, config_hash, model_revision, finish_reason FROM rows "
+            "WHERE state = ? ORDER BY source_row_index", (STATE_COMPLETE,)):
+        problems = []
+        valid, rule, _detail = validate_instruction(row["instruction"], policy)
+        if not valid:
+            problems.append(f"instruction:{rule}")
+        manifest_row = index.get(row["row_id"])
+        if manifest_row is None:
+            problems.append("missing_manifest_row")
+        else:
+            if row["image_sha256"] != manifest_row["image_sha256"]:
+                problems.append("image_checksum")
+            if row["tikz_sha256"] != manifest_row["tikz_sha256"]:
+                problems.append("tikz_checksum")
+        if row["finish_reason"] != "stop":
+            problems.append(f"finish_reason:{row['finish_reason']}")
+        if row["prompt_sha256"] != identity["prompt"]["sha256"]:
+            problems.append("prompt_hash")
+        if row["config_hash"] != identity_sha256:
+            problems.append("config_hash")
+        if row["model_revision"] != identity["model"]["revision"]:
+            problems.append("model_revision")
+        if problems:
+            failures.append({"id": row["row_id"],
+                             "source_row_index": row["source_row_index"],
+                             "problems": problems})
+    return failures
+
+
+def run_audit(work, *, quick: bool = False, export_dir=None) -> dict:
+    """Verify every structural invariant.  Returns an AuditReport dict."""
+    work = Path(work).resolve()
+    report = AuditReport()
+    try:
+        meta = verify_manifest(work, quick=quick)
+        report.check("manifest.verified", True,
+                     f"{meta['rows_frozen']} rows, hash {meta['manifest_sha256'][:16]}")
+    except ManifestError as exc:
+        report.check("manifest.verified", False, str(exc))
+        return report.to_dict()
+    report.check("manifest.exact_row_count",
+                 meta["rows_frozen"] == meta["row_limit"],
+                 f"rows_frozen={meta['rows_frozen']} row_limit={meta['row_limit']}")
+    index = manifest_index(work)
+    report.check("manifest.unique_stable_ids", len(index) == meta["rows_frozen"],
+                 f"{len(index)} unique ids for {meta['rows_frozen']} rows")
+    record = load_run_record(work)
+    if record is None:
+        report.check("run.record_present", False, "run.json is missing")
+        return report.to_dict()
+    identity = record["identity"]
+    report.check("run.record_present", True, f"run {record['run_id']}")
+    try:
+        prompt = load_prompt(identity["prompt"]["version"])
+        report.check("run.prompt_matches_registry", prompt.sha256 == identity["prompt"]["sha256"],
+                     f"{prompt.version} {prompt.sha256[:16]}")
+    except PromptError as exc:
+        report.check("run.prompt_matches_registry", False, str(exc))
+
+    if not (work / LEDGER_FILE).is_file():
+        report.check("ledger.present", False, "ledger.sqlite3 is missing")
+        return report.to_dict()
+    with Ledger(work, read_only=True) as ledger:
+        stored = ledger.meta()
+        report.check("ledger.identity_matches_run",
+                     stored.get("identity_sha256") == record["identity_sha256"],
+                     f"ledger {stored.get('identity_sha256', '')[:16]}")
+        report.check("ledger.manifest_matches_run",
+                     stored.get("manifest_sha256") == meta["manifest_sha256"], "")
+        report.check("ledger.prompt_hash_consistent",
+                     stored.get("prompt_sha256") == identity["prompt"]["sha256"], "")
+        counts = ledger.counts()
+        report.check("ledger.row_count_matches_manifest",
+                     counts["total"] == meta["rows_frozen"],
+                     f"ledger {counts['total']} vs manifest {meta['rows_frozen']}")
+        duplicate_ids = ledger.conn.execute(
+            "SELECT COUNT(*) FROM (SELECT row_id FROM rows GROUP BY row_id HAVING COUNT(*) > 1)"
+        ).fetchone()[0]
+        report.check("ledger.no_duplicate_ids", duplicate_ids == 0,
+                     f"{duplicate_ids} duplicated ids")
+        ledger_ids = {row["row_id"] for row in ledger.conn.execute("SELECT row_id FROM rows")}
+        missing = set(index) - ledger_ids
+        extra = ledger_ids - set(index)
+        report.check("ledger.row_set_matches_manifest", not missing and not extra,
+                     f"missing={len(missing)} extra={len(extra)}")
+        out_of_range = ledger.conn.execute(
+            "SELECT COUNT(*) FROM rows WHERE source_row_index < 0 OR source_row_index > ?",
+            (meta["row_limit"] - 1,)).fetchone()[0]
+        report.check("ledger.no_index_above_limit", out_of_range == 0,
+                     f"{out_of_range} rows outside 0..{meta['row_limit'] - 1}")
+        manifest_rejected = {entry["row_id"] for entry in iter_manifest(work)
+                             if entry["status"] == "rejected"}
+        rejected_states = {row["row_id"]: row["state"] for row in ledger.conn.execute(
+            "SELECT row_id, state FROM rows")}
+        bad = [row_id for row_id in manifest_rejected
+               if rejected_states.get(row_id) != STATE_REJECTED]
+        report.check("ledger.manifest_rejections_preserved", not bad,
+                     f"{len(bad)} manifest-invalid rows are not rejected in the ledger")
+        without_instruction = ledger.conn.execute(
+            "SELECT COUNT(*) FROM rows WHERE state = ? AND (instruction IS NULL OR "
+            "TRIM(instruction) = '')", (STATE_COMPLETE,)).fetchone()[0]
+        report.check("ledger.complete_rows_have_instructions", without_instruction == 0,
+                     f"{without_instruction} complete rows without an instruction")
+        rejected_without_reason = ledger.conn.execute(
+            "SELECT COUNT(*) FROM rows WHERE state = ? AND (rejection_reason IS NULL OR "
+            "TRIM(rejection_reason) = '')", (STATE_REJECTED,)).fetchone()[0]
+        report.check("ledger.rejected_rows_have_reasons", rejected_without_reason == 0,
+                     f"{rejected_without_reason} rejected rows without a reason")
+        duplicate_instructions = ledger.conn.execute(
+            "SELECT COUNT(*) FROM (SELECT instruction FROM rows WHERE state = ? AND "
+            "instruction IS NOT NULL GROUP BY instruction HAVING COUNT(*) > 1)",
+            (STATE_COMPLETE,)).fetchone()[0]
+        report.check("ledger.instructions_attached_to_one_row", duplicate_instructions == 0,
+                     f"{duplicate_instructions} instructions appear on multiple rows")
+        orphan_attempts = ledger.conn.execute(
+            "SELECT COUNT(*) FROM attempts WHERE row_id NOT IN (SELECT row_id FROM rows)"
+        ).fetchone()[0]
+        report.check("ledger.attempts_reference_known_rows", orphan_attempts == 0,
+                     f"{orphan_attempts} orphan attempts")
+        failures = collect_validation_failures(ledger, identity, record["identity_sha256"],
+                                               index)
+        report.check("ledger.accepted_instructions_valid", not failures,
+                     f"{len(failures)} invalid accepted instructions")
+
+        # Export checks, when an export exists.
+        root = Path(export_dir).resolve() if export_dir else work / "export"
+        if (root / "shards").is_dir() and any((root / "shards").glob("*.parquet")):
+            if not (root / "export.meta.json").is_file():
+                report.check("export.meta_present", False,
+                             "shards exist without export.meta.json (partial export)")
+            else:
+                report.check("export.meta_present", True, "")
+                export_meta = json.loads((root / "export.meta.json").read_text())
+                complete_ids = {row["row_id"] for row in ledger.conn.execute(
+                    "SELECT row_id FROM rows WHERE state = ?", (STATE_COMPLETE,))}
+                rejected_ids = {row["row_id"] for row in ledger.conn.execute(
+                    "SELECT row_id FROM rows WHERE state = ?", (STATE_REJECTED,))}
+                try:
+                    import pyarrow.parquet as parquet
+                    exported, export_failures = [], []
+                    checksums = json.loads((root / "checksums.json").read_text()) \
+                        if (root / "checksums.json").is_file() else {"shards": []}
+                    checksum_by_name = {entry["name"]: entry for entry in checksums["shards"]}
+                    last_index = -1
+                    for path in sorted((root / "shards").glob("*.parquet")):
+                        rows = parquet.read_table(path).to_pylist()
+                        logical = logical_checksum(rows)
+                        entry = checksum_by_name.get(path.name)
+                        if entry is None or entry["logical_sha256"] != logical:
+                            export_failures.append(f"{path.name}: logical checksum mismatch")
+                        elif not quick and entry["file_sha256"] != sha256_file(path):
+                            export_failures.append(f"{path.name}: file checksum mismatch")
+                        for row in rows:
+                            if row["source_row_index"] <= last_index:
+                                export_failures.append(f"{path.name}: rows not sorted")
+                            last_index = row["source_row_index"]
+                            exported.append(row)
+                    exported_ids = [row["id"] for row in exported]
+                    report.check("export.only_complete_rows",
+                                 set(exported_ids) <= complete_ids,
+                                 f"{len(set(exported_ids) - complete_ids)} non-complete ids")
+                    report.check("export.rejected_rows_excluded",
+                                 not (set(exported_ids) & rejected_ids), "")
+                    report.check("export.row_count_matches_ledger",
+                                 len(exported_ids) == len(complete_ids) and
+                                 export_meta["rows"] == len(complete_ids),
+                                 f"export {len(exported_ids)} vs ledger {len(complete_ids)}")
+                    report.check("export.unique_ids",
+                                 len(exported_ids) == len(set(exported_ids)), "")
+                    mapped = [row for row in exported
+                              if row["id"] in index and
+                              index[row["id"]]["image_sha256"] == row["image_sha256"] and
+                              index[row["id"]]["tikz_sha256"] == row["tikz_sha256"] and
+                              index[row["id"]]["source_row_index"] == row["source_row_index"]]
+                    report.check("export.rows_map_to_manifest",
+                                 len(mapped) == len(exported), "")
+                    report.check("export.checksums_match",
+                                 not export_failures, "; ".join(export_failures[:3]))
+                    rejected_table = parquet.read_table(root / "rejected.parquet").to_pylist() \
+                        if (root / "rejected.parquet").is_file() else []
+                    report.check("export.rejected_matches_ledger",
+                                 {row["id"] for row in rejected_table} == rejected_ids,
+                                 f"export {len(rejected_table)} vs ledger {len(rejected_ids)}")
+                    report.check("export.identity_matches_run",
+                                 export_meta.get("identity_sha256") == record["identity_sha256"], "")
+                except ImportError:
+                    report.warn("export.checked", "pyarrow unavailable; export not verified")
+        else:
+            report.warn("export.checked", "no export found")
+    return report.to_dict()
+
+
+def cmd_audit(args) -> int:
+    report = run_audit(args.work, quick=args.quick, export_dir=args.export_dir or None)
+    for check in report["checks"]:
+        marker = {"pass": "PASS", "fail": "FAIL", "warn": "WARN"}[check["status"]]
+        detail = f" - {check['detail']}" if check["detail"] else ""
+        print(f"[{marker}] {check['name']}{detail}")
+    bench.dump(Path(args.work).resolve() / "audit-report.json", report)
+    print(f"Audit: {report['status']} ({report['violations']} violations, "
+          f"{report['warnings']} warnings)")
+    return 1 if report["violations"] else 0
+
+
+def cmd_validate(args) -> int:
+    work = Path(args.work).resolve()
+    meta = verify_manifest(work, quick=True)
+    record = load_run_record(work)
+    if record is None:
+        raise ConfigError(f"No run record at {run_record_path(work)}; run the pipeline first")
+    index = manifest_index(work)
+    with Ledger(work, read_only=True) as ledger:
+        if ledger.meta().get("identity_sha256") != record["identity_sha256"]:
+            raise LedgerError("Ledger identity does not match run.json")
+        failures = collect_validation_failures(ledger, record["identity"],
+                                               record["identity_sha256"], index)
+        counts = ledger.counts()
+    report = {
+        "status": "fail" if failures else "pass",
+        "checked": counts["states"]["complete"],
+        "failures": failures,
+        "rules_sha256": validation_rules_sha256(),
+        "manifest_sha256": meta["manifest_sha256"],
+    }
+    bench.dump(work / "validation-report.json", report)
+    if failures:
+        print(f"Validation FAILED: {len(failures)} of {report['checked']} accepted rows")
+        for failure in failures[:10]:
+            print(f"  {failure['id']} ({failure['source_row_index']}): "
+                  f"{', '.join(failure['problems'])}")
+        return 1
+    print(f"Validation passed: {report['checked']} accepted rows match the policy and identity")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Slurm guard
 # ---------------------------------------------------------------------------
 
@@ -3021,6 +3438,24 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument("--export-dir", default="", help="Default: WORK/export")
     export.add_argument("--shard-size", type=int, default=1000)
     export.set_defaults(handler=cmd_export)
+
+    status = subparsers.add_parser("status", help="Human-readable progress report")
+    add_common_arguments(status)
+    status.add_argument("--json", action="store_true", help="Print the raw snapshot")
+    status.set_defaults(handler=cmd_status)
+
+    audit = subparsers.add_parser(
+        "audit", help="Verify structural invariants (nonzero exit on violation)")
+    add_common_arguments(audit)
+    audit.add_argument("--quick", action="store_true",
+                       help="Skip image and export file hashing")
+    audit.add_argument("--export-dir", default="", help="Default: WORK/export")
+    audit.set_defaults(handler=cmd_audit)
+
+    validate = subparsers.add_parser(
+        "validate", help="Re-validate every accepted instruction")
+    add_common_arguments(validate)
+    validate.set_defaults(handler=cmd_validate)
     return parser
 
 
