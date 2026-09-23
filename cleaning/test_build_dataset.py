@@ -10,6 +10,7 @@ import importlib.util
 import io
 import json
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import types
@@ -1243,6 +1244,107 @@ class ResultIdentityTests(unittest.TestCase):
         with self.assertRaisesRegex(b.PipelineIdentityError, "Duplicate result"):
             b.ingest_result_files(ledger=self.ledger, work=self.work, config=self.config,
                                   index=self.index, policy=self.policy)
+
+
+# ---------------------------------------------------------------------------
+# Feature 8: Slurm integration
+# ---------------------------------------------------------------------------
+
+
+class SlurmScriptTests(unittest.TestCase):
+    def build(self, *extra):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = b.main(["slurm-script", "--work", "/tmp/tikz-prod",
+                           "--vllm-sif", "/tmp/vllm.sif", "--wall-time", "12:00:00", *extra])
+        self.assertEqual(code, 0)
+        return output.getvalue()
+
+    def test_script_requests_the_production_allocation(self):
+        script = self.build()
+        self.assertIn("#SBATCH --partition=rtxpro6k", script)
+        self.assertIn("#SBATCH --gres=gpu:rtxpro6k:2", script)
+        self.assertIn("#SBATCH --nodes=1", script)
+        self.assertIn("#SBATCH --ntasks=1", script)
+        self.assertIn("#SBATCH --cpus-per-task=32", script)
+        self.assertIn("#SBATCH --time=12:00:00", script)
+        self.assertIn("#SBATCH --export=NONE", script)
+        self.assertIn("#SBATCH --output=slurm-tikz-prod-%j.out", script)
+        self.assertNotIn("sbatch ", script.splitlines()[-1])
+        self.assertTrue(all("sbatch" not in line or line.startswith("#")
+                            for line in script.splitlines() if "sbatch" in line))
+        subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
+    def test_script_stages_prepare_run_export_and_audit(self):
+        script = self.build()
+        self.assertIn("== status before ==", script)
+        self.assertIn("== prepare (downloads stay inside the allocation) ==", script)
+        self.assertIn("== run ==", script)
+        self.assertIn("== status after ==", script)
+        self.assertIn("== export ==", script)
+        self.assertIn("== audit ==", script)
+        # prepare, export and audit run inside the container; run is on the host.
+        self.assertIn("apptainer exec --nv", script)
+        self.assertIn(" prepare --work", script)
+        self.assertIn(" export --work", script)
+        self.assertIn(" audit --work", script)
+        run_line = next(line for line in script.splitlines() if " run --work" in line)
+        self.assertNotIn("apptainer", run_line)
+        self.assertTrue(run_line.startswith("python3 "))
+        # No dependency installation and no secret material.
+        self.assertNotIn("pip install", script)
+        self.assertNotIn("HF_TOKEN=", script)
+
+    def test_script_propagates_configuration_and_derives_runtime_budget(self):
+        script = self.build("--concurrency", "32", "--mtp", "2",
+                            "--max-rows-this-run", "5000", "--start-index", "10",
+                            "--end-index", "99", "--shard-size", "250",
+                            "--max-transient-attempts", "2")
+        self.assertIn("--concurrency 32", script)
+        self.assertIn("--mtp 2", script)
+        self.assertIn("--max-rows-this-run 5000", script)
+        self.assertIn("--start-index 10", script)
+        self.assertIn("--end-index 99", script)
+        self.assertIn("--shard-size 250", script)
+        self.assertIn("--max-transient-attempts 2", script)
+        # 12h wall time minus the 30 minute reserve.
+        self.assertIn("--max-runtime-minutes 690", script)
+        explicit = self.build("--max-runtime-minutes", "600")
+        self.assertIn("--max-runtime-minutes 600", explicit)
+
+    def test_script_requires_wall_time_and_container(self):
+        with self.assertRaisesRegex(b.ConfigError, "wall-time is required"):
+            b.build_slurm_script(b.build_parser().parse_args(
+                ["slurm-script", "--work", "/tmp/w", "--vllm-sif", "/tmp/v.sif"]))
+        with self.assertRaisesRegex(b.ConfigError, "vllm-sif is required"):
+            b.build_slurm_script(b.build_parser().parse_args(
+                ["slurm-script", "--work", "/tmp/w", "--wall-time", "1:00:00"]))
+
+    def test_wall_time_parsing(self):
+        self.assertEqual(b.parse_wall_time("12:00:00"), 720)
+        self.assertEqual(b.parse_wall_time("00:30:00"), 30)
+        self.assertEqual(b.parse_wall_time("1-00:00:00"), 1440)
+        self.assertEqual(b.parse_wall_time("2"), 2)
+        self.assertEqual(b.parse_wall_time("90"), 90)
+        self.assertEqual(b.parse_wall_time("5:00"), 5)
+        for invalid in ("", "abc", "12:99:00", "0", "1-25:00:00", "1:2:3:4"):
+            with self.assertRaises(b.ConfigError, msg=invalid):
+                b.parse_wall_time(invalid)
+
+    def test_prepare_python_bind_and_model_cache_bind(self):
+        script = self.build("--prepare-python", "/envs/prep/bin/python",
+                            "--model-cache-dir", "/shared/hf")
+        self.assertIn("--bind /envs/prep", script)
+        self.assertIn("--bind /shared/hf", script)
+        self.assertIn("/envs/prep/bin/python", script)
+
+    def test_historical_slurm_script_flag_alias(self):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.assertEqual(b.main(["--slurm-script", "--work", "/tmp/w",
+                                     "--vllm-sif", "/tmp/v.sif",
+                                     "--wall-time", "1:00:00"]), 0)
+        self.assertIn("#SBATCH --gres=gpu:rtxpro6k:2", output.getvalue())
 
 
 if __name__ == "__main__":

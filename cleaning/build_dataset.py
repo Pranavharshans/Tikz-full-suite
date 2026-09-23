@@ -28,6 +28,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import sqlite3
@@ -3268,6 +3269,169 @@ def cmd_validate(args) -> int:
 
 
 # ---------------------------------------------------------------------------
+# Slurm integration
+# ---------------------------------------------------------------------------
+
+
+def parse_wall_time(value: str) -> int:
+    """Parse Slurm wall time into whole minutes.
+
+    Slurm accepts minutes, MM:SS, HH:MM:SS, and D-HH[:MM[:SS]].
+    """
+    text = value.strip()
+    days = 0
+    if "-" in text:
+        day_part, text = text.split("-", 1)
+        if not day_part.isdigit():
+            raise ConfigError(f"Invalid wall time {value!r}")
+        days = int(day_part)
+    if not text or not all(part.isdigit() for part in text.split(":")):
+        raise ConfigError(f"Invalid wall time {value!r}; use minutes, MM:SS, HH:MM:SS or D-HH:MM:SS")
+    parts = [int(part) for part in text.split(":")]
+    hours = minutes = seconds = 0
+    if len(parts) == 1:
+        minutes = parts[0]  # Slurm treats a bare number as minutes
+    elif len(parts) == 2:
+        minutes, seconds = parts
+    elif len(parts) == 3:
+        hours, minutes, seconds = parts
+    else:
+        raise ConfigError(f"Invalid wall time {value!r}")
+    if len(parts) > 1 and (minutes > 59 or seconds > 59 or (days and hours > 23)):
+        raise ConfigError(f"Invalid wall time {value!r}")
+    total_seconds = days * 24 * 3600 + hours * 3600 + minutes * 60 + seconds
+    if total_seconds <= 0:
+        raise ConfigError("Wall time must be positive")
+    return max(1, total_seconds // 60)
+
+
+def build_slurm_script(args) -> str:
+    if not args.wall_time:
+        raise ConfigError("--wall-time is required when generating a Slurm script")
+    if not args.vllm_sif:
+        raise ConfigError("--vllm-sif is required when generating a Slurm script")
+    wall_minutes = parse_wall_time(args.wall_time)
+    max_runtime = args.max_runtime_minutes
+    if max_runtime is None:
+        max_runtime = max(10, wall_minutes - 30)
+    work = str(Path(args.work).resolve())
+    script = str(Path(__file__).resolve())
+    script_dir = str(Path(script).parent)
+    vllm = str(Path(args.vllm_sif).resolve())
+    model_cache = str(Path(args.model_cache_dir or f"{work}/hf").resolve())
+    quote = shlex.join
+    shell_value = shlex.quote
+
+    def container(command: list[str], python: str) -> str:
+        binds = ["--bind", work, "--bind", script_dir]
+        if not model_cache.startswith(work + os.sep) and model_cache != work:
+            binds += ["--bind", model_cache]
+        if Path(python).is_absolute():
+            binds += ["--bind", str(Path(python).parent.parent)]
+        return quote(["apptainer", "exec", "--nv", *binds, vllm, python, script, *command])
+
+    prepare_flags = ["prepare", "--work", work, "--model", args.model,
+                     "--dataset", args.dataset, "--model-cache-dir", model_cache]
+    if args.dataset_revision:
+        prepare_flags += ["--dataset-revision", args.dataset_revision]
+    if args.model_revision:
+        prepare_flags += ["--model-revision", args.model_revision]
+    prepare_command = container(prepare_flags, args.prepare_python)
+
+    run_flags = [
+        "run", "--work", work, "--model", args.model, "--vllm-sif", vllm,
+        "--concurrency", str(args.concurrency), "--mtp", str(args.mtp),
+        "--batch-token-budget", str(args.batch_token_budget),
+        "--context", str(args.context),
+        "--max-output-tokens", str(args.max_output_tokens),
+        "--truncation-retry-tokens", str(args.truncation_retry_tokens),
+        "--gpu-memory-utilization", str(args.gpu_memory_utilization),
+        "--nccl-p2p", args.nccl_p2p, "--prompt-version", args.prompt_version,
+        "--max-transient-attempts", str(args.max_transient_attempts),
+        "--retry-backoff-base-seconds", str(args.retry_backoff_base_seconds),
+        "--retry-backoff-cap-seconds", str(args.retry_backoff_cap_seconds),
+        "--max-runtime-minutes", str(max_runtime),
+        "--start-index", str(args.start_index), "--end-index", str(args.end_index),
+    ]
+    if args.max_rows_this_run:
+        run_flags += ["--max-rows-this-run", str(args.max_rows_this_run)]
+    if args.reprocess_rejected:
+        run_flags += ["--reprocess-rejected"]
+    if args.model_revision:
+        run_flags += ["--model-revision", args.model_revision]
+    run_command = quote(["python3", script, *run_flags])
+    export_command = container(
+        ["export", "--work", work, "--shard-size", str(args.shard_size),
+         "--model", args.model, "--prompt-version", args.prompt_version],
+        args.export_python)
+    audit_command = container(["audit", "--work", work], args.export_python)
+    status_command = quote(["python3", script, "status", "--work", work])
+    job_name = args.job_name or "tikz-prod"
+    lines = [
+        "#!/bin/bash -l",
+        f"#SBATCH --job-name={job_name}",
+        f"#SBATCH --partition={args.partition}",
+        f"#SBATCH --gres=gpu:{args.gpu_type}:{args.gpus}",
+        "#SBATCH --nodes=1",
+        "#SBATCH --ntasks=1",
+        f"#SBATCH --cpus-per-task={args.cpus_per_task}",
+        f"#SBATCH --time={args.wall_time}",
+        "#SBATCH --export=NONE",
+        f"#SBATCH --output={args.log_prefix}-%j.out",
+        "# Set HF_TOKEN in this environment if the model repository is gated.",
+        "# Never commit tokens; this generator never writes one.",
+        "set -euo pipefail",
+        "unset SLURM_EXPORT_ENV",
+        "command -v apptainer >/dev/null || module load apptainer",
+        "export http_proxy=http://proxy.nhr.fau.de:80",
+        "export https_proxy=$http_proxy",
+        "export no_proxy=localhost,127.0.0.1,::1",
+        "export NO_PROXY=$no_proxy",
+        f"WORK={shell_value(work)}",
+        f"VLLM={shell_value(vllm)}",
+        f"SCRIPT={shell_value(script)}",
+        "mkdir -p \"$WORK\"",
+        'echo "== status before =="',
+        f"{status_command} || true",
+        'if [ ! -f "$WORK/manifest.meta.json" ]; then',
+        '  echo "== prepare (downloads stay inside the allocation) =="',
+        f"  {prepare_command}",
+        "fi",
+        'echo "== run =="',
+        "run_rc=0",
+        f"{run_command} || run_rc=$?",
+        'echo "== status after =="',
+        f"{status_command} || true",
+        "check_rc=0",
+        'if [ "$run_rc" -le 3 ]; then',
+        '  echo "== export =="',
+        f"  {export_command} || check_rc=$?",
+        '  echo "== audit =="',
+        f"  {audit_command} || check_rc=$?",
+        "fi",
+        'if [ "$check_rc" -ne 0 ]; then',
+        '  echo "Export/audit failed with rc=$check_rc; inspect the work directory"',
+        '  exit "$check_rc"',
+        "fi",
+        'if [ "$run_rc" -eq 0 ]; then',
+        '  echo "All rows are terminal. Resubmit only after changing the configuration."',
+        'elif [ "$run_rc" -eq 3 ]; then',
+        '  echo "Rows remain (paused or failed). Resubmit this script to resume."',
+        "else",
+        '  echo "Run failed with rc=$run_rc; inspect the work directory and logs."',
+        "fi",
+        'exit "$run_rc"',
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def cmd_slurm_script(args) -> int:
+    print(build_slurm_script(args))
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Slurm guard
 # ---------------------------------------------------------------------------
 
@@ -3456,6 +3620,35 @@ def build_parser() -> argparse.ArgumentParser:
         "validate", help="Re-validate every accepted instruction")
     add_common_arguments(validate)
     validate.set_defaults(handler=cmd_validate)
+
+    slurm = subparsers.add_parser(
+        "slurm-script", help="Print an sbatch script (never submitted automatically)")
+    add_common_arguments(slurm)
+    slurm.add_argument("--vllm-sif", default="", help="vLLM Apptainer image")
+    slurm.add_argument("--wall-time", default="",
+                       help="Bounded Slurm wall time, e.g. 12:00:00 or 1-00:00:00")
+    slurm.add_argument("--partition", default="rtxpro6k")
+    slurm.add_argument("--gpu-type", default="rtxpro6k")
+    slurm.add_argument("--gpus", type=int, default=2)
+    slurm.add_argument("--cpus-per-task", type=int, default=32)
+    slurm.add_argument("--job-name", default="tikz-prod")
+    slurm.add_argument("--log-prefix", default="slurm-tikz-prod")
+    slurm.add_argument("--prepare-python", default="python3",
+                       help="Python inside the container for prepare (dependencies already present)")
+    slurm.add_argument("--export-python", default="python3",
+                       help="Python inside the container for export/audit (needs pyarrow)")
+    slurm.add_argument("--model-cache-dir", default="")
+    slurm.add_argument("--shard-size", type=int, default=1000)
+    slurm.add_argument("--max-rows-this-run", type=int, default=None)
+    slurm.add_argument("--max-runtime-minutes", type=float, default=None,
+                       help="Default: wall time minus 30 minutes")
+    slurm.add_argument("--start-index", type=int, default=ROW_START)
+    slurm.add_argument("--end-index", type=int, default=ROW_LIMIT - 1)
+    slurm.add_argument("--max-transient-attempts", type=int, default=3)
+    slurm.add_argument("--retry-backoff-base-seconds", type=float, default=30.0)
+    slurm.add_argument("--retry-backoff-cap-seconds", type=float, default=600.0)
+    slurm.add_argument("--reprocess-rejected", action="store_true")
+    slurm.set_defaults(handler=cmd_slurm_script)
     return parser
 
 
