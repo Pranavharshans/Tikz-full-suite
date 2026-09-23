@@ -87,14 +87,16 @@ class LocalSpawner:
 
 
 class GatedEngine(FakeEngine):
-    """Fake engine that holds generation until the controller writes its stop marker."""
+    """Fake engine that blocks until both workers are mid-batch, then until the stop marker."""
 
-    def __init__(self, job, *, gate_path, log_path=None):
+    def __init__(self, job, *, gate_path, barrier, log_path=None):
         super().__init__(job, log_path=log_path)
         self.gate_path = Path(gate_path)
+        self.barrier = barrier
 
     def generate(self, items):
-        deadline = time.time() + 10
+        self.barrier.wait(timeout=15)
+        deadline = time.time() + 15
         while not self.gate_path.exists() and time.time() < deadline:
             time.sleep(0.005)
         return super().generate(items)
@@ -200,17 +202,23 @@ class FaultInjectionTests(unittest.TestCase):
             self.assertEqual(attempts[1]["state"], "complete")
 
     def test_graceful_stop_releases_running_rows_without_budget(self):
-        # Two rows per batch and a gate that holds the first batch until the
-        # controller writes its stop marker makes the interruption deterministic:
-        # each worker finishes exactly one batch, the rest is released.
+        # Two rows per batch; a three-party barrier guarantees both workers are
+        # inside their first batch before SIGTERM is delivered, so each finishes
+        # exactly one batch and the rest is released without consuming budget.
         args = run_args(self.work, "--concurrency", "4")
         config = b.config_from_args(args, manifest_meta=self.meta, container_sha256="b" * 64,
                                     require_pinned=True)
         stop_flag = b.StopFlag()
         gate = self.work / "runtime" / "stop"
+        barrier = threading.Barrier(3, timeout=15)
+
+        def deliver_sigterm():
+            barrier.wait()
+            stop_flag.handle(signal.SIGTERM, None)
+
+        threading.Thread(target=deliver_sigterm, daemon=True).start()
         spawner = LocalSpawner(
-            lambda job: GatedEngine(job, gate_path=gate, log_path=self.log),
-            on_spawn=lambda *_: stop_flag.handle(signal.SIGTERM, None))
+            lambda job: GatedEngine(job, gate_path=gate, barrier=barrier, log_path=self.log))
         with slurm_env():
             summary = b.run_pipeline(args, config, self.meta, LocalDeps(spawner), stop_flag)
         self.assertEqual(summary["states"]["complete"], 4)
@@ -330,6 +338,43 @@ class FaultInjectionTests(unittest.TestCase):
             with self.assertRaises(b.IdentityMismatch):
                 b.cmd_run(run_args(self.work, "--concurrency", "32"),
                           deps=LocalDeps(LocalSpawner(self.engine_factory())))
+
+    def test_truncation_escalates_once_then_rejects_end_to_end(self):
+        target = self.entries[1]["row_id"]
+        with slurm_env():
+            code = b.cmd_run(run_args(self.work),
+                             deps=LocalDeps(LocalSpawner(self.engine_factory(
+                                 truncate_rows={target}))))
+        self.assertEqual(code, 0)
+        with b.Ledger(self.work, read_only=True) as ledger:
+            row = ledger.get(target)
+            self.assertEqual(row["state"], b.STATE_REJECTED)
+            self.assertEqual(row["rejection_reason"], "truncated_at_ceiling")
+            attempts = ledger.attempts_for([target])[target]
+            self.assertEqual([attempt["max_tokens"] for attempt in attempts], [256, 384])
+            self.assertEqual([attempt["finish_reason"] for attempt in attempts],
+                             ["length", "length"])
+            self.assertEqual(ledger.counts()["states"]["complete"], 11)
+        # The truncated row's text is not attached to any completed row.
+        with b.Ledger(self.work, read_only=True) as ledger:
+            for row in ledger.complete_rows():
+                self.assertEqual(row["instruction"], f"Instruction for {row['row_id']}")
+
+    def test_invalid_instruction_is_rejected_without_blind_retry(self):
+        target = self.entries[3]["row_id"]
+        with slurm_env():
+            code = b.cmd_run(run_args(self.work),
+                             deps=LocalDeps(LocalSpawner(self.engine_factory(
+                                 invalid_rows={target}))))
+        self.assertEqual(code, 0)
+        with b.Ledger(self.work, read_only=True) as ledger:
+            row = ledger.get(target)
+            self.assertEqual(row["state"], b.STATE_REJECTED)
+            self.assertEqual(row["rejection_reason"], "invalid_instruction")
+            self.assertIn("markdown_fence", row["last_error_detail"])
+            attempts = ledger.attempts_for([target])[target]
+            self.assertEqual(len(attempts), 1, "deterministic invalid output must not be retried")
+            self.assertEqual(ledger.counts()["states"]["complete"], 11)
 
     def test_run_guards(self):
         spawner = LocalSpawner(self.engine_factory())

@@ -323,7 +323,8 @@ class RunConfig:
             "runner": {"code_sha256": self.runner_sha256, "helpers_sha256": self.helper_sha256},
             "container": {"vllm_sif_sha256": self.container_sha256},
             "inference": dataclasses.asdict(self.inference),
-            "validation": dataclasses.asdict(self.validation),
+            "validation": dict(dataclasses.asdict(self.validation),
+                               rules_sha256=validation_rules_sha256()),
             "output": {"schema_version": self.schema_version},
         }
 
@@ -480,6 +481,68 @@ def config_from_args(args, *, manifest_meta=None, prompt: Prompt | None = None,
     )
     config.validate(require_pinned=require_pinned)
     return config
+
+
+# ---------------------------------------------------------------------------
+# Instruction validation (policy v1)
+# ---------------------------------------------------------------------------
+
+# LaTeX/TikZ commands that betray copied source rather than a natural instruction.
+TIKZ_COMMANDS = (
+    "\\begin{", "\\end{", "\\draw", "\\node", "\\path", "\\fill", "\\coordinate",
+    "\\foreach", "\\documentclass", "\\usepackage", "\\usetikzlibrary", "\\tikz",
+    "\\pgf",
+)
+# Lowercase phrases that reference the task inputs instead of describing the diagram.
+FORBIDDEN_REFERENCES = (
+    "supplied image", "supplied source", "supplied input",
+    "provided input", "provided image", "provided source",
+    "source code", "input image", "reference image",
+    "this task", "the task above", "markdown fence",
+)
+
+
+def validation_rules_sha256() -> str:
+    """Hash of the rule tables so editing them cannot silently keep an old identity."""
+    return canonical_digest(dict(
+        version=VALIDATION_POLICY_VERSION, tikz_commands=TIKZ_COMMANDS,
+        forbidden_references=FORBIDDEN_REFERENCES))
+
+
+def validate_instruction(text, policy: ValidationPolicy) -> tuple[bool, str, str]:
+    """Validate one accepted instruction.  Returns (ok, rule, detail)."""
+    if not isinstance(text, str):
+        return False, "not_text", f"instruction is {type(text).__name__}"
+    stripped = text.strip()
+    if not stripped:
+        return False, "empty", "instruction is empty after stripping"
+    try:
+        stripped.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        return False, "invalid_utf8", str(exc)
+    if "\x00" in stripped:
+        return False, "control_characters", "instruction contains a NUL byte"
+    lowered = stripped.lower()
+    if "<think" in lowered or "</think" in lowered:
+        return False, "thinking_leak", "instruction contains thinking tags"
+    if "<source" in lowered or "</source" in lowered:
+        return False, "source_tags", "instruction contains source tags"
+    if "```" in stripped:
+        return False, "markdown_fence", "instruction contains a code fence"
+    for command in TIKZ_COMMANDS:
+        if command in stripped:
+            return False, "tikz_code", f"instruction contains {command!r}"
+    for phrase in FORBIDDEN_REFERENCES:
+        if phrase in lowered:
+            return False, "task_reference", f"instruction references {phrase!r}"
+    if len(stripped) < policy.min_chars:
+        return False, "too_short", f"{len(stripped)} chars < {policy.min_chars}"
+    if len(stripped) > policy.max_chars:
+        return False, "too_long", f"{len(stripped)} chars > {policy.max_chars}"
+    words = len(stripped.split())
+    if words > policy.max_words:
+        return False, "too_many_words", f"{words} words > {policy.max_words}"
+    return True, "ok", ""
 
 
 # ---------------------------------------------------------------------------
@@ -1081,7 +1144,7 @@ def decide_result(result: dict, attempts, policy: RetryPolicy) -> Decision:
         return Decision(STATE_COMPLETE, "ok", "none")
     category = result.get("error_category") or "engine_transient"
     detail = result.get("error_detail") or ""
-    if category in ("integrity", "input_too_long"):
+    if category in ("integrity", "input_too_long", "invalid_instruction"):
         return Decision(STATE_REJECTED, category, category, detail=detail)
     if result.get("finish_reason") == "length":
         retry_attempted = any((attempt.get("max_tokens") or 0) >= policy.truncation_max_tokens
@@ -2087,6 +2150,15 @@ def ingest_result_files(*, ledger, work, config, index, policy) -> dict:
             if reason is not None:
                 result = dict(result, ok=False, instruction=None, finish_reason=None,
                               error_category="integrity", error_detail=reason)
+            elif result.get("ok"):
+                # Semantic validation is authoritative here and never retried:
+                # greedy decoding would reproduce the same invalid text.
+                valid, rule, detail = validate_instruction(result.get("instruction"),
+                                                           config.validation)
+                if not valid:
+                    result = dict(result, ok=False, instruction=None,
+                                  error_category="invalid_instruction",
+                                  error_detail=f"{rule}: {detail}" if detail else rule)
             row = ledger.get(result["row_id"])
             if row is None:
                 raise PipelineIdentityError(f"Result for unknown row {result['row_id']}")

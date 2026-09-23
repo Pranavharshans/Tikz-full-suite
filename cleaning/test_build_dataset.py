@@ -811,6 +811,69 @@ class LedgerTransitionTests(unittest.TestCase):
         self.assertIn("engine_transient", counts["error_categories"])
 
 
+class ValidationRuleTests(unittest.TestCase):
+    def setUp(self):
+        self.policy = b.ValidationPolicy()
+
+    def check(self, text, **overrides):
+        return b.validate_instruction(text, b.ValidationPolicy(**overrides))
+
+    def test_valid_instruction_passes(self):
+        ok, rule, _ = self.check("Draw a circle labelled r with a dashed radius line.")
+        self.assertTrue(ok, rule)
+
+    def test_rule_violations_are_classified(self):
+        cases = [
+            ("", "empty"),
+            ("   \n  ", "empty"),
+            ("\x00Draw a circle", "control_characters"),
+            ("<think>private</think> Draw a circle", "thinking_leak"),
+            ("Draw a circle</think>", "thinking_leak"),
+            ("Use the <source> code", "source_tags"),
+            ("Draw a circle\n```\ncode\n```", "markdown_fence"),
+            ("Draw \\begin{tikzpicture} then stop", "tikz_code"),
+            ("Draw the shape from \\draw (0,0);", "tikz_code"),
+            ("Place a \\node at the origin", "tikz_code"),
+            ("Recreate the supplied image as TikZ.", "task_reference"),
+            ("Convert the source code into a diagram.", "task_reference"),
+            ("Use the provided inputs to draw this.", "task_reference"),
+            ("Return only a caption for this task.", "task_reference"),
+            ("short", "too_short"),
+            ("word " * 121, "too_many_words"),
+        ]
+        for text, expected in cases:
+            ok, rule, detail = self.check(text)
+            self.assertFalse(ok, msg=text[:40])
+            self.assertEqual(rule, expected, msg=f"{text[:40]!r} -> {rule} ({detail})")
+
+    def test_limits_are_configurable(self):
+        text = "Draw a small circle with one radius line"
+        self.assertTrue(self.check(text)[0])
+        self.assertFalse(self.check(text, min_chars=1000)[0])
+        self.assertFalse(self.check(text, max_words=3)[0])
+        self.assertFalse(self.check(text, max_chars=5)[0])
+        ok, rule, _ = self.check(text, max_words=3)
+        self.assertEqual(rule, "too_many_words")
+
+    def test_word_count_is_the_120_word_ceiling(self):
+        exactly = "word " * 119 + "word"
+        self.assertEqual(len(exactly.split()), 120)
+        self.assertTrue(self.check(exactly)[0])
+        over = exactly + " extra"
+        ok, rule, _ = self.check(over)
+        self.assertFalse(ok)
+        self.assertEqual(rule, "too_many_words")
+
+    def test_rule_table_is_part_of_the_identity(self):
+        before_rules = b.validation_rules_sha256()
+        before_identity = make_config().identity_sha256()
+        with mock.patch.object(b, "FORBIDDEN_REFERENCES",
+                               b.FORBIDDEN_REFERENCES + ("banana",)):
+            self.assertNotEqual(b.validation_rules_sha256(), before_rules)
+            self.assertNotEqual(make_config().identity_sha256(), before_identity)
+        self.assertEqual(b.validation_rules_sha256(), before_rules)
+
+
 # ---------------------------------------------------------------------------
 # Feature 4: identity-safe inference
 # ---------------------------------------------------------------------------
@@ -820,13 +883,15 @@ class FakeEngine:
     """Deterministic fake engine: text is derived from the prompt's row id."""
 
     def __init__(self, job, *, crash_rows=(), fail_rows=(), prompt_mismatch=False,
-                 short_batch=False, log_path=None):
+                 short_batch=False, log_path=None, truncate_rows=(), invalid_rows=()):
         self.job = job
         self.crash_rows = set(crash_rows)
         self.fail_rows = set(fail_rows)
         self.prompt_mismatch = prompt_mismatch
         self.short_batch = short_batch
         self.log_path = log_path
+        self.truncate_rows = set(truncate_rows)
+        self.invalid_rows = set(invalid_rows)
 
     def _log(self, row_id):
         if self.log_path:
@@ -842,7 +907,14 @@ class FakeEngine:
             if row_id in self.fail_rows:
                 raise RuntimeError("simulated CUDA failure")
             self._log(row_id)
+            if row_id in self.truncate_rows:
+                outputs.append(b.EngineOutput(prompt=item["prompt"], text="Partial caption",
+                                              finish_reason="length", prompt_tokens=12,
+                                              completion_tokens=item["max_tokens"]))
+                continue
             text = f"Instruction for {row_id}"
+            if row_id in self.invalid_rows:
+                text = "Here it is:\n```tikz\n\\draw (0,0);\n```"
             outputs.append(b.EngineOutput(prompt=item["prompt"], text=text,
                                           finish_reason="stop", prompt_tokens=12,
                                           completion_tokens=len(text.split())))
