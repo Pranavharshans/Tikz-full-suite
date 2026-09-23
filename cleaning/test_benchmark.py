@@ -80,16 +80,24 @@ class Tests(unittest.TestCase):
             "--rtx-concurrency-screen", "--no-enable-thinking",
             "--max-output-tokens", "256", "--load-samples", "512",
             "--throughput-mtp", "1", "--batch-token-budget", "32768",
-            "--greedy", "--vllm-sif", "/tmp/vllm.sif",
+            "--rtx-concurrencies", "64", "--greedy",
+            "--vllm-sif", "/tmp/vllm.sif",
             "--sglang-sif", "/tmp/sglang.sif"], text=True)
         self.assertIn("--rtx-concurrency-screen", script)
         self.assertIn("--load-samples 512", script)
         self.assertIn("--throughput-mtp 1", script)
         self.assertIn("--batch-token-budget 32768", script)
         self.assertIn("--greedy", script)
+        self.assertIn("--rtx-concurrencies 64", script)
         self.assertIn("#SBATCH --partition=rtxpro6k", script)
         self.assertIn("#SBATCH --gres=gpu:rtxpro6k:2", script)
         subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
+    def test_concurrency_parser(self):
+        self.assertEqual(b.parse_concurrencies("64, 96,128"), (64, 96, 128))
+        for invalid in ("", "0", "64,64", "abc"):
+            with self.assertRaises(argparse.ArgumentTypeError):
+                b.parse_concurrencies(invalid)
 
     def test_load_manifest_has_unique_ids(self):
         manifest = {"rows": [{"id": "a", "tikz_code": "x"},

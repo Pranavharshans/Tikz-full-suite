@@ -182,6 +182,10 @@ generated Slurm script. For attributable results, hold the validated RTX
 topology at TP1 x 2 replicas, MTP1 and aggregate concurrency 64; test prefill
 budget first and greedy decoding second.
 
+Use `--rtx-concurrencies 64` to run only the validated concurrency during a
+focused A/B test. The option also accepts a comma-separated subset such as
+`64,96`; its default remains the full `64,96,128,192,256` capacity sweep.
+
 ### Tests
 
 ```bash

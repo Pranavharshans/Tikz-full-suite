@@ -114,6 +114,18 @@ def load_manifest(manifest, count):
     return dict(manifest, rows=expanded, load_test_source_rows=len(rows), load_test_requests=count)
 
 
+def parse_concurrencies(value):
+    try:
+        values = tuple(int(part.strip()) for part in value.split(",") if part.strip())
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("concurrencies must be comma-separated integers") from exc
+    if not values or any(value < 1 for value in values):
+        raise argparse.ArgumentTypeError("concurrencies must be positive")
+    if len(set(values)) != len(values):
+        raise argparse.ArgumentTypeError("concurrencies must be unique")
+    return values
+
+
 def shortlist(results):
     eligible = [r for r in results if r.get("successful") == r.get("samples", 100)
                 and not r.get("failed") and r["config"]["mtp"]]
@@ -579,6 +591,9 @@ def main():
                         help="Run bounded TP1 throughput candidates on two RTX PRO GPUs")
     parser.add_argument("--rtx-concurrency-screen", action="store_true",
                         help="Run a sustained two-GPU RTX TP1 concurrency load test")
+    parser.add_argument("--rtx-concurrencies", type=parse_concurrencies,
+                        default=(64, 96, 128, 192, 256),
+                        help="Comma-separated aggregate concurrencies for the RTX load test")
     parser.add_argument("--load-samples", type=int, default=512)
     parser.add_argument("--throughput-mtp", type=int, choices=(0, 1, 2, 3), default=2)
     parser.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction, default=True)
@@ -622,6 +637,7 @@ def main():
                           "--max-output-tokens", str(args.max_output_tokens),
                           "--batch-token-budget", str(args.batch_token_budget),
                           "--load-samples", str(args.load_samples),
+                          "--rtx-concurrencies", ",".join(map(str, args.rtx_concurrencies)),
                           "--throughput-mtp", str(args.throughput_mtp)] +
                          (["--enable-thinking"] if args.enable_thinking else ["--no-enable-thinking"]) +
                          (["--greedy"] if args.greedy else []) +
@@ -697,7 +713,7 @@ def main():
         configs = [config(engine="vllm-offline", tp=1, replicas=2,
                           mtp=args.throughput_mtp, concurrency=c,
                           budget=args.batch_token_budget)
-                   for c in (64, 96, 128, 192, 256)]
+                   for c in args.rtx_concurrencies]
         results = []
         for cfg in configs:
             print("rtx-concurrency", f"requests={args.load_samples}", json.dumps(cfg), flush=True)
