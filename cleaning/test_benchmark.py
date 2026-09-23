@@ -79,11 +79,14 @@ class Tests(unittest.TestCase):
             sys.executable, str(Path(b.__file__)), "--slurm-script",
             "--rtx-concurrency-screen", "--no-enable-thinking",
             "--max-output-tokens", "256", "--load-samples", "512",
-            "--throughput-mtp", "1", "--vllm-sif", "/tmp/vllm.sif",
+            "--throughput-mtp", "1", "--batch-token-budget", "32768",
+            "--greedy", "--vllm-sif", "/tmp/vllm.sif",
             "--sglang-sif", "/tmp/sglang.sif"], text=True)
         self.assertIn("--rtx-concurrency-screen", script)
         self.assertIn("--load-samples 512", script)
         self.assertIn("--throughput-mtp 1", script)
+        self.assertIn("--batch-token-budget 32768", script)
+        self.assertIn("--greedy", script)
         self.assertIn("#SBATCH --partition=rtxpro6k", script)
         self.assertIn("#SBATCH --gres=gpu:rtxpro6k:2", script)
         subprocess.run(["bash", "-n"], input=script, text=True, check=True)
@@ -103,6 +106,7 @@ class Tests(unittest.TestCase):
         self.assertEqual(thinking["temperature"], 1.0)
         self.assertEqual(instruct["temperature"], .7)
         self.assertEqual(instruct["presence_penalty"], 1.5)
+        self.assertEqual(b.generation_settings({"greedy": True})["temperature"], 0.0)
 
     def test_vllm_runtime_workaround_and_metrics(self):
         opts = b.vllm_runtime_options()

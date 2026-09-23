@@ -206,6 +206,8 @@ def warmup_passed(record):
 
 
 def generation_settings(job):
+    if job.get("greedy"):
+        return dict(temperature=0.0)
     if job["enable_thinking"]:
         return dict(temperature=1.0, top_p=.95, top_k=20,
                     presence_penalty=0.0)
@@ -454,6 +456,7 @@ def run_config(args, cfg, manifest):
                               enable_thinking=args.enable_thinking,
                               reasoning_effort=args.reasoning_effort,
                               max_output_tokens=args.max_output_tokens,
+                              greedy=args.greedy,
                               nccl_p2p=args.nccl_p2p,
                               request_timeout=args.request_timeout, config_timeout=args.config_timeout,
                               script=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
@@ -491,6 +494,7 @@ def run_config(args, cfg, manifest):
                         enable_thinking=args.enable_thinking,
                         reasoning_effort=args.reasoning_effort,
                         max_output_tokens=args.max_output_tokens,
+                        greedy=args.greedy,
                         concurrency=concurrency, context=args.context, port=19000+index,
                         startup_timeout=args.startup_timeout, request_timeout=args.request_timeout)
             dump(folder / "job.json", spec)
@@ -580,6 +584,10 @@ def main():
     parser.add_argument("--enable-thinking", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--reasoning-effort", choices=("low", "medium", "xhigh"), default="xhigh")
     parser.add_argument("--max-output-tokens", type=int, default=32768)
+    parser.add_argument("--greedy", action="store_true",
+                        help="Use deterministic greedy decoding (temperature 0)")
+    parser.add_argument("--batch-token-budget", type=int, default=16384,
+                        help="max_num_batched_tokens/max prefill tokens for focused throughput modes")
     args = parser.parse_args()
     throughput_modes = sum((args.throughput_screen, args.rtx_throughput_screen,
                             args.rtx_concurrency_screen))
@@ -589,6 +597,8 @@ def main():
         parser.error("--load-samples must be positive")
     if args.warmup_samples < 1:
         parser.error("--warmup-samples must be positive")
+    if args.batch_token_budget < 1:
+        parser.error("--batch-token-budget must be positive")
     if args.slurm_script:
         if not args.vllm_sif or not args.sglang_sif:
             parser.error("--slurm-script requires both engine SIF paths")
@@ -610,9 +620,11 @@ def main():
                           "--warmup-samples", str(args.warmup_samples),
                           "--reasoning-effort", args.reasoning_effort,
                           "--max-output-tokens", str(args.max_output_tokens),
+                          "--batch-token-budget", str(args.batch_token_budget),
                           "--load-samples", str(args.load_samples),
                           "--throughput-mtp", str(args.throughput_mtp)] +
                          (["--enable-thinking"] if args.enable_thinking else ["--no-enable-thinking"]) +
+                         (["--greedy"] if args.greedy else []) +
                          (["--throughput-screen"] if args.throughput_screen else []) +
                          (["--rtx-throughput-screen"] if args.rtx_throughput_screen else []) +
                          (["--rtx-concurrency-screen"] if args.rtx_concurrency_screen else []) +
@@ -683,7 +695,8 @@ def main():
             raise SystemExit("--rtx-concurrency-screen requires at least 256 load requests")
         load = load_manifest(manifest, args.load_samples)
         configs = [config(engine="vllm-offline", tp=1, replicas=2,
-                          mtp=args.throughput_mtp, concurrency=c)
+                          mtp=args.throughput_mtp, concurrency=c,
+                          budget=args.batch_token_budget)
                    for c in (64, 96, 128, 192, 256)]
         results = []
         for cfg in configs:
@@ -701,10 +714,13 @@ def main():
         if args.enable_thinking:
             raise SystemExit("--rtx-throughput-screen requires --no-enable-thinking")
         configs = [
-            config(engine="vllm-offline", tp=1, replicas=1, mtp=2, concurrency=32),
-            *[config(engine="vllm-offline", tp=1, replicas=2, mtp=mtp, concurrency=64)
+            config(engine="vllm-offline", tp=1, replicas=1, mtp=2, concurrency=32,
+                   budget=args.batch_token_budget),
+            *[config(engine="vllm-offline", tp=1, replicas=2, mtp=mtp, concurrency=64,
+                     budget=args.batch_token_budget)
               for mtp in (0, 1, 2, 3)],
-            config(engine="vllm-offline", tp=1, replicas=2, mtp=2, concurrency=100),
+            config(engine="vllm-offline", tp=1, replicas=2, mtp=2, concurrency=100,
+                   budget=args.batch_token_budget),
         ]
         results = []
         for cfg in configs:
@@ -722,9 +738,12 @@ def main():
         if args.enable_thinking:
             raise SystemExit("--throughput-screen requires --no-enable-thinking")
         configs = [
-            config(engine="vllm-offline", tp=2, replicas=1, mtp=2, concurrency=32),
-            config(engine="vllm-offline", tp=2, replicas=2, mtp=2, concurrency=64),
-            config(engine="vllm-offline", tp=2, replicas=2, mtp=2, concurrency=100),
+            config(engine="vllm-offline", tp=2, replicas=1, mtp=2, concurrency=32,
+                   budget=args.batch_token_budget),
+            config(engine="vllm-offline", tp=2, replicas=2, mtp=2, concurrency=64,
+                   budget=args.batch_token_budget),
+            config(engine="vllm-offline", tp=2, replicas=2, mtp=2, concurrency=100,
+                   budget=args.batch_token_budget),
         ]
         results = []
         for cfg in configs:

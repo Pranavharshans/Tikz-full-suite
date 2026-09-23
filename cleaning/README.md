@@ -167,6 +167,21 @@ Warmup validates that the engine returns non-empty output and therefore accepts
 either `stop` or the configured `length` boundary. Measured responses that end
 at the boundary remain failures, so this does not inflate production throughput.
 
+Focused throughput modes accept two additional tuning controls:
+
+- `--batch-token-budget N` sets vLLM `max_num_batched_tokens` (and the
+  equivalent prefill limit for HTTP engines). The default remains the validated
+  16,384 tokens. Test 32,768 and 65,536 independently; larger values can improve
+  image/source prefill throughput but also consume more activation memory.
+- `--greedy` uses deterministic temperature-zero decoding. It removes top-k,
+  top-p and presence-penalty sampling from the request, so compare both speed
+  and caption quality against the existing Qwen instruct sampling baseline.
+
+Both controls participate in the run fingerprint and are propagated into a
+generated Slurm script. For attributable results, hold the validated RTX
+topology at TP1 x 2 replicas, MTP1 and aggregate concurrency 64; test prefill
+budget first and greedy decoding second.
+
 ### Tests
 
 ```bash
