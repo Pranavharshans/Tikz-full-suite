@@ -8,9 +8,10 @@ explicit, identity-checked and resumable.
 `cleaning/benchmark.py` and `cleaning/results/` are preserved untouched: the
 benchmark tool and its recorded measurements are the evidence for the baseline
 settings below. `build_dataset.py` is a separate production workflow that
-imports only three audited helpers from `benchmark.py` (`bench.dump`,
-`bench.digest`, `bench.vllm_runtime_options`) and never runs the benchmark
-matrix.
+imports only two audited helpers from `benchmark.py` (`bench.digest` and
+`bench.vllm_runtime_options`) and never runs the benchmark matrix. All
+production file writes use the builder's own durable writer (unique temp name,
+fsync, atomic rename, directory fsync) rather than `bench.dump`.
 
 Contents:
 
@@ -96,6 +97,14 @@ heartbeat. The worker container gets `CUDA_VISIBLE_DEVICES` for one GPU,
 `HF_HUB_OFFLINE=1` / `TRANSFORMERS_OFFLINE=1`; the model snapshot path is
 bind-mounted, so workers need no network.
 
+Every batch is validated before its results are trusted: the output count must
+match, and each output must echo the request prompt. An engine that does not
+echo prompts is refused by default (`--allow-missing-prompt-echo` accepts
+engine ordering explicitly, for engines that guarantee it). A batch whose
+association is doubtful is recorded as a transient failure for all of its rows
+rather than partially committed. Prompts whose length plus the reserved output
+ceiling exceeds the context are rejected as `input_too_long` before generation.
+
 Engine construction (in the worker) uses:
 `max_model_len=context`, `max_num_seqs=per_replica_concurrency`,
 `max_num_batched_tokens=batch_token_budget`, `enable_chunked_prefill=True`,
@@ -128,6 +137,9 @@ transactions). Tables:
   `normal|truncation_retry|recovered`, state `running|complete|retryable|
   rejected|lost`, worker, `max_tokens`, timestamps, finish reason, error
   category/detail, token counts, instruction, hashes).
+- `consumed_files`: content SHA256 of every result file already committed, so
+  re-applying a file after a crash between commit and file removal is a no-op
+  rather than a duplicated attempt.
 
 The ledger independently pins the identity: `Ledger.initialize` inserts
 missing metadata but refuses conflicting values, so reusing a work directory
@@ -136,15 +148,18 @@ with a different identity fails even if `run.json` were removed.
 ### 1.4 Atomic manifest and export lifecycles
 
 Manifest freeze: rows are staged under `WORK/.staging-<pid>/`, the manifest
-JSONL is flushed and `fsync`ed, the staging images directory and manifest are
-moved into place with `os.replace`, and `manifest.meta.json` is written last.
+JSONL is flushed and `fsync`ed, the staged manifest and every staged image are
+read back and hash-verified, the staging directories are `fsync`ed, the images
+directory and manifest are moved into place with `os.replace`, and
+`manifest.meta.json` is written last with a durable fsync+rename writer.
 `manifest.meta.json` is the only marker that makes a manifest authoritative;
 an interrupted freeze leaves no top-level manifest, and `prepare` removes
 partial artifacts (`manifest.jsonl`, `images/`, `.staging-*`) before
-re-freezing. `verify_manifest` re-checks schema, contiguous indices, unique
-stable ids, TikZ checksums, image existence (and hashes when `quick=False`),
-rejection reasons, row count, and the manifest content hash against the meta
-file.
+re-freezing. A torn (non-JSON) `manifest.meta.json` is treated as an
+interrupted freeze and re-frozen automatically. `verify_manifest` re-checks
+schema, contiguous indices, unique stable ids, TikZ checksums, image presence
+and non-emptiness (and hashes when `quick=False`), rejection reasons, row
+count, and the manifest content hash against the meta file.
 
 Export: each shard is written to `shard-NNNNN.parquet.tmp`, `fsync`ed,
 read back for row count and first-id equality, then renamed atomically; the
@@ -172,6 +187,7 @@ WORK/
     tasks/                       worker-N-genW.jsonl and worker-N-genW-rR.jsonl (restarts)
     results/worker-N/batch-W-BBBBB.json   atomic worker outputs (unconsumed)
     consumed/worker-N/...        result files already committed to the ledger
+    quarantine/                  unprocessable result files kept as evidence
     jobs/worker-N-genW-rR.json   worker job descriptions
     heartbeats/worker-N.json     progress heartbeats
     logs/worker-N.log            worker stdout/stderr (appended across restarts)
@@ -259,8 +275,8 @@ Chunk, retry and monitoring flags (`--start-index`, `--end-index`,
 `--max-rows-this-run`, `--max-runtime-minutes`, `--worker-restarts`,
 `--worker-timeout`, `--poll-seconds`, `--shutdown-grace-seconds`,
 `--retry-wait-seconds`, `--warmup-samples`, `--reprocess-rejected`,
-`--max-transient-attempts`, backoff flags) are **not** identity-locked and can
-differ between resubmissions.
+`--max-transient-attempts`, `--allow-missing-prompt-echo`, backoff flags) are
+**not** identity-locked and can differ between resubmissions.
 
 ---
 
@@ -718,6 +734,10 @@ ignored.
    `pending`, manifest-invalid rows become `rejected` with
    `last_error_category = input_invalid`.
 5. Ingests any leftover worker result files, committing finished batches.
+   Files already committed (tracked by content SHA256 in `consumed_files`) are
+   moved without reprocessing, so a crash between commit and file removal is
+   harmless. Unprocessable files are moved to `runtime/quarantine/` and their
+   rows are reclaimed instead of blocking the resume.
 6. Reclaims every row still marked `running` as `stale_claim` — this controller
    provably owns the work directory, so those claims belong to dead workers.
    No retry budget is consumed.
@@ -751,7 +771,8 @@ Does not:
   because the controller lock proves no other controller is active.
 - During a wave, a worker with no heartbeat and no activity for
   `--worker-timeout` (default 1800 s) is terminated; if it does not exit
-  within 60 s it is killed.
+  within the stall-kill grace (60 s by default) it is killed. A worker that is
+  restarted starts with a clean stall deadline.
 - A worker that exits while rows are outstanding is restarted up to
   `--worker-restarts` times (default 2). A restart writes a filtered task file
   (`worker-N-genW-rR.jsonl`) with only the outstanding rows and starts a fresh
@@ -825,10 +846,11 @@ and the row is retried on resubmission.
 ### 8.4 Semantic failures
 
 `integrity` (image/TikZ checksum mismatch detected in the worker or during
-ingestion), `input_too_long` (prompt length `>= context`), and
-`invalid_instruction` (failed validation after a successful generation) are
-rejected without retry: greedy decoding would reproduce the same invalid text.
-Manifest-invalid rows are seeded as rejected with `input_invalid`.
+ingestion), `input_too_long` (prompt plus its reserved output ceiling exceeds
+the context), and `invalid_instruction` (failed validation after a successful
+generation) are rejected without retry: greedy decoding would reproduce the
+same invalid text. Manifest-invalid rows are seeded as rejected with
+`input_invalid`.
 
 ### 8.5 Reprocessing rejected rows
 
@@ -842,7 +864,9 @@ moved. Use it deliberately, for example after fixing the cause of an
 ## 9. Export outputs
 
 `export` writes to `WORK/export` (override with `--export-dir`) and requires
-`run.json`, a matching ledger identity, a verified manifest, and `pyarrow`.
+`run.json`, a matching ledger identity, a verified manifest, matching live
+validation rules, and `pyarrow`. It also refuses any complete row whose finish
+reason, prompt hash, config hash or model revision disagrees with the run.
 
 ### 9.1 Shards
 
@@ -942,6 +966,7 @@ Manifest and identity checks:
 - `manifest.unique_stable_ids`
 - `run.record_present`
 - `run.prompt_matches_registry`
+- `run.validation_rules_match` (live rule tables versus the pinned hash)
 
 Ledger checks:
 
@@ -956,11 +981,16 @@ Ledger checks:
 - `ledger.manifest_rejections_preserved`
 - `ledger.complete_rows_have_instructions`
 - `ledger.rejected_rows_have_reasons`
-- `ledger.instructions_attached_to_one_row`
+- `ledger.instructions_attached_to_one_row` (**warning**, not a violation:
+  identical greedy captions are legitimate; the detail reports how many)
+- `ledger.index_pairs_match_manifest` (every ledger row's `(id, index)` pair
+  matches the frozen manifest)
 - `ledger.attempts_reference_known_rows`
 - `ledger.accepted_instructions_valid` (re-runs the validation policy and
   checks checksums, `finish_reason == "stop"`, prompt hash, config hash, and
   model revision for every complete row)
+- `runtime.no_quarantined_results` (**warning** when any result file was
+  quarantined; its rows were reclaimed and regenerated)
 
 Export checks (when `shards/*.parquet` exist):
 
@@ -971,6 +1001,9 @@ Export checks (when `shards/*.parquet` exist):
 - `export.unique_ids`
 - `export.rows_map_to_manifest`
 - `export.checksums_match` (logical always; file hashes unless `--quick`)
+- `export.companion_checksums_match` (rejected/attempts file hashes unless
+  `--quick`)
+- `export.shard_count_matches_meta`
 - `export.rejected_matches_ledger`
 - `export.identity_matches_run`
 
@@ -1013,13 +1046,14 @@ checkpoint. Resubmit the same script; it resumes from the ledger. Check
   in-flight batch is retried, not duplicated.
 - Never run two controllers against one work directory; the second one refuses
   to start while the lock is held.
+- Unprocessable result files are moved to `runtime/quarantine/` (the run
+  continues and their rows are reclaimed). Inspect them before deleting;
+  `audit` warns while any remain.
 
 ### 12.3 Corrupt or incomplete shard
 
 Shards are written atomically, so a crash can leave at most a
-`shard-NNNNN.parquet.tmp` plus the previous completed shards. Recovery:
-
-```bash
+`shard-NNNNN.parquet.tmp` plus the previous completed shards. Recovery:```bash
 # Optional cleanup of an interrupted write; .tmp files are ignored by audit
 # and export, so deleting them is safe.
 rm -f /shared/$USER/tikz-production/export/shards/*.parquet.tmp
@@ -1187,8 +1221,9 @@ Notes:
   falls back to signature checks and records `"signature"`.
 - A test asserts that importing `build_dataset.py` does not import `pyarrow`,
   `PIL`, `datasets`, `vllm` or `torch`.
-- Tests use the hidden `--allow-non-slurm` flag and injectable dependency
-  seams; production runs must not use either.
+- Tests use the hidden `--allow-non-slurm` flag, the hidden
+  `--stall-kill-grace-seconds` control and injectable dependency seams;
+  production runs must not use them.
 
 ---
 
@@ -1267,8 +1302,8 @@ python3 cleaning/build_dataset.py checkpoint --work /shared/$USER/tikz-productio
   builder reads only `cleaning/` and writes only inside `--work` (plus the
   container hash cache there). It never writes to the stage directories.
 - `cleaning/benchmark.py` is preserved untouched as the benchmark tool; the
-  production pipeline reuses only the audited helpers `bench.dump`,
-  `bench.digest` and `bench.vllm_runtime_options`.
+  production pipeline reuses only the audited helpers `bench.digest` and
+  `bench.vllm_runtime_options`.
 - `cleaning/results/` is the preserved record of the measured benchmark
   campaigns, including the RTX PRO 6000 results that selected the validated
   baseline and rejected the four-replica/two-per-GPU topology.
