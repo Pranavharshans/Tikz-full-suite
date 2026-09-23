@@ -1,0 +1,247 @@
+"""Local tests for the production dataset builder (no GPU, no network).
+
+Synthetic fixtures only: tests never download the real dataset or model and
+never start an inference engine.
+"""
+import contextlib
+import dataclasses
+import importlib.util
+import io
+import json
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+SPEC = importlib.util.spec_from_file_location(
+    "build_dataset", Path(__file__).with_name("build_dataset.py"))
+b = importlib.util.module_from_spec(SPEC)
+sys.modules["build_dataset"] = b
+SPEC.loader.exec_module(b)
+
+PINNED = "a" * 40
+CONTAINER = "b" * 64
+RUNNER = "c" * 64
+HELPERS = "d" * 64
+
+
+def make_config(**overrides):
+    prompt = overrides.pop("prompt", b.load_prompt())
+    values = dict(
+        dataset=b.DatasetSource(revision=PINNED),
+        model=b.ModelSource(revision=PINNED, processor_revision=PINNED, path="/tmp/model"),
+        prompt=prompt,
+        inference=b.InferenceConfig(),
+        validation=b.ValidationPolicy(),
+        container_sha256=CONTAINER,
+        runner_sha256=RUNNER,
+        helper_sha256=HELPERS,
+        git_commit="0" * 40,
+    )
+    values.update(overrides)
+    return b.RunConfig(**values)
+
+
+def mutate(config, **changes):
+    """Apply nested dataclass replacements: mutate(cfg, inference__mtp=2)."""
+    top = {}
+    nested = {}
+    for key, value in changes.items():
+        if "__" in key:
+            name, field = key.split("__", 1)
+            nested.setdefault(name, {})[field] = value
+        else:
+            top[key] = value
+    for name, fields in nested.items():
+        top[name] = dataclasses.replace(getattr(config, name), **fields)
+    return dataclasses.replace(config, **top)
+
+
+class PromptTests(unittest.TestCase):
+    def test_shipped_prompt_matches_registry(self):
+        prompt = b.load_prompt()
+        self.assertEqual(prompt.version, "caption-v1")
+        self.assertTrue(b.is_sha256(prompt.sha256))
+        registry = json.loads((b.PROMPTS_DIR / "registry.json").read_text())
+        self.assertEqual(registry[prompt.version]["sha256"], prompt.sha256)
+        self.assertIn("under 120 words", prompt.text)
+        self.assertNotIn("\n", prompt.text)
+
+    def test_normalization_is_wrap_insensitive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            (directory / "caption-v9.txt").write_text("one two\nthree\n")
+            normalized = "one two three"
+            (directory / "registry.json").write_text(json.dumps({
+                "caption-v9": {"file": "caption-v9.txt", "sha256": b.sha256_text(normalized)}}))
+            first = b.load_prompt("caption-v9", directory)
+            (directory / "caption-v9.txt").write_text("one\ntwo   three\n\n")
+            second = b.load_prompt("caption-v9", directory)
+            self.assertEqual(first.sha256, second.sha256)
+
+    def test_changed_prompt_requires_new_version(self):
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            (directory / "caption-v9.txt").write_text("original text")
+            (directory / "registry.json").write_text(json.dumps({
+                "caption-v9": {"file": "caption-v9.txt", "sha256": b.sha256_text("original text")}}))
+            (directory / "caption-v9.txt").write_text("edited text")
+            with self.assertRaisesRegex(b.PromptError, "create a new version"):
+                b.load_prompt("caption-v9", directory)
+
+    def test_unknown_version_rejected(self):
+        with self.assertRaisesRegex(b.PromptError, "Unknown prompt version"):
+            b.load_prompt("caption-does-not-exist")
+
+
+class IdentityTests(unittest.TestCase):
+    def test_production_baseline_defaults(self):
+        inference = b.InferenceConfig()
+        self.assertEqual(inference.engine, "vllm-offline")
+        self.assertEqual((inference.tensor_parallel, inference.replicas), (1, 2))
+        self.assertEqual(inference.replicas_per_gpu, 1)
+        self.assertEqual(inference.aggregate_concurrency, 64)
+        self.assertEqual(inference.per_replica_concurrency(0), 32)
+        self.assertEqual(inference.per_replica_concurrency(1), 32)
+        self.assertEqual(inference.mtp, 1)
+        self.assertFalse(inference.enable_thinking)
+        self.assertTrue(inference.greedy)
+        self.assertEqual(inference.batch_token_budget, 16384)
+        self.assertEqual(inference.context, 32768)
+        self.assertEqual(inference.max_output_tokens, 256)
+        self.assertEqual(inference.truncation_retry_tokens, 384)
+        self.assertFalse(inference.prefix_caching)
+        self.assertFalse(inference.custom_all_reduce)
+        self.assertEqual(inference.nccl_p2p, "disabled")
+        self.assertAlmostEqual(inference.gpu_memory_utilization, 0.90)
+        self.assertEqual(b.DATASET_ID, "nllg/DaTikZ-V4")
+        self.assertEqual(b.MODEL_ID, "nvidia/Qwen3.8-27B-NVFP4")
+        self.assertEqual((b.ROW_START, b.ROW_LIMIT), (0, 100_000))
+        inference.validate()
+
+    def test_identity_changes_for_every_scientific_input(self):
+        base = make_config()
+        baseline = base.identity_sha256()
+        self.assertEqual(base.run_id(), baseline[:16])
+        mutations = [
+            dict(dataset__revision="e" * 40),
+            dict(model__revision="f" * 40),
+            dict(model__processor_revision="f" * 40),
+            dict(prompt=b.Prompt(version="caption-v2", sha256=b.sha256_text("other"), text="other")),
+            dict(runner_sha256="1" * 64),
+            dict(helper_sha256="2" * 64),
+            dict(container_sha256="3" * 64),
+            dict(inference__aggregate_concurrency=32),
+            dict(inference__mtp=2),
+            dict(inference__batch_token_budget=32768),
+            dict(inference__context=16384),
+            dict(inference__max_output_tokens=512),
+            dict(inference__truncation_retry_tokens=768),
+            dict(inference__gpu_memory_utilization=0.5),
+            dict(inference__nccl_p2p="auto"),
+            dict(inference__enable_thinking=True),
+            dict(inference__greedy=False),
+            dict(inference__prefix_caching=True),
+            dict(inference__custom_all_reduce=True),
+            dict(inference__tensor_parallel=2, inference__replicas=1),
+            dict(validation__min_chars=5),
+            dict(validation__max_chars=100),
+            dict(validation__max_words=50),
+            dict(schema_version="dataset-v2"),
+        ]
+        for change in mutations:
+            changed = mutate(base, **change)
+            self.assertNotEqual(changed.identity_sha256(), baseline, msg=str(change))
+            self.assertNotEqual(changed.run_id(), base.run_id(), msg=str(change))
+
+    def test_identity_excludes_provenance_only_fields(self):
+        base = make_config()
+        self.assertEqual(mutate(base, git_commit="9" * 40).identity_sha256(),
+                         base.identity_sha256())
+        self.assertEqual(mutate(base, model__path="/elsewhere/model").identity_sha256(),
+                         base.identity_sha256())
+
+    def test_invalid_configurations_rejected(self):
+        cases = [
+            (dict(inference__enable_thinking=True), "Thinking must be explicitly disabled"),
+            (dict(inference__replicas_per_gpu=2), "rejected topology"),
+            (dict(inference__replicas=4), "TP1 with exactly two replicas"),
+            (dict(inference__greedy=False), "greedy"),
+            (dict(inference__truncation_retry_tokens=256), "must exceed"),
+            (dict(inference__context=1024), "at least 4096"),
+            (dict(inference__nccl_p2p="sometimes"), "Unknown nccl_p2p"),
+            (dict(validation__min_chars=0), "length policy"),
+            (dict(schema_version="dataset-v9"), "Unknown output schema"),
+        ]
+        for change, message in cases:
+            with self.assertRaisesRegex(b.ConfigError, message, msg=str(change)):
+                mutate(make_config(), **change).validate()
+
+    def test_require_pinned_revisions(self):
+        config = make_config(dataset=b.DatasetSource(revision="main"))
+        with self.assertRaisesRegex(b.ConfigError, "pinned 40-char"):
+            config.require_pinned()
+        make_config().require_pinned()
+
+    def test_identity_diff_reports_nested_fields(self):
+        base = make_config()
+        changed = mutate(base, inference__mtp=3, prompt=b.Prompt(
+            version="caption-v2", sha256=b.sha256_text("x"), text="x"))
+        differences = b.identity_diff(base.identity(), changed.identity())
+        self.assertTrue(any("inference.mtp" in line for line in differences))
+        self.assertTrue(any("prompt.sha256" in line for line in differences))
+        self.assertEqual(b.identity_diff(base.identity(), base.identity()), [])
+
+
+class RunRecordTests(unittest.TestCase):
+    def test_roundtrip_and_mismatch_refusal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = make_config()
+            record = b.write_run_record(directory, config)
+            self.assertEqual(record["run_id"], config.run_id())
+            stored = b.verify_run_record(directory, config)
+            self.assertEqual(stored["identity"], config.identity())
+            changed = mutate(config, inference__aggregate_concurrency=128)
+            with self.assertRaises(b.IdentityMismatch) as caught:
+                b.verify_run_record(directory, changed)
+            self.assertTrue(any("aggregate_concurrency" in line
+                                for line in caught.exception.differences))
+            with self.assertRaisesRegex(b.ConfigError, "run prepare first"):
+                b.verify_run_record(Path(directory) / "missing", config)
+
+
+class PlanTests(unittest.TestCase):
+    def run_plan(self, *extra):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            code = b.main(["plan", *extra])
+        self.assertEqual(code, 0)
+        return json.loads(output.getvalue())
+
+    def test_plan_reports_provisional_identity(self):
+        plan = self.run_plan()
+        self.assertEqual(plan["source"]["count"], 100_000)
+        self.assertEqual(plan["source"]["rows"], "0-99999")
+        self.assertEqual(plan["model"], b.MODEL_ID)
+        self.assertEqual(plan["identity_provisional"]["dataset"]["revision"], "UNRESOLVED")
+        self.assertEqual(plan["identity_provisional"]["inference"]["mtp"], 1)
+        self.assertIn("prepare", plan["stages"])
+        self.assertGreater(plan["baseline"]["estimated_generation_hours_at_baseline"], 5)
+
+    def test_plan_honors_pinned_revisions(self):
+        plan = self.run_plan("--dataset-revision", "1" * 40,
+                             "--model-revision", "2" * 40, "--mtp", "2")
+        identity = plan["identity_provisional"]
+        self.assertEqual(identity["dataset"]["revision"], "1" * 40)
+        self.assertEqual(identity["model"]["revision"], "2" * 40)
+        self.assertEqual(identity["inference"]["mtp"], 2)
+
+    def test_plan_identity_changes_with_configuration(self):
+        first = self.run_plan()
+        second = self.run_plan("--concurrency", "32")
+        self.assertNotEqual(first["identity_sha256_provisional"],
+                            second["identity_sha256_provisional"])
+
+
+if __name__ == "__main__":
+    unittest.main()
