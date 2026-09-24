@@ -517,8 +517,14 @@ def make_callbacks(transformers, *, monitor: TrainingMonitor,
         def on_save(self, args, state, control, **kwargs):
             directory = Path(args.output_dir) / f"checkpoint-{int(state.global_step)}"
             if directory.is_dir():
+                model = kwargs.get("model")
+                optimizer = kwargs.get("optimizer")
+                if model is None or optimizer is None:
+                    raise DataError(
+                        "Trainer checkpoint callback received no model/optimizer; "
+                        "refusing to write a checkpoint without its resume plan")
                 checkpointing_module.write_resume_plan(
-                    directory, model=kwargs["model"], optimizer=kwargs["optimizer"],
+                    directory, model=model, optimizer=optimizer,
                     num_training_steps=state.max_steps,
                     num_warmup_steps=args.get_warmup_steps(state.max_steps))
                 checkpointing_module.write_checkpoint_meta(

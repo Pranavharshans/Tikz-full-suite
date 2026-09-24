@@ -658,6 +658,21 @@ class ProductionSchedulerIntegrationTests(unittest.TestCase):
         with self.assertRaisesRegex(CheckpointError, "stage1-resume-plan"):
             self.verify(directory)
 
+    def test_malformed_resume_plan_is_refused(self):
+        directory, _, _ = self.write_checkpoint()
+        (directory / checkpointing.RESUME_PLAN_FILE).write_text("not json")
+        with self.assertRaisesRegex(CheckpointError, "could not be read"):
+            self.verify(directory)
+
+    def test_unknown_resume_plan_schema_is_refused(self):
+        directory, _, _ = self.write_checkpoint()
+        plan_path = directory / checkpointing.RESUME_PLAN_FILE
+        plan = json.loads(plan_path.read_text())
+        plan["schema_version"] = 99
+        plan_path.write_text(json.dumps(plan))
+        with self.assertRaisesRegex(CheckpointError, "schema_version"):
+            self.verify(directory)
+
     def test_continuation_hook_runs_after_verification(self):
         directory, _, _ = self.write_checkpoint()
         seen = []

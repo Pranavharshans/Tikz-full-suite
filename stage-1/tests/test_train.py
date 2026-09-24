@@ -270,6 +270,19 @@ class CallbackTests(unittest.TestCase):
                     args=None, state=types.SimpleNamespace(global_step=0),
                     control=None)
 
+    def test_save_without_model_or_optimizer_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            accounting = monitor()
+            _, save_callback = self.make_callbacks(Path(directory), accounting)
+            checkpoint_dir = Path(directory) / "checkpoints" / "smoke-1000" / "checkpoint-3"
+            checkpoint_dir.mkdir(parents=True)
+            args = types.SimpleNamespace(
+                output_dir=str(Path(directory) / "checkpoints" / "smoke-1000"),
+                get_warmup_steps=lambda steps: 2)
+            state = types.SimpleNamespace(global_step=3, epoch=0.2, max_steps=10)
+            with self.assertRaisesRegex(DataError, "no model/optimizer"):
+                save_callback.on_save(args=args, state=state, control=None)
+
     def test_checkpoint_meta_records_gate_model_and_committed_tokens(self):
         with tempfile.TemporaryDirectory() as directory:
             accounting = monitor()

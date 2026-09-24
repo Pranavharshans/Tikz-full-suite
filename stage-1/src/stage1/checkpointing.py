@@ -966,7 +966,23 @@ def verify_resume_state(checkpoint_dir, *, torch, model, learning_rate: float,
     # 2. Compare the configured initial LR before the optimizer state is loaded.
     initial_lr = check_saved_initial_lr(saved_scheduler_state, learning_rate)
     resume_plan_path = checkpoint_dir / RESUME_PLAN_FILE
-    resume_plan = read_json(resume_plan_path) if resume_plan_path.is_file() else None
+    resume_plan = None
+    if resume_plan_path.is_file():
+        try:
+            resume_plan = read_json(resume_plan_path)
+        except Exception as exc:
+            raise CheckpointError(
+                f"{resume_plan_path} could not be read "
+                f"({type(exc).__name__}: {exc}); the resume schedule and "
+                "parameter mapping cannot be verified") from exc
+        if not isinstance(resume_plan, dict):
+            raise CheckpointError(
+                f"{resume_plan_path} is not a JSON object; the resume schedule "
+                "and parameter mapping cannot be verified")
+        if resume_plan.get("schema_version") != 1:
+            raise CheckpointError(
+                f"{resume_plan_path} has schema_version="
+                f"{resume_plan.get('schema_version')!r}; expected 1")
     saved_group_names = optimizer_group_names(saved_optimizer_state)
     if resume_plan is None and saved_group_names is not None:
         # Names-aware groups only come from the corrected builder; such a
