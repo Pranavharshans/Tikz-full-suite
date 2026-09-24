@@ -88,6 +88,105 @@ class GateNamespaceTests(unittest.TestCase):
             self.assertEqual(meta["gate"], gate)
 
 
+class _AdapterMask:
+    def __init__(self, ok):
+        self.ok = ok
+
+    def all(self):
+        return self.ok
+
+
+class _AdapterTensor:
+    """Duck-typed tensor for the comparison tests (class-level __eq__)."""
+
+    def __init__(self, value, *, dtype="float32", shape=(2, 4)):
+        self.value = value
+        self.dtype = dtype
+        self.shape = shape
+
+    def __eq__(self, other):
+        return _AdapterMask(self.value == getattr(other, "value", other))
+
+
+class AdapterStateComparisonTests(unittest.TestCase):
+    """Pure tests for the PEFT adapter-state comparison (no torch needed)."""
+
+    def tensor(self, value, *, dtype="float32", shape=(2, 4)):
+        return _AdapterTensor(value, dtype=dtype, shape=shape)
+
+    def saved(self):
+        return {
+            "base_model.model.model.layers.0.q_proj.lora_A.weight":
+                self.tensor(1, shape=(4, 8)),
+            "base_model.model.model.layers.0.q_proj.lora_B.weight":
+                self.tensor(2, shape=(8, 4)),
+        }
+
+    def restored(self):
+        # Same tensors spelled without the PeftModel prefix.
+        return {key.replace("base_model.model.", ""): value
+                for key, value in self.saved().items()}
+
+    def test_matching_states_pass_with_prefix_normalization(self):
+        report = checkpointing.compare_adapter_states(self.saved(),
+                                                      self.restored())
+        self.assertEqual(report["problems"], [])
+        self.assertEqual(report["compared"], 2)
+        self.assertEqual(report["adapter_parameters"], 2)
+
+    def test_base_weight_omissions_are_not_problems(self):
+        # The saved adapter never contains base weights; only adapter keys are
+        # compared, so their absence can never be reported.
+        report = checkpointing.compare_adapter_states(
+            self.saved(), self.restored())
+        self.assertNotIn("base", " ".join(report["problems"]))
+
+    def test_missing_adapter_parameter_is_reported(self):
+        restored = self.restored()
+        restored["model.layers.0.gate_proj.lora_A.weight"] = self.tensor(3)
+        report = checkpointing.compare_adapter_states(self.saved(), restored)
+        self.assertTrue(any("missing from the saved artifact" in item
+                            for item in report["problems"]))
+
+    def test_extra_saved_tensor_is_reported(self):
+        saved = self.saved()
+        saved["base_model.model.model.layers.0.gate_proj.lora_A.weight"] = (
+            self.tensor(3))
+        report = checkpointing.compare_adapter_states(saved, self.restored())
+        self.assertTrue(any("not part of this model's adapter" in item
+                            for item in report["problems"]))
+
+    def test_shape_dtype_and_value_differences_are_reported(self):
+        for change, pattern in (
+                ({"shape": (8, 8)}, "shape mismatch"),
+                ({"dtype": "bfloat16"}, "dtype mismatch"),
+                ({"value": 99}, "values differ")):
+            with self.subTest(pattern=pattern):
+                saved = self.saved()
+                key = "base_model.model.model.layers.0.q_proj.lora_A.weight"
+                saved[key] = self.tensor(change.get("value", 1),
+                                         dtype=change.get("dtype", "float32"),
+                                         shape=change.get("shape", (4, 8)))
+                report = checkpointing.compare_adapter_states(
+                    saved, self.restored())
+                self.assertTrue(any(pattern in item
+                                    for item in report["problems"]),
+                                report["problems"])
+
+    def test_key_normalization(self):
+        self.assertEqual(
+            checkpointing.normalize_adapter_key(
+                "base_model.model.model.layers.0.q_proj.lora_A.weight"),
+            "model.layers.0.q_proj.lora_A.weight")
+        self.assertEqual(
+            checkpointing.normalize_adapter_key(
+                "base_model.model.layers.0.q_proj.lora_A.weight"),
+            "layers.0.q_proj.lora_A.weight")
+        self.assertEqual(
+            checkpointing.normalize_adapter_key("layers.0.q_proj.lora_A.weight"),
+            "layers.0.q_proj.lora_A.weight")
+
+
 class MethodIsolationTests(unittest.TestCase):
     """Full and LoRA artifacts must never share or resume each other."""
 

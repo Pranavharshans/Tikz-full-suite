@@ -1,0 +1,44 @@
+# BF16 LoRA configuration: Qwen/Qwen3.5-4B on an RTX PRO 6000 Blackwell.
+#
+# Identical adapter settings to qwen3.5-4b-lora.yaml; the only difference is
+# the hardware profile. This is LoRA, not QLoRA: the base checkpoint is loaded
+# unquantized in BF16 and adapters are applied through Unsloth's native PEFT
+# integration. The A40 profile stays strict (A40 only, 44 GiB); this config
+# requires an RTX PRO 6000 with at least 60 GiB usable and 60 GiB free disk.
+inherit: common.yaml
+
+model:
+  id: Qwen/Qwen3.5-4B
+  # Resolved from the Hub on 2026-09-23; pin the exact commit, never a branch.
+  revision: 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
+  adapter: qwen3.5
+  loader: unsloth-vision-model
+
+training:
+  method: lora
+  # LoRA uses a larger learning rate than full finetuning.
+  learning_rate: 1.0e-4
+
+lora:
+  rank: 64
+  alpha: 64
+  dropout: 0.0
+  bias: none
+  # Target names are verified against the loaded checkpoint before training;
+  # the preflight reports the matched-module count per target.
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+environment:
+  lock_file: locks/qwen3.5-4b.lock
+  python_version: "3.12"
+
+hardware:
+  # RTX PRO 6000 Blackwell LoRA profile (60 GiB threshold, 60 GiB disk).
+  profile: rtxpro6000-lora

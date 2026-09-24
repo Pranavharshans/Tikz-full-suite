@@ -8,8 +8,10 @@ implementation and differ only by configuration:
 | --- | --- | --- |
 | `configs/qwen3.5-4b-full.yaml` | `Qwen/Qwen3.5-4B` @ `851bf6e8…` | `qwen3.5` (multimodal checkpoint, trained text-only) |
 | `configs/minicpm5-2b-full.yaml` | `openbmb/MiniCPM5-2B` @ `12a3808a…` | `minicpm5` (text-only Llama, the comparison baseline) |
-| `configs/qwen3.5-4b-lora.yaml` | same model, BF16 LoRA | `qwen3.5` |
-| `configs/minicpm5-2b-lora.yaml` | same model, BF16 LoRA | `minicpm5` |
+| `configs/qwen3.5-4b-lora.yaml` | same model, BF16 LoRA (A40 profile) | `qwen3.5` |
+| `configs/minicpm5-2b-lora.yaml` | same model, BF16 LoRA (A40 profile) | `minicpm5` |
+| `configs/qwen3.5-4b-lora-rtx.yaml` | same model, BF16 LoRA (RTX PRO 6000 profile) | `qwen3.5` |
+| `configs/minicpm5-2b-lora-rtx.yaml` | same model, BF16 LoRA (RTX PRO 6000 profile) | `minicpm5` |
 
 Training mode is explicit and first-class:
 
@@ -336,12 +338,18 @@ only, and the dependency-gated integration test exercises a fresh Trainer
 continuing from a native checkpoint).
 
 **Hardware profiles.** `hardware.profile` selects a built-in expectation
-bundle: `rtxpro6000-full` (full-parameter SFT: `RTX PRO 6000`, 88 GiB minimum,
-250 GiB free disk) and `a40-lora` (BF16 LoRA: `A40`, 44 GiB minimum within the
-44–48 GiB range, 60 GiB free disk). Explicit `expected_gpu_name_regex` /
-`min_vram_gib` / `min_free_disk_gib` values override the profile; unknown
-profiles are refused. Full configs keep the RTX PRO 6000 profile; the LoRA
-configs use `a40-lora`.
+bundle:
+
+| Profile | GPU regex | Min VRAM | Min free disk | Used by |
+| --- | --- | --- | --- | --- |
+| `rtxpro6000-full` | `RTX PRO 6000` | 88 GiB | 250 GiB | full-parameter SFT |
+| `rtxpro6000-lora` | `RTX PRO 6000` | 60 GiB | 60 GiB | RTX LoRA configs |
+| `a40-lora` | `\bA40\b` | 44 GiB (strict 44–48) | 60 GiB | A40 LoRA configs |
+
+Explicit `expected_gpu_name_regex` / `min_vram_gib` / `min_free_disk_gib`
+values override the profile; unknown profiles are refused. The A40 profile
+stays strict (it never matches an RTX PRO 6000), and the RTX LoRA profile
+never matches an A40.
 
 **Base-only loading and single attach.** Evaluation, preflight reload and
 merge load the pinned BF16 base through `load_base_model_and_tokenizer`, which
@@ -351,10 +359,15 @@ same rule applies to base-model evaluation: a LoRA config evaluated without a
 checkpoint still loads the base without adapters.
 
 **Adapter restore.** Restoring adapter weights (gate checkpoint verification,
-final-weight restore after verification) goes through PEFT's supported
-adapter-state API, `peft.set_peft_model_state_dict`, followed by a tensor
-read-back against the saved file. Raw `load_state_dict` is used only for full
-artifacts.
+final-weight restore after verification) goes through PEFT's supported adapter
+APIs: `peft.set_peft_model_state_dict` applies the saved tensors, then
+`peft.get_peft_model_state_dict` reads the adapter back using the same
+`adapter_name`, and the normalized adapter tensors are compared (keys, shapes,
+dtypes, values). PEFT's key-prefix spellings are normalized on both sides, and
+setter "missing" keys that are base-model weights are recorded as diagnostics,
+never rejected — only genuine adapter incompatibilities (a missing adapter
+parameter, an extra tensor, or a shape/dtype/value mismatch) fail. Raw
+`load_state_dict` is used only for full artifacts.
 
 **Merge (separate command).** `scripts/merge_adapter.py` is the only way to
 produce a merged model; training never merges automatically. It verifies the

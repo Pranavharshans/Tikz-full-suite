@@ -150,11 +150,31 @@ class AdapterRoundTripTests(unittest.TestCase):
                                                      method="lora")
         self.assertEqual(report["restore_api"],
                          "peft.set_peft_model_state_dict")
+        self.assertEqual(report["readback_api"],
+                         "peft.get_peft_model_state_dict")
         self.assertTrue(report["readback_verified"])
+        # The real PEFT setter reports base weights as "missing" because
+        # adapter files never contain them; that must not fail the restore.
+        self.assertGreater(report["setter_missing_keys"], 0)
+        self.assertEqual(report["adapter_name"], "default")
         with torch.no_grad():
             restored = model(inputs).logits.detach().clone()
         self.assertTrue(torch.allclose(expected, restored, atol=1e-6),
                         f"max diff {(expected - restored).abs().max().item()}")
+
+    def test_production_restore_rejects_a_genuine_adapter_incompatibility(self):
+        """A rank-mismatched adapter is a real incompatibility and must fail."""
+        from peft import LoraConfig, get_peft_model
+
+        small = apply_peft_lora(tiny_llama())
+        adapter_dir = self.root / "adapter-r4"
+        small.save_pretrained(str(adapter_dir))
+        big = get_peft_model(tiny_llama(), LoraConfig(
+            r=8, lora_alpha=8, lora_dropout=0.0, bias="none",
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+            task_type="CAUSAL_LM"))
+        with self.assertRaises(CheckpointError):
+            checkpointing.load_artifact_weights(big, adapter_dir, method="lora")
 
     def test_evaluation_path_loads_base_only_then_attaches_once(self):
         """Production evaluation path: one base load, one adapter attach."""

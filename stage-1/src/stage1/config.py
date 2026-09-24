@@ -297,7 +297,14 @@ HARDWARE_PROFILES = {
         "min_vram_gib": 88.0,
         "min_free_disk_gib": 250.0,
     },
-    # BF16 LoRA on one A40 48GB: adapters need far less VRAM and disk.
+    # BF16 LoRA on one RTX PRO 6000 Blackwell 96GB: adapters need far less
+    # VRAM and disk than full finetuning.
+    "rtxpro6000-lora": {
+        "expected_gpu_name_regex": "RTX PRO 6000",
+        "min_vram_gib": 60.0,
+        "min_free_disk_gib": 60.0,
+    },
+    # BF16 LoRA on one A40 48GB, strictly within the 44-48 GiB range.
     "a40-lora": {
         "expected_gpu_name_regex": r"\bA40\b",
         "min_vram_gib": 44.0,

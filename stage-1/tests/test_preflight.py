@@ -142,6 +142,26 @@ class GpuProfileTests(unittest.TestCase):
         self.assertEqual(outcome["status"], "fail")
         self.assertIn("does not match", outcome["detail"])
 
+    def test_rtx_lora_profile_accepts_an_rtx_pro_6000_at_60_gib(self):
+        outcome = self.run_check("NVIDIA RTX PRO 6000 Blackwell Server Edition",
+                                 96, hardware={"profile": "rtxpro6000-lora"})
+        self.assertEqual(outcome["status"], "pass", outcome["detail"])
+
+    def test_rtx_lora_profile_rejects_an_a40(self):
+        outcome = self.run_check("NVIDIA A40", 48,
+                                 hardware={"profile": "rtxpro6000-lora"})
+        self.assertEqual(outcome["status"], "fail")
+        self.assertIn("does not match", outcome["detail"])
+
+    def test_rtx_lora_profile_threshold_is_sixty_gib(self):
+        outcome = self.run_check("NVIDIA RTX PRO 6000 Blackwell Server Edition",
+                                 60, hardware={"profile": "rtxpro6000-lora"})
+        self.assertEqual(outcome["status"], "pass", outcome["detail"])
+        outcome = self.run_check("NVIDIA RTX PRO 6000 Blackwell Server Edition",
+                                 59, hardware={"profile": "rtxpro6000-lora"})
+        self.assertEqual(outcome["status"], "fail")
+        self.assertIn("60.0", outcome["detail"])
+
     def test_a40_profile_explicit_vram_override(self):
         outcome = self.run_check("NVIDIA A40", 46,
                                  hardware={"profile": "a40-lora",

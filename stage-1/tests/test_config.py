@@ -247,6 +247,21 @@ class HardwareProfileTests(unittest.TestCase):
             __import__("re").search(config.hardware.expected_gpu_name_regex,
                                     "NVIDIA A4000"))
 
+    def test_rtxpro6000_lora_profile_defaults(self):
+        config = support.make_config(hardware={"profile": "rtxpro6000-lora"})
+        self.assertEqual(config.hardware.profile, "rtxpro6000-lora")
+        self.assertEqual(config.hardware.expected_gpu_name_regex,
+                         "RTX PRO 6000")
+        self.assertEqual(config.hardware.min_vram_gib, 60.0)
+        self.assertEqual(config.hardware.min_free_disk_gib, 60.0)
+
+    def test_a40_profile_remains_strict(self):
+        config = support.make_config(hardware={"profile": "a40-lora"})
+        self.assertIsNone(__import__("re").search(
+            config.hardware.expected_gpu_name_regex,
+            "NVIDIA RTX PRO 6000 Blackwell Server Edition"))
+        self.assertEqual(config.hardware.min_vram_gib, 44.0)
+
     def test_explicit_values_override_the_profile(self):
         config = support.make_config(hardware={
             "profile": "a40-lora", "min_vram_gib": 46.0})
@@ -384,6 +399,26 @@ class ShippedConfigTests(unittest.TestCase):
                 config = config_module.load_config(REPO_STAGE1 / "configs" / name)
                 self.assertEqual(config.hardware.profile, "a40-lora")
                 self.assertEqual(config.hardware.min_vram_gib, 44.0)
+
+    @support.requires_yaml
+    def test_shipped_rtx_lora_configs_use_the_rtx_lora_profile(self):
+        expected = {
+            "qwen3.5-4b-lora-rtx.yaml": ("Qwen/Qwen3.5-4B",
+                                         "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"),
+            "minicpm5-2b-lora-rtx.yaml": ("openbmb/MiniCPM5-2B",
+                                          "12a3808a956f869c767195e9266b59c4d21d92e2"),
+        }
+        for name, (model_id, revision) in expected.items():
+            with self.subTest(config=name):
+                config = config_module.load_config(REPO_STAGE1 / "configs" / name)
+                self.assertEqual(config.training.method, "lora")
+                self.assertEqual(config.model.id, model_id)
+                self.assertEqual(config.model.revision, revision)
+                self.assertEqual(config.hardware.profile, "rtxpro6000-lora")
+                self.assertEqual(config.hardware.min_vram_gib, 60.0)
+                self.assertEqual(config.training.effective_batch_size, 16)
+                self.assertEqual(config.lora.rank, 64)
+                self.assertEqual(len(config.lora.target_modules), 7)
 
     @support.requires_yaml
     def test_shipped_full_configs_keep_the_rtx_profile(self):

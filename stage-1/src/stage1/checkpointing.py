@@ -326,17 +326,102 @@ def _tensors_equal(left, right) -> bool:
     return left == right
 
 
+def normalize_adapter_key(key: str) -> str:
+    """PEFT's adapter-key normalization: strip the PeftModel wrapper prefix.
+
+    ``get_peft_model_state_dict`` returns keys relative to the wrapped base
+    model while ``model.state_dict()`` keeps the ``base_model.model.`` prefix;
+    both are valid spellings of the same adapter tensor. Normalizing both sides
+    makes the comparison independent of which spelling a PEFT version emits.
+    """
+    for prefix in ("base_model.model.", "base_model."):
+        if key.startswith(prefix):
+            return key[len(prefix):]
+    return key
+
+
+def _tensor_dtype(value):
+    dtype = getattr(value, "dtype", None)
+    return None if dtype is None else str(dtype)
+
+
+def compare_adapter_states(saved: dict, restored: dict) -> dict:
+    """Compare normalized adapter states and report only genuine mismatches.
+
+    Both mappings are keyed by PEFT's own adapter-state spelling. Base-model
+    weights are absent from both by construction, so their omission can never
+    be reported. Only adapter parameters that are missing from the artifact,
+    tensors that are not part of the model's adapter, or shape/dtype/value
+    differences are problems.
+    """
+    saved_norm = {normalize_adapter_key(key): value for key, value in saved.items()}
+    restored_norm = {normalize_adapter_key(key): value
+                     for key, value in restored.items()}
+    problems = []
+    only_restored = sorted(set(restored_norm) - set(saved_norm))
+    only_saved = sorted(set(saved_norm) - set(restored_norm))
+    for key in only_restored:
+        problems.append(f"{key}: adapter parameter missing from the saved artifact")
+    for key in only_saved:
+        problems.append(f"{key}: saved tensor is not part of this model's adapter")
+    compared = 0
+    for key in sorted(set(saved_norm) & set(restored_norm)):
+        left, right = saved_norm[key], restored_norm[key]
+        left_shape = getattr(left, "shape", None)
+        right_shape = getattr(right, "shape", None)
+        if (left_shape is None) != (right_shape is None):
+            problems.append(
+                f"{key}: shape mismatch saved={left_shape} restored={right_shape}")
+            continue
+        if left_shape is not None and tuple(left_shape) != tuple(right_shape):
+            problems.append(
+                f"{key}: shape mismatch saved={tuple(left_shape)} "
+                f"restored={tuple(right_shape)}")
+            continue
+        left_dtype, right_dtype = _tensor_dtype(left), _tensor_dtype(right)
+        if left_dtype is not None and right_dtype is not None and left_dtype != right_dtype:
+            problems.append(
+                f"{key}: dtype mismatch saved={left_dtype} restored={right_dtype}")
+            continue
+        if not _tensors_equal(left, right):
+            problems.append(f"{key}: values differ after the PEFT restore")
+            continue
+        compared += 1
+    return {
+        "problems": problems,
+        "compared": compared,
+        "adapter_parameters": len(restored_norm),
+        "missing_from_artifact": only_restored,
+        "not_part_of_adapter": only_saved,
+    }
+
+
+def _peft_adapter_apis():
+    try:
+        from peft import get_peft_model_state_dict, set_peft_model_state_dict
+    except ImportError as exc:  # pragma: no cover - environment dependent
+        raise CheckpointError(
+            "peft is required to restore LoRA adapter state through its "
+            "supported API; install the pinned environment from "
+            "environment.lock_file") from exc
+    return set_peft_model_state_dict, get_peft_model_state_dict
+
+
 def load_artifact_weights(model, directory, *, method: str = "full",
-                          loader=None, adapter_state_setter=None) -> dict:
+                          loader=None, adapter_state_setter=None,
+                          adapter_state_getter=None,
+                          adapter_name: str = "default") -> dict:
     """Restore an artifact's weights into the model, exactly and method-aware.
 
     Full artifacts load the complete model state dict. LoRA artifacts are
-    restored through PEFT's supported adapter-state API
-    (``peft.set_peft_model_state_dict``), never a raw ``load_state_dict``:
-    the saved keys must be adapter keys, must cover every adapter parameter of
-    the live model, and the restored tensors are read back and compared to the
-    saved ones. ``loader`` and ``adapter_state_setter`` are injection seams for
-    tests.
+    restored through PEFT's supported adapter-state APIs: the saved tensors are
+    applied with ``set_peft_model_state_dict`` and then read back with
+    ``get_peft_model_state_dict`` using the same ``adapter_name``; the
+    normalized adapter tensors (keys, shapes, dtypes, values) must match.
+    Base-model weight omissions and PEFT key-prefix normalization are expected
+    and are never treated as errors - only genuine adapter incompatibilities
+    fail. ``loader``, ``adapter_state_setter`` and ``adapter_state_getter`` are
+    injection seams for tests.
     """
     if method not in TRAINING_METHODS:
         raise CheckpointError(f"Unknown training method {method!r}")
@@ -366,55 +451,51 @@ def load_artifact_weights(model, directory, *, method: str = "full",
         return {"path": str(directory), "method": method, "tensors": len(saved),
                 "restore_api": "Module.load_state_dict"}
 
-    non_adapter = sorted(key for key in saved if "lora_" not in key)
-    if non_adapter:
+    if not any("lora_" in key for key in saved):
         raise CheckpointError(
-            f"Adapter file in {directory} contains non-adapter tensors "
-            f"({non_adapter[:3]}); refusing to treat it as a LoRA artifact")
-    live = model.state_dict()
-    expected = {key for key in live if "lora_" in key}
-    if not expected:
-        raise CheckpointError(
-            "The live model has no adapter parameters; refusing to restore a "
-            "LoRA artifact into a non-LoRA model")
-    missing = sorted(expected - set(saved))
-    if missing:
-        raise CheckpointError(
-            f"Adapter in {directory} does not cover the model's adapter "
-            f"parameters; missing {len(missing)} key(s), first {missing[0]}")
-    if adapter_state_setter is None:
-        try:
-            from peft import set_peft_model_state_dict as adapter_state_setter
-        except ImportError as exc:  # pragma: no cover - environment dependent
-            raise CheckpointError(
-                "peft is required to restore LoRA adapter state through its "
-                "supported API; install the pinned environment from "
-                "environment.lock_file") from exc
+            f"{directory} contains no adapter tensors; refusing to restore it "
+            "as a LoRA artifact")
+    if adapter_state_setter is None or adapter_state_getter is None:
+        default_setter, default_getter = _peft_adapter_apis()
+        adapter_state_setter = adapter_state_setter or default_setter
+        adapter_state_getter = adapter_state_getter or default_getter
     try:
-        result = adapter_state_setter(model, saved)
+        result = adapter_state_setter(model, saved, adapter_name=adapter_name)
+    except CheckpointError:
+        raise
     except Exception as exc:
         raise CheckpointError(
-            f"PEFT failed to restore the adapter in {directory} "
+            f"PEFT failed to restore the adapter in {directory} with "
+            f"adapter_name={adapter_name!r} "
             f"({type(exc).__name__}: {exc})") from exc
-    missing_keys = list(getattr(result, "missing_keys", []) or [])
-    unexpected_keys = list(getattr(result, "unexpected_keys", []) or [])
-    if missing_keys or unexpected_keys:
+    try:
+        restored = adapter_state_getter(model, adapter_name=adapter_name)
+    except Exception as exc:
         raise CheckpointError(
-            f"PEFT reported an incomplete adapter restore from {directory}: "
-            f"missing={missing_keys[:3]}, unexpected={unexpected_keys[:3]}")
-    restored = model.state_dict()
-    mismatched = [key for key in saved if not _tensors_equal(restored.get(key),
-                                                             saved[key])]
-    if mismatched:
+            f"PEFT could not read the adapter state back from {directory} with "
+            f"adapter_name={adapter_name!r} "
+            f"({type(exc).__name__}: {exc})") from exc
+    comparison = compare_adapter_states(saved, restored)
+    if comparison["problems"]:
+        detail = "\n".join(f"  - {line}" for line in comparison["problems"][:10])
         raise CheckpointError(
-            f"Adapter read-back in {directory} does not match the saved "
-            f"tensors; first mismatch {mismatched[0]}")
+            f"Adapter in {directory} is incompatible with this model:\n{detail}")
+    # The setter's missing keys cover base-model weights that adapter files
+    # never contain; they are recorded for diagnostics, never rejected.
+    setter_missing = list(getattr(result, "missing_keys", []) or [])
+    setter_unexpected = list(getattr(result, "unexpected_keys", []) or [])
     return {
         "path": str(directory),
         "method": method,
         "tensors": len(saved),
+        "adapter_name": adapter_name,
         "restore_api": "peft.set_peft_model_state_dict",
+        "readback_api": "peft.get_peft_model_state_dict",
         "readback_verified": True,
+        "compared_tensors": comparison["compared"],
+        "adapter_parameters": comparison["adapter_parameters"],
+        "setter_missing_keys": len(setter_missing),
+        "setter_unexpected_keys": len(setter_unexpected),
     }
 
 
