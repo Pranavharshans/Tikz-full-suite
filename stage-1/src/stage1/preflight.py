@@ -56,6 +56,17 @@ def _skip(detail: str, **data) -> dict:
     return {"status": "skip", "detail": detail, "data": data}
 
 
+def _forward_no_cache(model, batch):
+    """Direct loss forwards must not enter generation-cache code paths.
+
+    The Trainer disables the KV cache when gradient checkpointing is active.
+    Mirror that behavior in standalone preflight/reload forwards as well;
+    some Unsloth-patched model families expose generation helpers as callables
+    that are valid for generation but not iterable cache objects in eval mode.
+    """
+    return model(**batch, use_cache=False)
+
+
 @dataclass
 class PreflightContext:
     config: object
@@ -418,7 +429,7 @@ def check_one_step(ctx: PreflightContext) -> dict:
     model.train()
     started = time.monotonic()
     try:
-        outputs = model(**batch)
+        outputs = _forward_no_cache(model, batch)
         loss = outputs.loss
         if loss is None or not torch.isfinite(loss):
             return _fail(f"loss is not finite: {loss}")
@@ -447,7 +458,7 @@ def check_one_step(ctx: PreflightContext) -> dict:
     model.eval()
     try:
         with torch.no_grad():
-            eval_outputs = model(**batch)
+            eval_outputs = _forward_no_cache(model, batch)
         eval_loss = float(eval_outputs.loss)
         logits_shape = tuple(eval_outputs.logits.shape)
     except Exception as exc:
@@ -470,7 +481,8 @@ def check_one_step(ctx: PreflightContext) -> dict:
         peak_vram_bytes=peak_vram, supervised_tokens=plan.supervised_tokens)
 
 
-def check_weight_serialization(ctx: PreflightContext) -> dict:
+def check_weight_serialization(ctx: PreflightContext, *,
+                               adapter_state_getter=None) -> dict:
     """Weight serialization only: save, read back, compare sampled tensors.
 
     This deliberately does not claim that the model can be reloaded or resumed;
@@ -493,10 +505,40 @@ def check_weight_serialization(ctx: PreflightContext) -> dict:
         loaded = {}
         for path in weight_files:
             loaded.update(load_file(str(path)))
-        state = ctx.model.state_dict()
         keys = sorted(loaded)
         if not keys:
             return _fail("saved checkpoint contains no tensors")
+        method = ctx.config.training.method
+        if method == "lora":
+            if adapter_state_getter is None:
+                try:
+                    from peft import get_peft_model_state_dict
+                except ImportError:
+                    return _fail("peft is not importable")
+                adapter_state_getter = get_peft_model_state_dict
+            from .checkpointing import compare_adapter_states
+            try:
+                live_adapter = adapter_state_getter(ctx.model)
+            except Exception as exc:
+                return _fail(
+                    "PEFT could not read the live adapter state: "
+                    f"{type(exc).__name__}: {exc}")
+            comparison = compare_adapter_states(loaded, live_adapter)
+            if comparison["problems"]:
+                return _fail(
+                    "adapter serialization failed:\n" + "\n".join(
+                        f"  - {line}" for line in comparison["problems"]))
+            return _pass(
+                f"saved {len(weight_files)} adapter weight file(s), compared "
+                f"all {comparison['compared']} PEFT tensors, read-back matches "
+                "(serialization only)",
+                weight_files=len(weight_files),
+                sampled=comparison["compared"],
+                adapter_tensors=comparison["adapter_parameters"],
+                bytes_on_disk=sum(path.stat().st_size for path in weight_files),
+                reload_verified=False)
+
+        state = ctx.model.state_dict()
         sample = keys[:2] + keys[len(keys) // 2:len(keys) // 2 + 2] + keys[-2:]
         mismatches = []
         for key in sample:
@@ -592,7 +634,7 @@ def check_model_reload(ctx: PreflightContext, *, base_loader=None,
         model.eval()
         try:
             with torch.no_grad():
-                outputs = model(**batch)
+                outputs = _forward_no_cache(model, batch)
         except Exception as exc:
             return _fail(
                 f"forward pass on the reloaded model failed: "
@@ -669,7 +711,7 @@ def check_trainer_resume(ctx: PreflightContext) -> dict:
                                          device=device),
         }
         model.train()
-        outputs = model(**batch)
+        outputs = _forward_no_cache(model, batch)
         if outputs.loss is None or not torch.isfinite(outputs.loss):
             return _fail(f"loss is not finite before the resume check: {outputs.loss}")
         outputs.loss.backward()
@@ -736,7 +778,7 @@ def check_trainer_resume(ctx: PreflightContext) -> dict:
 
         model.eval()
         with torch.no_grad():
-            restored_outputs = model(**batch)
+            restored_outputs = _forward_no_cache(model, batch)
         restored_loss = float(restored_outputs.loss)
         if restored_loss != restored_loss or restored_loss == float("inf"):
             return _fail(f"loss after restore is not finite: {restored_loss}")

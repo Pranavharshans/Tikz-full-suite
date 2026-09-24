@@ -306,7 +306,7 @@ def _eval_forward_loss(model, batch_plan, torch, device="cuda"):
     }
     model.eval()
     with torch.no_grad():
-        outputs = model(**batch)
+        outputs = model(**batch, use_cache=False)
     loss = float(outputs.loss)
     if not math.isfinite(loss):
         raise DataError(f"Forward pass produced a non-finite loss: {loss}")

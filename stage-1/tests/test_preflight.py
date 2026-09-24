@@ -5,6 +5,7 @@ import types
 import unittest
 from pathlib import Path
 from unittest import mock
+import sys
 
 from tests import support
 
@@ -190,6 +191,53 @@ class GpuProfileTests(unittest.TestCase):
 
 
 class IndividualCheckTests(unittest.TestCase):
+    def test_direct_forward_explicitly_disables_kv_cache(self):
+        calls = []
+
+        class Model:
+            def __call__(self, **kwargs):
+                calls.append(kwargs)
+                return "output"
+
+        result = preflight._forward_no_cache(Model(), {"input_ids": [1]})
+        self.assertEqual(result, "output")
+        self.assertFalse(calls[0]["use_cache"])
+
+    def test_lora_serialization_uses_peft_state_not_raw_model_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            class Model:
+                def save_pretrained(self, path, safe_serialization=True):
+                    Path(path, "adapter_model.safetensors").write_bytes(b"fake")
+
+                def state_dict(self):
+                    raise AssertionError("raw state_dict must not verify LoRA")
+
+            saved = {"base_model.model.layer.lora_A.weight": [1, 2]}
+            live = {"base_model.model.layer.lora_A.weight": [1, 2]}
+            getter_calls = []
+            package = types.ModuleType("safetensors")
+            package.__path__ = []
+            torch_module = types.ModuleType("safetensors.torch")
+            torch_module.load_file = lambda path: saved
+            ctx = context(directory)
+            ctx.model = Model()
+            ctx.config.training.method = "lora"
+            ctx.torch = types.SimpleNamespace()
+
+            def getter(model):
+                getter_calls.append(model)
+                return live
+
+            with mock.patch.dict(sys.modules, {
+                    "safetensors": package,
+                    "safetensors.torch": torch_module}):
+                outcome = preflight.check_weight_serialization(
+                    ctx, adapter_state_getter=getter)
+
+            self.assertEqual(outcome["status"], "pass")
+            self.assertEqual(getter_calls, [ctx.model])
+            self.assertEqual(outcome["data"]["adapter_tensors"], 1)
+
     def test_python_version_check(self):
         import sys
         from unittest import mock
