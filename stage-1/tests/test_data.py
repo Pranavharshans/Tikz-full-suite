@@ -163,6 +163,14 @@ class VerifyExportTests(unittest.TestCase):
         with self.assertRaisesRegex(DataError, "run_id"):
             data_module.verify_export(self.export["root"])
 
+    def test_manifest_provenance_disagreement_is_detected(self):
+        provenance_path = self.export["root"] / "run-metadata.json"
+        provenance = json.loads(provenance_path.read_text())
+        provenance["manifest"]["manifest_sha256"] = "0" * 64
+        provenance_path.write_text(json.dumps(provenance))
+        with self.assertRaisesRegex(DataError, "manifest metadata"):
+            data_module.verify_export(self.export["root"])
+
     def test_iter_rows_enforces_order_and_projections(self):
         info = data_module.verify_export(self.export["root"], quick=True)
         logical = list(data_module.iter_rows(info, columns="logical"))

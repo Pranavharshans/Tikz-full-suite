@@ -195,11 +195,21 @@ def verify_export(export_dir, *, require_complete: bool = True,
             raise DataError(
                 f"export.meta.json disagrees with run-metadata.json on {key}: "
                 f"{meta.get(key)!r} vs {embedded.get(key)!r}")
-    for key in ("run_id", "identity_sha256", "manifest_sha256"):
+    # The cleaning run record identifies the generation run, but the manifest
+    # checksum belongs to the separately embedded manifest metadata.  The
+    # production exporter intentionally does not copy manifest_sha256 into
+    # ``run`` (see cleaning.build_dataset.build_run_record).
+    for key in ("run_id", "identity_sha256"):
         if run_record.get(key) != meta.get(key):
             raise DataError(
                 f"export.meta.json disagrees with the run record on {key}: "
                 f"{meta.get(key)!r} vs {run_record.get(key)!r}")
+    manifest_record = provenance.get("manifest") or {}
+    if manifest_record.get("manifest_sha256") != meta.get("manifest_sha256"):
+        raise DataError(
+            "export.meta.json disagrees with the manifest metadata on "
+            f"manifest_sha256: {meta.get('manifest_sha256')!r} vs "
+            f"{manifest_record.get('manifest_sha256')!r}")
 
     shard_records = checksums.get("shards")
     if not isinstance(shard_records, list) or not shard_records:

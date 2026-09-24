@@ -412,7 +412,6 @@ def make_export(root, rows=None, *, shard_size: int = 2,
         "schema_version": "run-v1",
         "run_id": run_id,
         "identity_sha256": identity_sha256,
-        "manifest_sha256": manifest_sha256,
         "identity": {
             "dataset": {"dataset_id": source_dataset, "revision": source_revision,
                         "split": "train", "row_start": 0, "row_limit": 100000},
