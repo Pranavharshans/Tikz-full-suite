@@ -12,7 +12,7 @@ bitsandbytes==0.50.2
 unsloth==2026.9.11
 unsloth_zoo==2026.9.7
 huggingface_hub==1.32.0
-tokenizers==0.23.0
+tokenizers==0.22.2
 safetensors==0.8.0
 sentencepiece==0.2.2
 numpy==2.5.3
