@@ -35,7 +35,9 @@ Why these versions:
 - `openbmb/MiniCPM5-2B` is `LlamaForCausalLM`. Upstream documents
   `transformers>=5.6,<6` as the primary path and `transformers==4.57.3` as the
   fallback. The MiniCPM lock uses that fallback because it is inside
-  Unsloth's supported range and avoids Transformers-v5 weight conversion.
+  Unsloth's supported range and avoids Transformers-v5 weight conversion. It
+  pins `huggingface_hub==0.36.0` to satisfy Transformers 4.57.3's `<1.0`
+  requirement.
 - Stage 1 does not support sequence packing, so no varlen attention backend is
   required and `flash-attn` is not pinned. The preflight still records which
   attention backends are importable.
