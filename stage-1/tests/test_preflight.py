@@ -330,6 +330,39 @@ class IndividualCheckTests(unittest.TestCase):
             self.assertEqual(outcome["status"], "fail")
             self.assertIn("model", outcome["detail"])
 
+    def test_one_step_refuses_incomplete_gradient_checkpointing(self):
+        class Module:
+            gradient_checkpointing = True
+
+        class Model:
+            def named_modules(self):
+                yield "model.layers.0", Module()
+
+        ctx = context()
+        ctx.torch = types.SimpleNamespace()
+        ctx.model = Model()
+        ctx.tokenizer = types.SimpleNamespace()
+        outcome = preflight.check_one_step(ctx)
+        self.assertEqual(outcome["status"], "fail")
+        self.assertIn("_gradient_checkpointing_func", outcome["detail"])
+        self.assertIn("model.layers.0", outcome["detail"])
+
+    def test_trainer_resume_refuses_incomplete_gradient_checkpointing(self):
+        class Module:
+            gradient_checkpointing = True
+
+        class Model:
+            def named_modules(self):
+                yield "model.layers.0", Module()
+
+        ctx = context(batch_plan=object())
+        ctx.torch = types.SimpleNamespace()
+        ctx.model = Model()
+        outcome = preflight.check_trainer_resume(ctx)
+        self.assertEqual(outcome["status"], "fail")
+        self.assertIn("_gradient_checkpointing_func", outcome["detail"])
+        self.assertIn("trainer resume training forward", outcome["detail"])
+
     def test_checkpoint_checks_are_truthfully_named(self):
         names = [name for name, _, _ in preflight.CHECK_SPECS]
         self.assertIn("checkpoint.weight_serialization", names)

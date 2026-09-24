@@ -339,6 +339,22 @@ scheduler objects for resume (the preflight's state check is verification
 only, and the dependency-gated integration test exercises a fresh Trainer
 continuing from a native checkpoint).
 
+**Training-state restore on adapter reload.** A saved adapter attached to a
+fresh base carries no training-mode state; Unsloth's `for_training` only flips
+the `gradient_checkpointing` flags, while Transformers dispatches to each
+decoder layer's `_gradient_checkpointing_func`. `prepare_model_for_training`
+therefore restores the full lifecycle before any training forward:
+`patch_peft_model` (the same call Unsloth's own adapter reload and
+`get_peft_model` make), then `for_training` with the configured checkpointing
+mode, then the exact `gradient_checkpointing_enable(use_reentrant=...)` call
+`Trainer._inner_training_loop` makes, and `enable_input_require_grads` when the
+loader did not register it. It refuses to return a model that reports
+`gradient_checkpointing` without a callable `_gradient_checkpointing_func`, and
+the preflight one-step/reload/resume checks and the production training start
+run the same diagnostic before the first forward, so an incomplete state is a
+clear failure with the missing module names instead of a decoder
+`AttributeError`.
+
 **Hardware profiles.** `hardware.profile` selects a built-in expectation
 bundle:
 

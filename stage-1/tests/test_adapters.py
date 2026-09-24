@@ -193,22 +193,14 @@ class BaseOnlyLoaderTests(unittest.TestCase):
         self.assertEqual(tokenizer.pad_token, "<unused_token_477>")
         self.assertEqual(tokenizer.name_or_path, self.config.model.id)
 
-    def test_training_patches_can_be_applied_after_adapter_attachment(self):
-        calls = []
-        model = FakeModel(with_adapter=True)
-
-        class Loader:
-            @staticmethod
-            def for_training(value):
-                calls.append(value)
-                return value
-
-        unsloth = types.ModuleType("unsloth")
-        unsloth.FastLanguageModel = Loader
-        with mock.patch.dict(sys.modules, {"unsloth": unsloth}):
-            result = adapters.prepare_model_for_training(model, self.config)
-        self.assertIs(result, model)
-        self.assertEqual(calls, [model])
+    def test_lora_loader_honors_gradient_checkpointing_false(self):
+        loader, modules = fake_modules()
+        config = support.make_config(
+            training={"method": "lora", "gradient_checkpointing": False}, lora={})
+        with mock.patch.dict(sys.modules, modules):
+            adapters.load_model_and_tokenizer(config)
+        call = loader.FastLanguageModel.peft_calls[0]
+        self.assertIs(call["use_gradient_checkpointing"], False)
 
     def test_base_loader_reports_missing_targets_before_adapting(self):
         loader, modules = fake_modules()
@@ -249,6 +241,189 @@ class BaseOnlyLoaderTests(unittest.TestCase):
                     FakeModel(), directory, is_trainable=True)
         self.assertEqual(attached, "attached")
         self.assertEqual(calls[0][2], {"is_trainable": True})
+
+
+class CheckpointingModule:
+    """Tiny gradient-checkpointing module stand-in."""
+
+    def __init__(self, *, with_function=True):
+        self.gradient_checkpointing = False
+        if with_function:
+            self._gradient_checkpointing_func = lambda *args, **kwargs: None
+
+
+class TrainingLifecycleTests(unittest.TestCase):
+    """The reloaded-adapter training lifecycle: Unsloth patch, for_training,
+    gradient_checkpointing_enable, and a hard pre-forward diagnostic.
+
+    These are the dependency-free twins of the real-PEFT and GPU/Unsloth
+    regressions; they prove the call order and the refusal, not the kernels.
+    """
+
+    def setUp(self):
+        self.config = support.make_config(training={"method": "lora"}, lora={})
+
+    def fake_loader(self, calls, modules):
+        class Loader:
+            @staticmethod
+            def patch_peft_model(model, use_gradient_checkpointing="unsloth"):
+                calls.append(("patch_peft_model", use_gradient_checkpointing))
+                for module in modules:
+                    module.gradient_checkpointing = True
+                    module._gradient_checkpointing_func = lambda *a, **k: None
+                return model
+
+            @staticmethod
+            def for_training(model, use_gradient_checkpointing=True):
+                calls.append(("for_training", use_gradient_checkpointing))
+                for module in modules:
+                    module.gradient_checkpointing = use_gradient_checkpointing
+                return model
+
+        return Loader
+
+    def test_reload_restores_the_full_training_lifecycle_in_order(self):
+        calls = []
+        modules = [CheckpointingModule() for _ in range(2)]
+        Loader = self.fake_loader(calls, modules)
+
+        class Model:
+            peft_config = {"default": object()}
+            _require_grads_hook = None
+            # Unsloth marks every model it loads; patch_peft_model relies on it.
+            max_seq_length = 256
+
+            def named_modules(self):
+                yield "model.layers.0", modules[0]
+                yield "model.layers.1", modules[1]
+
+            def gradient_checkpointing_enable(
+                    self, gradient_checkpointing_kwargs=None):
+                calls.append(("gradient_checkpointing_enable",
+                              dict(gradient_checkpointing_kwargs)))
+                for module in modules:
+                    module.gradient_checkpointing = True
+                    module._gradient_checkpointing_func = lambda *a, **k: None
+
+            def enable_input_require_grads(self):
+                calls.append(("enable_input_require_grads",))
+                self._require_grads_hook = object()
+
+        model = Model()
+        report = {}
+        prepared = adapters.prepare_model_for_training(
+            model, self.config, loader=Loader, report=report)
+        self.assertIs(prepared, model)
+        self.assertEqual(
+            [call[0] for call in calls],
+            ["patch_peft_model", "for_training",
+             "gradient_checkpointing_enable", "enable_input_require_grads"])
+        self.assertEqual(calls[0][1], "unsloth")
+        self.assertIs(calls[1][1], True)
+        self.assertEqual(calls[2][1], {"use_reentrant": False})
+        self.assertEqual(report["training_state"]["peft_training_state_api"],
+                         "FastLanguageModel.patch_peft_model")
+        self.assertEqual(
+            report["training_state"]["modules_with_gradient_checkpointing"], 2)
+        self.assertEqual(
+            report["training_state"]["modules_missing_checkpoint_function"], 0)
+
+    def test_gradient_checkpointing_false_is_passed_through(self):
+        config = support.make_config(
+            training={"method": "lora", "gradient_checkpointing": False}, lora={})
+        calls = []
+        modules = [CheckpointingModule()]
+
+        class Loader:
+            @staticmethod
+            def for_training(model, use_gradient_checkpointing=True):
+                calls.append(("for_training", use_gradient_checkpointing))
+                for module in modules:
+                    module.gradient_checkpointing = use_gradient_checkpointing
+                return model
+
+        model = FakeModel(with_adapter=True)
+        model.peft_config = {"default": object()}
+        model.named_modules = lambda: iter([("model.layers.0", modules[0])])
+        # No gradient_checkpointing_enable must be required when it is disabled.
+        adapters.prepare_model_for_training(model, config, loader=Loader)
+        self.assertEqual([call[0] for call in calls], ["for_training"])
+        self.assertIs(calls[0][1], False)
+
+    def test_plain_model_skips_patch_peft_model_but_restores_checkpointing(self):
+        calls = []
+        modules = [CheckpointingModule()]
+
+        class Loader:
+            @staticmethod
+            def patch_peft_model(model, use_gradient_checkpointing="unsloth"):
+                calls.append("patch_peft_model")
+                return model
+
+            @staticmethod
+            def for_training(model, use_gradient_checkpointing=True):
+                calls.append("for_training")
+                for module in modules:
+                    module.gradient_checkpointing = use_gradient_checkpointing
+                return model
+
+        class Model:
+            peft_config = {"default": object()}
+            _require_grads_hook = None
+
+            def named_modules(self):
+                yield "model.layers.0", modules[0]
+
+            def gradient_checkpointing_enable(
+                    self, gradient_checkpointing_kwargs=None):
+                calls.append("gradient_checkpointing_enable")
+                modules[0]._gradient_checkpointing_func = lambda *a, **k: None
+
+            def enable_input_require_grads(self):
+                self._require_grads_hook = object()
+
+        report = {}
+        adapters.prepare_model_for_training(
+            Model(), self.config, loader=Loader, report=report)
+        self.assertEqual(
+            calls, ["for_training", "gradient_checkpointing_enable"])
+        self.assertIsNone(report["training_state"]["peft_training_state_api"])
+        self.assertIn("not loaded through the Unsloth Fast* loader",
+                      report["training_state"]["peft_training_state_skipped"][0])
+
+    def test_incomplete_checkpointing_state_is_refused_before_a_forward(self):
+        module = CheckpointingModule(with_function=False)
+        module.gradient_checkpointing = True
+
+        class Model:
+            def named_modules(self):
+                yield "model.layers.0", module
+
+        with self.assertRaisesRegex(DataError, "_gradient_checkpointing_func"):
+            adapters.require_gradient_checkpointing_ready(
+                Model(), context="the test training forward")
+
+    def test_no_checkpointing_module_is_refused(self):
+        class Model:
+            def named_modules(self):
+                yield "model.layers.0", object()
+
+        with self.assertRaisesRegex(DataError, "no module reports"):
+            adapters.require_gradient_checkpointing_ready(
+                Model(), context="the test training forward")
+
+    def test_diagnostic_accepts_a_complete_state(self):
+        module = CheckpointingModule()
+        module.gradient_checkpointing = True
+
+        class Model:
+            def named_modules(self):
+                yield "model.layers.0", module
+
+        state = adapters.require_gradient_checkpointing_ready(
+            Model(), context="the test training forward")
+        self.assertEqual(state["modules_with_gradient_checkpointing"], 1)
+        self.assertEqual(state["modules_missing_checkpoint_function"], 0)
 
 
 class EvaluationBaseBranchTests(unittest.TestCase):

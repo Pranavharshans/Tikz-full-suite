@@ -18,6 +18,7 @@ Everything here is skipped where the dependencies are missing; the run report
 states that the LoRA GPU/resume gates remain unverified in such environments.
 """
 import importlib.util
+import math
 import tempfile
 import unittest
 from pathlib import Path
@@ -330,6 +331,104 @@ class AdapterRoundTripTests(unittest.TestCase):
                 directory, identity_sha256="a" * 64, gate="smoke-1000",
                 method="full", model_id="test/TinyLlama",
                 model_revision="b" * 40, adapter="minicpm5")
+
+
+class _FlagOnlyForTraining:
+    """Unsloth ``for_training`` without its checkpointing restore.
+
+    This is exactly the state the failed resume path produced: the flags are
+    set, but no ``_gradient_checkpointing_func`` is installed.
+    """
+
+    @staticmethod
+    def for_training(model, use_gradient_checkpointing=True):
+        for module in model.modules():
+            if hasattr(module, "gradient_checkpointing"):
+                module.gradient_checkpointing = bool(use_gradient_checkpointing)
+        model.train()
+        return model
+
+
+@support.requires_transformers
+@support.requires_torch
+@requires_peft
+class ReloadTrainingStateTests(unittest.TestCase):
+    """The reloaded-adapter training lifecycle on real PEFT/Transformers.
+
+    ``Unsloth``'s ``for_training`` only flips ``gradient_checkpointing`` flags.
+    Transformers then calls ``self._gradient_checkpointing_func`` on every
+    checkpointing decoder layer, so a flag-only reload fails inside the decoder
+    with a bare AttributeError. These tests reproduce that state with the real
+    libraries and prove that the production preparation makes the training
+    forward/backward work again.
+    """
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.config = support.make_config(
+            training={"method": "lora", "learning_rate": 1e-4}, lora={})
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def reload_adapter(self):
+        base = tiny_llama()
+        base_state = state_copy(base)
+        reference = apply_peft_lora(base)
+        adapter_dir = self.root / "adapter"
+        reference.save_pretrained(str(adapter_dir))
+        fresh = tiny_llama()
+        fresh.load_state_dict(base_state, strict=False)
+        attached = adapters.attach_lora_adapter(
+            fresh, adapter_dir, is_trainable=True)
+        return attached
+
+    def batch(self):
+        import torch
+        return {
+            "input_ids": torch.tensor([[1, 2, 3, 4]]),
+            "labels": torch.tensor([[1, 2, 3, 4]]),
+        }
+
+    def test_flag_only_reload_fails_a_training_forward_in_the_decoder(self):
+        model = self.reload_adapter()
+        _FlagOnlyForTraining.for_training(model)
+        model.train()
+        with self.assertRaises(AttributeError) as caught:
+            model(**self.batch())
+        self.assertIn("_gradient_checkpointing_func", str(caught.exception))
+
+    def test_prepare_restores_a_complete_state_and_the_training_step(self):
+        model = self.reload_adapter()
+        state_before = adapters.gradient_checkpointing_state(model)
+        self.assertGreater(state_before["modules_with_gradient_checkpointing"], 0)
+        self.assertGreater(state_before["modules_missing_checkpoint_function"], 0)
+        with self.assertRaisesRegex(DataError, "_gradient_checkpointing_func"):
+            adapters.require_gradient_checkpointing_ready(
+                model, context="the test training forward")
+
+        prepared = adapters.prepare_model_for_training(
+            model, self.config, loader=_FlagOnlyForTraining)
+        state_after = adapters.require_gradient_checkpointing_ready(
+            prepared, context="the test training forward")
+        self.assertGreater(state_after["modules_with_gradient_checkpointing"], 0)
+        self.assertEqual(state_after["modules_missing_checkpoint_function"], 0)
+
+        prepared.train()
+        outputs = prepared(**self.batch())
+        loss = float(outputs.loss)
+        self.assertTrue(math.isfinite(loss))
+        outputs.loss.backward()
+        adapter_grads = [
+            parameter.grad for name, parameter in prepared.named_parameters()
+            if "lora_" in name and parameter.grad is not None]
+        self.assertTrue(adapter_grads)
+        self.assertTrue(any(float(grad.abs().sum()) > 0 for grad in adapter_grads))
+        # Base weights stay frozen.
+        report = adapters.verify_lora_trainables(
+            prepared.named_parameters(), self.config.lora)
+        self.assertEqual(report["base_parameters_trainable"], 0)
 
 
 @support.requires_transformers

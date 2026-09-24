@@ -461,6 +461,7 @@ def load_model_and_tokenizer(config, *, local_files_only: bool = False,
 
     training_patch_stage = None
     for_training_applied = False
+    for_training_gradient_checkpointing = None
     if for_training:
         for_training_fn = getattr(Loader, "for_training", None)
         if for_training_fn is None:
@@ -468,8 +469,13 @@ def load_model_and_tokenizer(config, *, local_files_only: bool = False,
                 f"Unsloth {loader_name}.for_training is not available in the "
                 "installed unsloth; refusing to start training without the "
                 "training-time patches")
-        model = for_training_fn(model)
+        requested_training = {
+            "use_gradient_checkpointing": bool(config.training.gradient_checkpointing)}
+        accepted_training, _ = _split_kwargs(for_training_fn, requested_training)
+        model = for_training_fn(model, **accepted_training)
         for_training_applied = True
+        for_training_gradient_checkpointing = accepted_training.get(
+            "use_gradient_checkpointing")
         training_patch_stage = "after_adapter" if method == "lora" else "base_model"
 
     for_inference_applied = False
@@ -486,6 +492,7 @@ def load_model_and_tokenizer(config, *, local_files_only: bool = False,
     report.update(_parameter_summary(model))
     report["for_training_applied"] = for_training_applied
     report["for_training_patch_stage"] = training_patch_stage
+    report["for_training_gradient_checkpointing"] = for_training_gradient_checkpointing
     report["for_inference_applied"] = for_inference_applied
     return model, tokenizer, report
 
@@ -506,21 +513,21 @@ def _apply_lora(model, Loader, config, report):
         "bias": lora.bias,
         "target_modules": list(lora.target_modules),
         "random_state": config.seed,
+        # Configuration is the authority for gradient checkpointing. The mode
+        # is always explicit so a fresh adapter and a reloaded adapter are
+        # prepared with the same one; Unsloth would otherwise default to
+        # "unsloth" even when training.gradient_checkpointing is false.
+        "use_gradient_checkpointing": (
+            "unsloth" if config.training.gradient_checkpointing else False),
     }
-    if config.training.gradient_checkpointing:
-        requested["use_gradient_checkpointing"] = "unsloth"
     accepted, rejected = _split_kwargs(get_peft_model, requested)
-    required = {"r", "lora_alpha", "lora_dropout", "bias", "target_modules"}
+    required = {"r", "lora_alpha", "lora_dropout", "bias", "target_modules",
+                "use_gradient_checkpointing"}
     missing = sorted(required - set(accepted))
     if missing:
         raise DataError(
             f"Unsloth {report['loader']}.get_peft_model does not accept "
             f"{missing}; refusing to attach a partially configured adapter")
-    if config.training.gradient_checkpointing and "use_gradient_checkpointing" not in accepted:
-        raise DataError(
-            f"Unsloth {report['loader']}.get_peft_model does not accept "
-            "use_gradient_checkpointing but training.gradient_checkpointing is "
-            "true; refusing to train without gradient checkpointing")
     try:
         model = get_peft_model(model, **accepted)
     except Exception as exc:
@@ -583,20 +590,174 @@ def attach_lora_adapter(model, adapter_dir, *, is_trainable: bool = False):
             f"({type(exc).__name__}: {exc})") from exc
 
 
-def prepare_model_for_training(model, config):
-    """Apply Unsloth training patches after the final adapter is attached."""
+def _unsloth_training_loader(config, loader=None, loader_name=None):
+    """Resolve the Unsloth Fast* loader that owns the training-mode patches."""
+    vision = config.model.loader == "unsloth-vision-model"
+    if loader is not None:
+        return loader, loader_name or (
+            "FastVisionModel" if vision else "FastLanguageModel")
     try:
         import unsloth
-        if config.model.loader == "unsloth-vision-model":
-            Loader = unsloth.FastVisionModel
+    except ImportError as exc:  # pragma: no cover - environment dependent
+        raise DataError(
+            "unsloth is required to restore the training lifecycle after "
+            "attaching a saved adapter; install the pinned environment from "
+            "environment.lock_file") from exc
+    name = "FastVisionModel" if vision else "FastLanguageModel"
+    resolved = getattr(unsloth, name, None)
+    if resolved is None:
+        raise DataError(
+            f"unsloth {getattr(unsloth, '__version__', 'unknown')} has no "
+            f"{name}; cannot restore the training lifecycle after attaching a "
+            "saved adapter")
+    return resolved, loader_name or name
+
+
+def gradient_checkpointing_state(model) -> dict:
+    """Report modules that will gradient-checkpoint and their checkpoint funcs.
+
+    Transformers' ``GradientCheckpointingLayer.__call__`` dispatches to
+    ``self._gradient_checkpointing_func`` whenever the module is training with
+    ``gradient_checkpointing`` enabled, so every module with the flag must own
+    a callable. The report is duck-typed: it needs only ``named_modules`` and
+    ``getattr``.
+    """
+    enabled = []
+    missing = []
+    for name, module in model.named_modules():
+        if not getattr(module, "gradient_checkpointing", False):
+            continue
+        label = name or type(module).__name__
+        enabled.append(label)
+        if not callable(getattr(module, "_gradient_checkpointing_func", None)):
+            missing.append(label)
+    return {
+        "modules_with_gradient_checkpointing": len(enabled),
+        "modules_missing_checkpoint_function": len(missing),
+        "missing_sample": missing[:5],
+    }
+
+
+def require_gradient_checkpointing_ready(model, *, context: str) -> dict:
+    """Refuse a training forward whose gradient-checkpointing state is incomplete.
+
+    A model left with the ``gradient_checkpointing`` flag but without
+    ``_gradient_checkpointing_func`` fails later inside the decoder with a bare
+    ``AttributeError: 'LlamaDecoderLayer' object has no attribute
+    '_gradient_checkpointing_func'``. This diagnostic reports the same state at
+    the call boundary, with the missing module names, before the forward runs.
+    """
+    state = gradient_checkpointing_state(model)
+    if state["modules_missing_checkpoint_function"]:
+        raise DataError(
+            "Gradient checkpointing is enabled on "
+            f"{state['modules_with_gradient_checkpointing']} module(s) but "
+            f"{state['modules_missing_checkpoint_function']} have no callable "
+            f"_gradient_checkpointing_func (first: {state['missing_sample']}); "
+            f"the model state is incomplete before {context}. Restore it "
+            "through prepare_model_for_training after attaching the saved "
+            "adapter instead of disabling checkpointing.")
+    if state["modules_with_gradient_checkpointing"] == 0:
+        raise DataError(
+            "training.gradient_checkpointing is true but no module reports "
+            f"gradient_checkpointing before {context}; the checkpointing state "
+            "was not restored. Refusing to train without the configured "
+            "gradient checkpointing.")
+    return state
+
+
+def prepare_model_for_training(model, config, *, loader=None, loader_name=None,
+                               report=None):
+    """Restore the complete Unsloth training lifecycle after adapter attachment.
+
+    A saved adapter attached to a fresh base carries no training-mode state.
+    Unsloth's ``for_training`` only flips the ``gradient_checkpointing`` flags,
+    while Transformers dispatches to ``self._gradient_checkpointing_func`` -
+    which only ``get_peft_model``/``patch_peft_model`` or
+    ``gradient_checkpointing_enable`` installs. This function mirrors the
+    production lifecycle exactly:
+
+    1. ``patch_peft_model`` when the loader exposes it (FastLanguageModel
+       does): the same call Unsloth's own adapter-reload path and
+       ``get_peft_model`` make, restoring the checkpointing function,
+       ``use_cache=False``, input gradients and the fast LoRA patches.
+    2. ``for_training`` with the configured checkpointing mode, so
+       ``training.gradient_checkpointing: false`` is honored too.
+    3. ``gradient_checkpointing_enable`` with the configured ``use_reentrant``:
+       the exact call ``Trainer._inner_training_loop`` makes before the first
+       training forward when ``gradient_checkpointing`` is set.
+    4. ``enable_input_require_grads`` when the loader path did not already
+       register it (frozen embeddings must propagate gradients to the adapter).
+
+    Finally the function refuses to return a model whose checkpointing modules
+    lack a callable function, instead of letting the decoder raise later.
+    ``loader`` is an injection seam for tests; production resolves the
+    configured Unsloth Fast* loader. ``report`` receives the lifecycle facts.
+    """
+    Loader, resolved_name = _unsloth_training_loader(
+        config, loader, loader_name)
+    gradient_checkpointing = bool(config.training.gradient_checkpointing)
+    use_reentrant = bool(config.training.gradient_checkpointing_use_reentrant)
+    lifecycle = {"loader": resolved_name}
+    try:
+        attached = getattr(model, "peft_config", None) is not None
+        patch_peft_model = getattr(Loader, "patch_peft_model", None)
+        # Unsloth marks every model it loads with ``max_seq_length`` and
+        # ``patch_peft_model`` relies on it. The production reload always goes
+        # through the Unsloth Fast* loader, so the full restore always runs
+        # there; an injected/plain base still gets the checkpointing restore
+        # below (the same call Trainer makes), never a silent pass.
+        unsloth_loaded = hasattr(model, "max_seq_length")
+        if attached and callable(patch_peft_model) and unsloth_loaded:
+            model = patch_peft_model(
+                model,
+                use_gradient_checkpointing=(
+                    "unsloth" if gradient_checkpointing else False))
+            lifecycle["peft_training_state_api"] = (
+                f"{resolved_name}.patch_peft_model")
         else:
-            Loader = unsloth.FastLanguageModel
-        prepare = getattr(Loader, "for_training")
-        return prepare(model)
+            lifecycle["peft_training_state_api"] = None
+            lifecycle["peft_training_state_skipped"] = [
+                reason for reason, present in (
+                    ("no attached PEFT adapter", not attached),
+                    (f"{resolved_name} has no patch_peft_model",
+                     not callable(patch_peft_model)),
+                    ("model was not loaded through the Unsloth Fast* loader",
+                     not unsloth_loaded),
+                ) if present]
+        for_training = getattr(Loader, "for_training")
+        requested = {"use_gradient_checkpointing": gradient_checkpointing}
+        accepted, dropped = _split_kwargs(for_training, requested)
+        model = for_training(model, **accepted)
+        lifecycle["for_training_applied"] = True
+        lifecycle["for_training_gradient_checkpointing"] = accepted.get(
+            "use_gradient_checkpointing", "unsupported")
+        lifecycle["for_training_dropped_kwargs"] = sorted(dropped)
+        if gradient_checkpointing:
+            enable = getattr(model, "gradient_checkpointing_enable", None)
+            if not callable(enable):
+                raise DataError(
+                    "training.gradient_checkpointing is true but the reloaded "
+                    "model has no gradient_checkpointing_enable(); the "
+                    "checkpointing state cannot be restored")
+            enable(gradient_checkpointing_kwargs={"use_reentrant": use_reentrant})
+            lifecycle["gradient_checkpointing_enable"] = {
+                "use_reentrant": use_reentrant}
+            if (getattr(model, "_require_grads_hook", None) is None
+                    and hasattr(model, "enable_input_require_grads")):
+                model.enable_input_require_grads()
+                lifecycle["input_require_grads"] = "enabled"
+            lifecycle.update(require_gradient_checkpointing_ready(
+                model, context="the reloaded training forward"))
+    except DataError:
+        raise
     except Exception as exc:
         raise DataError(
-            "Failed to apply Unsloth training patches after attaching the "
-            f"saved adapter ({type(exc).__name__}: {exc})") from exc
+            "Failed to restore the Unsloth training lifecycle after attaching "
+            f"the saved adapter ({type(exc).__name__}: {exc})") from exc
+    if report is not None:
+        report["training_state"] = lifecycle
+    return model
 
 
 def load_model_for_evaluation(config, *, checkpoint_dir=None, artifact_meta=None,

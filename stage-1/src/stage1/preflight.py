@@ -401,10 +401,17 @@ def check_model_load(ctx: PreflightContext) -> dict:
 
 def check_one_step(ctx: PreflightContext) -> dict:
     import time
-    from . import collator, data as data_module, formatting
+    from . import adapters, collator, data as data_module, formatting
     torch = _torch(ctx)
     if ctx.model is None or ctx.tokenizer is None:
         return _fail("model or tokenizer not loaded")
+    if ctx.config.training.gradient_checkpointing:
+        try:
+            ctx.scratch["gradient_checkpointing_one_step"] = (
+                adapters.require_gradient_checkpointing_ready(
+                    ctx.model, context="the one-step training forward"))
+        except DataError as exc:
+            return _fail(str(exc))
     template = ctx.scratch.get("template")
     export_dir = ctx.export_dir or ctx.config.data.export_dir
     if export_dir is None:
@@ -686,7 +693,8 @@ def check_model_reload(ctx: PreflightContext, *, base_loader=None,
                 else:
                     model = adapter_attacher(model, directory)
                 if production_attacher:
-                    model = adapters.prepare_model_for_training(model, ctx.config)
+                    model = adapters.prepare_model_for_training(
+                        model, ctx.config, report=report)
                 trainable_report = adapters.verify_lora_trainables(
                     model.named_parameters(), ctx.config.lora)
                 report.update(trainable_report)
@@ -755,7 +763,7 @@ def check_trainer_resume(ctx: PreflightContext) -> dict:
     check), so no second model copy is allocated.
     """
     import tempfile
-    from . import checkpointing
+    from . import adapters, checkpointing
     from .errors import CheckpointError
     torch = _torch(ctx)
     if ctx.model is None:
@@ -763,6 +771,16 @@ def check_trainer_resume(ctx: PreflightContext) -> dict:
     plan = ctx.scratch.get("batch_plan")
     if plan is None:
         return _fail("no recorded batch to run the resume check against")
+    if ctx.config.training.gradient_checkpointing:
+        # The first real training forward of the resume lifecycle runs here;
+        # report an incomplete checkpointing state directly instead of letting
+        # the decoder raise AttributeError('_gradient_checkpointing_func').
+        try:
+            ctx.scratch["gradient_checkpointing_resume"] = (
+                adapters.require_gradient_checkpointing_ready(
+                    ctx.model, context="the trainer resume training forward"))
+        except DataError as exc:
+            return _fail(str(exc))
 
     directory = Path(tempfile.mkdtemp(prefix="stage1-preflight-trainer-"))
     try:

@@ -840,6 +840,12 @@ def run_training(config, paths, gate_name: str, *, local_files_only: bool = Fals
             "Model loader returned a tokenizer that differs from preparation:\n" +
             "\n".join(f"  - {line}" for line in model_tokenizer_problems))
     template = model_template
+    if config.training.gradient_checkpointing:
+        # The resume lifecycle and the preflight reconstruction must both reach
+        # a training forward with a complete checkpointing state.
+        load_report["gradient_checkpointing"] = (
+            adapters.require_gradient_checkpointing_ready(
+                model, context="the production training forward"))
     write_json_atomic(paths.run_dir / "environment.json", {
         "created_at": utc_now_iso(),
         "gate": gate_name,
