@@ -12,6 +12,10 @@ model:
   adapter: minicpm5
   loader: unsloth-language-model
 
+tokenizer:
+  # Keep the tokenizer identity aligned with Unsloth's MiniCPM loader.
+  pad_token: <unused_token_477>
+
 environment:
   lock_file: locks/minicpm5-2b.lock
   python_version: "3.12"

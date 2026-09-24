@@ -374,12 +374,19 @@ def check_tokenizer_load(ctx: PreflightContext) -> dict:
 
 
 def check_model_load(ctx: PreflightContext) -> dict:
-    from . import adapters
+    from . import adapters, formatting
     model, tokenizer, report = adapters.load_model_and_tokenizer(
         ctx.config, local_files_only=ctx.local_files_only, cache_dir=ctx.cache_dir,
         for_training=True)
-    if ctx.tokenizer is None:
-        ctx.tokenizer = tokenizer
+    template = formatting.resolve_chat_template(tokenizer, ctx.config.tokenizer)
+    fingerprint = adapters.tokenizer_fingerprint(tokenizer, template, ctx.config)
+    problems = adapters.compare_fingerprints(ctx.prepared["model"], fingerprint)
+    if problems:
+        return _fail(
+            "model loader returned a tokenizer that differs from preparation:\n" +
+            "\n".join(f"  - {line}" for line in problems))
+    ctx.tokenizer = tokenizer
+    ctx.scratch["template"] = template
     ctx.model = model
     ctx.load_report = report
     ctx.scratch["parameter_count"] = report["parameter_count"]
@@ -672,12 +679,14 @@ def check_model_reload(ctx: PreflightContext, *, base_loader=None,
                 # without any adapter, then attach the saved one exactly once.
                 model, tokenizer, report = base_loader(
                     ctx.config, local_files_only=ctx.local_files_only,
-                    cache_dir=ctx.cache_dir, for_training=True)
+                    cache_dir=ctx.cache_dir, for_training=False)
                 if production_attacher:
                     model = adapter_attacher(
                         model, directory, is_trainable=True)
                 else:
                     model = adapter_attacher(model, directory)
+                if production_attacher:
+                    model = adapters.prepare_model_for_training(model, ctx.config)
                 trainable_report = adapters.verify_lora_trainables(
                     model.named_parameters(), ctx.config.lora)
                 report.update(trainable_report)

@@ -310,7 +310,12 @@ def _eval_forward_loss(model, batch_plan, torch, device="cuda"):
     loss = float(outputs.loss)
     if not math.isfinite(loss):
         raise DataError(f"Forward pass produced a non-finite loss: {loss}")
-    return loss, tuple(outputs.logits.shape)
+    shape = getattr(getattr(outputs, "logits", None), "shape", None)
+    if shape is None or callable(shape):
+        shape = None
+    else:
+        shape = tuple(shape)
+    return loss, shape
 
 
 def restore_final_weights(model, final_directory, *, method: str,
@@ -330,7 +335,8 @@ def restore_final_weights(model, final_directory, *, method: str,
         "restore_method": method,
         "restore_tensors": restore["tensors"],
         "restore_loss": loss,
-        "restore_logits_shape": list(shape),
+        "restore_logits_shape": list(shape) if shape is not None else None,
+        "restore_logits_materialized": shape is not None,
     }
 
 
@@ -824,6 +830,16 @@ def run_training(config, paths, gate_name: str, *, local_files_only: bool = Fals
     model, tokenizer, load_report = adapters.load_model_and_tokenizer(
         config, local_files_only=local_files_only, cache_dir=cache_dir,
         for_training=True)
+    model_template = formatting.resolve_chat_template(tokenizer, config.tokenizer)
+    model_fingerprint = adapters.tokenizer_fingerprint(
+        tokenizer, model_template, config)
+    model_tokenizer_problems = adapters.compare_fingerprints(
+        prepared["model"], model_fingerprint)
+    if model_tokenizer_problems:
+        raise DataError(
+            "Model loader returned a tokenizer that differs from preparation:\n" +
+            "\n".join(f"  - {line}" for line in model_tokenizer_problems))
+    template = model_template
     write_json_atomic(paths.run_dir / "environment.json", {
         "created_at": utc_now_iso(),
         "gate": gate_name,

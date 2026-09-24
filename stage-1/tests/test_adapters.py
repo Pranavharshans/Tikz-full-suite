@@ -186,6 +186,30 @@ class BaseOnlyLoaderTests(unittest.TestCase):
                          len(TARGETS))
         self.assertTrue(report["base_frozen"])
 
+    def test_model_loader_applies_configured_padding_token(self):
+        self.config.tokenizer.pad_token = "<unused_token_477>"
+        with mock.patch.dict(sys.modules, self.modules):
+            _, tokenizer, _ = adapters.load_base_model_and_tokenizer(self.config)
+        self.assertEqual(tokenizer.pad_token, "<unused_token_477>")
+        self.assertEqual(tokenizer.name_or_path, self.config.model.id)
+
+    def test_training_patches_can_be_applied_after_adapter_attachment(self):
+        calls = []
+        model = FakeModel(with_adapter=True)
+
+        class Loader:
+            @staticmethod
+            def for_training(value):
+                calls.append(value)
+                return value
+
+        unsloth = types.ModuleType("unsloth")
+        unsloth.FastLanguageModel = Loader
+        with mock.patch.dict(sys.modules, {"unsloth": unsloth}):
+            result = adapters.prepare_model_for_training(model, self.config)
+        self.assertIs(result, model)
+        self.assertEqual(calls, [model])
+
     def test_base_loader_reports_missing_targets_before_adapting(self):
         loader, modules = fake_modules()
 

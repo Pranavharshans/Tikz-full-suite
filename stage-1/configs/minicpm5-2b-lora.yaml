@@ -14,6 +14,11 @@ model:
   adapter: minicpm5
   loader: unsloth-language-model
 
+tokenizer:
+  # Unsloth rejects MiniCPM's default </s> as padding and selects this existing
+  # vocabulary token. Pin it so preparation, run identity and training agree.
+  pad_token: <unused_token_477>
+
 training:
   method: lora
   # LoRA uses a larger learning rate than full finetuning.

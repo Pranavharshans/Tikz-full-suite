@@ -410,6 +410,16 @@ def load_model_and_tokenizer(config, *, local_files_only: bool = False,
             f"Unsloth {loader_name} ({type(exc).__name__}: {exc}). The preflight "
             "must prove this checkpoint loads before any training gate.") from exc
 
+    # Unsloth can repair a model's padding token while loading. Configuration
+    # is the authority so preparation, model loading and run identity cannot
+    # silently use different padding ids.
+    if config.tokenizer.pad_token:
+        tokenizer.pad_token = config.tokenizer.pad_token
+    if config.model.local_path is None:
+        # A cached snapshot path is an implementation detail, not a distinct
+        # tokenizer identity from the pinned Hub id + revision.
+        tokenizer.name_or_path = config.model.id
+
     embedding = model.get_input_embeddings()
     embedding_dtype = str(embedding.weight.dtype) if embedding is not None else "unknown"
     if embedding is not None and embedding.weight.dtype != torch.bfloat16:
@@ -571,6 +581,22 @@ def attach_lora_adapter(model, adapter_dir, *, is_trainable: bool = False):
         raise DataError(
             f"Failed to attach the adapter at {adapter_dir} "
             f"({type(exc).__name__}: {exc})") from exc
+
+
+def prepare_model_for_training(model, config):
+    """Apply Unsloth training patches after the final adapter is attached."""
+    try:
+        import unsloth
+        if config.model.loader == "unsloth-vision-model":
+            Loader = unsloth.FastVisionModel
+        else:
+            Loader = unsloth.FastLanguageModel
+        prepare = getattr(Loader, "for_training")
+        return prepare(model)
+    except Exception as exc:
+        raise DataError(
+            "Failed to apply Unsloth training patches after attaching the "
+            f"saved adapter ({type(exc).__name__}: {exc})") from exc
 
 
 def load_model_for_evaluation(config, *, checkpoint_dir=None, artifact_meta=None,

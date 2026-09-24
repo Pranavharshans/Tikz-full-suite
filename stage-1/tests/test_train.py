@@ -469,6 +469,14 @@ class ArtifactWeightTests(unittest.TestCase):
         self.assertEqual(report["restore_loss"], 0.125)
         self.assertEqual(report["restore_logits_shape"], [2, 4])
 
+    def test_restore_accepts_unsloth_lazy_logits(self):
+        model = FakeModel(loss=0.125, shape=lambda: None)
+        report = train.restore_final_weights(
+            model, self.final, method="full", batch_plan=self.batch_plan,
+            torch=FakeTorch, loader=self.loader)
+        self.assertIsNone(report["restore_logits_shape"])
+        self.assertFalse(report["restore_logits_materialized"])
+
     def test_non_finite_forward_loss_is_refused(self):
         model = FakeModel(loss=float("nan"))
         with self.assertRaisesRegex(DataError, "non-finite loss"):
