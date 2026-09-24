@@ -122,6 +122,9 @@ class VerifyExportTests(unittest.TestCase):
         info = data_module.verify_export(export["root"])
         self.assertEqual(info.rows, len(rows))
         self.assertEqual(info.rejected_rows, 1)
+        streamed = list(data_module.iter_rows(info, columns="logical"))
+        self.assertEqual([row["source_row_index"] for row in streamed],
+                         [0, 1, 2, 4, 5, 6])
 
     def test_duplicate_row_ids_are_detected(self):
         import pyarrow as pa

@@ -386,7 +386,7 @@ def iter_rows(export_info: ExportInfo, *, columns: str = "text",
     else:
         raise DataError(f"Unknown column projection {columns!r}")
     parquet = _require_pyarrow()
-    expected_index = 0
+    previous_source_index = None
     seen = set()
     for record in export_info.shards:
         path = export_info.root / "shards" / record["name"]
@@ -396,11 +396,18 @@ def iter_rows(export_info: ExportInfo, *, columns: str = "text",
                 if row.get("id") in seen:
                     raise DataError(f"Duplicate row id while streaming: {row.get('id')}")
                 seen.add(row.get("id"))
-                if row.get("source_row_index") != expected_index:
+                source_index = row.get("source_row_index")
+                if not isinstance(source_index, int) or source_index < 0:
                     raise DataError(
                         f"Row {row.get('id')} has source_row_index "
-                        f"{row.get('source_row_index')}, expected {expected_index}")
-                expected_index += 1
+                        f"{source_index!r}; expected a non-negative integer")
+                if (previous_source_index is not None
+                        and source_index <= previous_source_index):
+                    raise DataError(
+                        f"Row {row.get('id')} has source_row_index {source_index} "
+                        f"after {previous_source_index}; completed rows are not "
+                        "in strict source order")
+                previous_source_index = source_index
                 if not include_image:
                     row.pop("png_image", None)
                 yield row
