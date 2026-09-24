@@ -103,7 +103,9 @@ class AdapterRoundTripTests(unittest.TestCase):
                                                  self.stage1_lora())
         self.assertEqual(report["base_parameters_trainable"], 0)
         self.assertGreater(report["trainable_parameters"], 0)
-        self.assertLess(report["trainable_percentage"], 5.0)
+        # A tiny two-layer model makes rank 4 a larger share than a real 2B/4B
+        # checkpoint; the contract is "adapters are a small minority".
+        self.assertLess(report["trainable_percentage"], 15.0)
         self.assertEqual(set(report["adapter_targets"]),
                          {"q_proj", "k_proj", "v_proj", "o_proj"})
 
@@ -238,7 +240,10 @@ class AdapterRoundTripTests(unittest.TestCase):
         config = support.make_config(
             training={"method": "lora", "learning_rate": 1e-4,
                       "optim": "adamw_torch"},
-            lora={"rank": 4, "alpha": 4, "dropout": 0.0})
+            lora={"rank": 4, "alpha": 4, "dropout": 0.0,
+                  # The saved adapter is q/k/v/o only; the config must match or
+                  # the trainable check correctly refuses a partial attachment.
+                  "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"]})
         ctx = preflight.PreflightContext(
             config=config, run_dir=self.root / "run", identity={}, prepared={})
         ctx.model = model
@@ -401,6 +406,9 @@ class ReloadTrainingStateTests(unittest.TestCase):
 
     def test_prepare_restores_a_complete_state_and_the_training_step(self):
         model = self.reload_adapter()
+        # Simulate the failing reload state: Unsloth for_training flips the
+        # gradient-checkpointing flags but installs no checkpoint function.
+        _FlagOnlyForTraining.for_training(model)
         state_before = adapters.gradient_checkpointing_state(model)
         self.assertGreater(state_before["modules_with_gradient_checkpointing"], 0)
         self.assertGreater(state_before["modules_missing_checkpoint_function"], 0)

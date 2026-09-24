@@ -444,8 +444,20 @@ def make_export(root, rows=None, *, shard_size: int = 2,
         pa.field("image_sha256", pa.string(), nullable=False),
         pa.field("tikz_sha256", pa.string(), nullable=False),
     ])
-    parquet.write_table(pa.Table.from_pylist([], schema=rejected_schema),
-                        root / "rejected.parquet")
+    rejected_records = [{
+        "id": f"{run_id}-rejected-{index}",
+        "source_row_index": index,
+        "rejection_reason": "fixture rejection",
+        "error_category": "fixture",
+        "error_detail": None,
+        "attempt_count": 1,
+        "updated_at": 0.0,
+        "image_sha256": sha256_bytes(make_png_bytes(seed=1000 + index)),
+        "tikz_sha256": sha256_text(f"\\draw (0,0) -- ({index},0);"),
+    } for index in range(rejected_rows)]
+    parquet.write_table(
+        pa.Table.from_pylist(rejected_records, schema=rejected_schema),
+        root / "rejected.parquet")
     (root / "checksums.json").write_text(json.dumps({
         "shards": shard_entries,
         "rejected": {"rows": rejected_rows,

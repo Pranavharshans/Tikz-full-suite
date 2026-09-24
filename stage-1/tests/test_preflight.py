@@ -267,7 +267,10 @@ class IndividualCheckTests(unittest.TestCase):
         actual = ".".join(str(part) for part in sys.version_info[:2])
         ctx = context()
         ctx.config.environment.python_version = actual
-        with mock.patch.object(preflight, "python_version_pin", return_value="3.12"):
+        # The mocked pin must differ from the running interpreter; the GPU
+        # environment itself is Python 3.12, so a hard-coded "3.12" would agree.
+        self.assertNotEqual(actual, "9.9")
+        with mock.patch.object(preflight, "python_version_pin", return_value="9.9"):
             outcome = preflight.check_python_version(ctx)
         self.assertEqual(outcome["status"], "fail")
         self.assertIn(".python-version", outcome["detail"])

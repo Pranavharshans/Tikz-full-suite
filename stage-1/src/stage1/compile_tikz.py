@@ -208,9 +208,13 @@ def compile_tikz(text, *, engine: str = "pdflatex", timeout_seconds: int = 20,
             "unsafe_primitive", "unsafe_primitive",
             error_message=f"refused TeX primitive {unsafe.group(0)!r}")
     engine_path = check_engine_available(engine)
-    if engine_path is None:
+    if engine_path is None and runner is None:
         return result("unavailable", "unavailable",
                       error_message=f"{engine} not found on PATH")
+    if engine_path is None:
+        # An injected runner replaces the subprocess, so the real engine does
+        # not need to be installed for the runner plumbing to be exercised.
+        engine_path = engine
 
     if workdir is not None:
         base = Path(workdir).resolve()

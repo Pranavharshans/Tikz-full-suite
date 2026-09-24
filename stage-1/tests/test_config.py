@@ -379,7 +379,9 @@ class ShippedConfigTests(unittest.TestCase):
         self.assertEqual(config.model.loader, "unsloth-vision-model")
         self.assertEqual(config.environment.lock_path.name, "qwen3.5-4b.lock")
         self.assertIsNotNone(config.environment.lock_sha256)
-        self.assertEqual(config.data.max_seq_len, 4096)
+        # common.yaml's audited ceiling is 8192 since commit 751164a; the qwen
+        # config inherits it (this test was never executed without PyYAML).
+        self.assertEqual(config.data.max_seq_len, 8192)
         self.assertEqual(config.gate("full").max_rows, None)
 
     @support.requires_yaml

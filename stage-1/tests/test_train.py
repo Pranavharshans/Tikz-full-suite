@@ -5,10 +5,12 @@ and the gate criteria are pure functions over metrics documents.
 """
 import importlib.util
 import json
+import sys
 import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tests import support
 
@@ -632,11 +634,14 @@ class LoraRestoreTests(unittest.TestCase):
             self.restore(loader=loader)
 
     def test_restore_requires_peft_without_a_getter_seam(self):
-        with self.assertRaisesRegex(CheckpointError, "peft is required"):
-            checkpointing.load_artifact_weights(
-                NoStateDictModel(), self.adapter, method="lora",
-                loader=self.loader,
-                adapter_state_setter=lambda model, state, adapter_name="default": None)
+        # Simulate an environment without peft: the real getter must not be
+        # used, and the missing dependency must be reported as such.
+        with mock.patch.dict(sys.modules, {"peft": None}):
+            with self.assertRaisesRegex(CheckpointError, "peft is required"):
+                checkpointing.load_artifact_weights(
+                    NoStateDictModel(), self.adapter, method="lora",
+                    loader=self.loader,
+                    adapter_state_setter=lambda model, state, adapter_name="default": None)
 
     def test_setter_failure_is_reported_as_adapter_incompatibility(self):
         def setter(model, state_dict, adapter_name="default"):
