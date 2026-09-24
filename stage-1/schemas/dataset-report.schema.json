@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "stage1/dataset-report.schema.json",
+  "title": "Stage 1 dataset report (the data gate evidence)",
+  "type": "object",
+  "required": ["schema_version", "status", "created_at", "tool_version",
+               "export", "data_identity", "models"],
+  "properties": {
+    "schema_version": { "const": "stage1-prepared-v1" },
+    "status": { "enum": ["pass", "fail"] },
+    "created_at": { "type": "string" },
+    "tool_version": { "type": "string" },
+    "export": {
+      "type": "object",
+      "required": ["root", "dataset_logical_sha256", "checksums_sha256", "rows",
+                   "complete_rows", "rejected_rows", "shards", "source_dataset",
+                   "source_revision", "prompt_version"],
+      "properties": {
+        "root": { "type": "string" },
+        "dataset_logical_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "checksums_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "rows": { "type": "integer", "minimum": 0 },
+        "complete_rows": { "type": "integer", "minimum": 0 },
+        "rejected_rows": { "type": "integer", "minimum": 0 },
+        "shards": { "type": "integer", "minimum": 1 },
+        "source_dataset": { "type": "string" },
+        "source_revision": { "type": "string" },
+        "caption_model": { "type": "string" },
+        "caption_model_revision": { "type": "string" },
+        "prompt_version": { "type": "string" },
+        "run_id": { "type": ["string", "null"] }
+      }
+    },
+    "data_identity": { "type": "object", "required": ["sha256"] },
+    "models": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["token_report_sha256", "model_fingerprint_sha256",
+                     "quarantined", "quarantine_fraction", "max_seq_len"],
+        "properties": {
+          "token_report_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "model_fingerprint_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+          "quarantined": { "type": "integer", "minimum": 0 },
+          "quarantine_fraction": { "type": "number", "minimum": 0, "maximum": 1 },
+          "max_seq_len": { "type": "integer", "minimum": 128 }
+        }
+      }
+    }
+  }
+}

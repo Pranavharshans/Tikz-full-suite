@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "stage1/artifact.schema.json",
+  "title": "Stage 1 checkpoint / final artifact metadata",
+  "description": "Written as stage1-checkpoint.json inside resumable checkpoints and stage1-final.json inside final/<gate>/ directories.",
+  "type": "object",
+  "required": ["schema_version", "kind", "created_at", "identity_sha256",
+               "gate", "model_id", "model_revision", "adapter", "global_step",
+               "supervised_tokens_seen", "epochs_completed"],
+  "properties": {
+    "schema_version": { "const": "stage1-artifact-v1" },
+    "kind": { "enum": ["checkpoint", "final"] },
+    "created_at": { "type": "string" },
+    "identity_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "run_id": { "type": ["string", "null"] },
+    "gate": { "type": ["string", "null"],
+              "enum": ["overfit-100", "smoke-1000", "full", null] },
+    "model_id": { "type": "string", "minLength": 1 },
+    "model_revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "adapter": { "type": "string", "minLength": 1 },
+    "global_step": { "type": "integer", "minimum": 0 },
+    "supervised_tokens_seen": { "type": "integer", "minimum": 0 },
+    "epochs_completed": { "type": "number", "minimum": 0 }
+  }
+}

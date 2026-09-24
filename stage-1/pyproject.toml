@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tikz-stage1"
+version = "0.1.0"
+description = "Stage 1 supervised fine-tuning for text-to-TikZ (Unsloth full-parameter BF16 SFT)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Proprietary" }
+dependencies = [
+    # Configuration and data access. Keep these importable without torch so
+    # that config validation, dataset preparation and TeX tooling stay usable
+    # on a login node.
+    "PyYAML>=6.0",
+    "pyarrow>=14",
+]
+
+[project.optional-dependencies]
+# CPU-side evaluation extras: rendered-image similarity against png_image.
+eval = [
+    "Pillow>=10",
+]
+# GPU training environment. Exact versions live in locks/; the bounds below are
+# only a floor so that an accidental `pip install .[train]` cannot pick something
+# ancient. Production environments MUST be installed from the lock file.
+train = [
+    "torch>=2.6",
+    "transformers>=4.56",
+    "unsloth>=2025.1",
+    "trl>=0.18",
+    "datasets>=3.4",
+    "accelerate>=0.34",
+    "peft>=0.18",
+    "bitsandbytes>=0.45",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-dir]
+"" = "src"

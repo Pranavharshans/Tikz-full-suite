@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "stage1/gate-evidence.schema.json",
+  "title": "Stage 1 gate evidence",
+  "type": "object",
+  "required": ["schema_version", "gate", "status", "identity_sha256", "created_at"],
+  "properties": {
+    "schema_version": { "const": "stage1-gate-v1" },
+    "gate": { "enum": ["overfit-100", "smoke-1000", "full"] },
+    "status": { "enum": ["passed", "failed"] },
+    "identity_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "created_at": { "type": "string" },
+    "metrics_path": { "type": "string" },
+    "reason": { "type": "string" },
+    "gate_settings": { "type": "object" },
+    "supervised_tokens_seen": { "type": "integer", "minimum": 0 },
+    "optimizer_steps": { "type": "integer", "minimum": 0 },
+    "final_eval_loss": { "type": ["number", "null"] },
+    "peak_vram_bytes": { "type": ["integer", "null"], "minimum": 0 },
+    "rerun": { "type": "boolean" }
+  }
+}

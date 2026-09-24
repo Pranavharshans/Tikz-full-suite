@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "stage1/eval.schema.json",
+  "title": "Stage 1 evaluation metrics",
+  "type": "object",
+  "required": ["schema_version", "generation", "extraction", "compilation",
+               "output_length", "latency", "duplicates", "memorization",
+               "render_similarity"],
+  "properties": {
+    "schema_version": { "const": "stage1-eval-v1" },
+    "created_at": { "type": "string" },
+    "name": { "type": "string" },
+    "source_kind": { "enum": ["base", "checkpoint"] },
+    "split": { "enum": ["validation", "test"] },
+    "generation": {
+      "type": "object",
+      "required": ["examples", "completed", "truncated", "errors", "empty"],
+      "properties": {
+        "examples": { "type": "integer", "minimum": 1 },
+        "completed": { "type": "integer", "minimum": 0 },
+        "truncated": { "type": "integer", "minimum": 0 },
+        "errors": { "type": "integer", "minimum": 0 },
+        "empty": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "extraction": {
+      "type": "object",
+      "required": ["picture", "document", "none"],
+      "properties": {
+        "picture": { "type": "integer", "minimum": 0 },
+        "document": { "type": "integer", "minimum": 0 },
+        "none": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "compilation": {
+      "type": "object",
+      "required": ["attempted", "success", "categories"],
+      "properties": {
+        "attempted": { "type": "integer", "minimum": 0 },
+        "success": { "type": "integer", "minimum": 0 },
+        "success_rate": { "type": ["number", "null"] },
+        "categories": { "type": "object" },
+        "first_errors": { "type": "array" }
+      }
+    },
+    "output_length": {
+      "type": "object",
+      "required": ["tokens", "chars"],
+      "properties": { "tokens": { "type": "object" }, "chars": { "type": "object" } }
+    },
+    "latency": {
+      "type": "object",
+      "required": ["mean", "total_s"],
+      "properties": {
+        "count": { "type": "integer" },
+        "mean": { "type": ["number", "null"] },
+        "median": { "type": ["number", "null"] },
+        "p10": { "type": ["number", "null"] },
+        "max": { "type": ["number", "null"] },
+        "total_s": { "type": "number", "minimum": 0 },
+        "tokens_per_second": { "type": ["number", "null"] }
+      }
+    },
+    "duplicates": {
+      "type": "object",
+      "required": ["duplicate_groups", "duplicate_rows"],
+      "properties": {
+        "duplicate_groups": { "type": "integer", "minimum": 0 },
+        "duplicate_rows": { "type": "integer", "minimum": 0 },
+        "largest_group": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "memorization": {
+      "type": "object",
+      "required": ["exact_matches", "near_matches"],
+      "properties": {
+        "train_targets_checked": { "type": "integer", "minimum": 0 },
+        "exact_matches": { "type": "integer", "minimum": 0 },
+        "near_matches": { "type": "integer", "minimum": 0 },
+        "overlap_threshold": { "type": "number" },
+        "ngram_size": { "type": "integer", "minimum": 2 }
+      }
+    },
+    "render_similarity": {
+      "type": "object",
+      "required": ["enabled", "status"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "status": { "enum": ["ok", "not_available", "no_data"] },
+        "compared": { "type": "integer", "minimum": 0 },
+        "mean": { "type": ["number", "null"] },
+        "median": { "type": ["number", "null"] },
+        "p10": { "type": ["number", "null"] },
+        "max": { "type": ["number", "null"] },
+        "reasons": { "type": "object" }
+      }
+    }
+  }
+}

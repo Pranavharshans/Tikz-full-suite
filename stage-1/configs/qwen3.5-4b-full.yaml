@@ -1,0 +1,20 @@
+# Full-parameter BF16 SFT configuration: Qwen/Qwen3.5-4B.
+#
+# Qwen3.5-4B is a multimodal checkpoint (Qwen3_5ForConditionalGeneration,
+# hybrid linear/full attention). Stage 1 trains it text-only: batches contain
+# no pixel values. The vision loader is used because the Hub pipeline is
+# image-text-to-text; if a future Unsloth release loads the same checkpoint
+# through the language-model loader, switching `loader` is a reviewed config
+# change (it changes the run identity) and must be re-preflighted.
+inherit: common.yaml
+
+model:
+  id: Qwen/Qwen3.5-4B
+  # Resolved from the Hub on 2026-09-23; pin the exact commit, never a branch.
+  revision: 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
+  adapter: qwen3.5
+  loader: unsloth-vision-model
+
+environment:
+  lock_file: locks/qwen3.5-4b.lock
+  python_version: "3.12"

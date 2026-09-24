@@ -1,0 +1,23 @@
+# Pinned GPU environment: openbmb/MiniCPM5-2B full-parameter BF16 SFT.
+# Install: see locks/README.md. Interpreter pin: ../.python-version (3.12).
+# Identical pins to qwen3.5-4b.lock today; kept separate so the environments can
+# diverge if the models need different Transformers releases.
+torch==2.12.1
+torchvision==0.27.1
+xformers==0.0.35
+transformers==5.5.0
+trl==0.24.0
+datasets==4.3.0
+accelerate==1.15.0
+peft==0.21.0
+bitsandbytes==0.50.2
+unsloth==2026.9.11
+unsloth_zoo==2026.9.7
+huggingface_hub==1.32.0
+tokenizers==0.23.2
+safetensors==0.8.0
+sentencepiece==0.2.2
+numpy==2.5.3
+pyyaml==6.0.3
+pyarrow==25.0.1
+pillow==12.3.0

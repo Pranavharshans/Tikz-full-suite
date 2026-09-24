@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "stage1/run.schema.json",
+  "title": "Stage 1 run record",
+  "type": "object",
+  "required": ["schema_version", "tool_version", "created_at",
+               "identity_sha256", "identity"],
+  "properties": {
+    "schema_version": { "const": "stage1-run-v1" },
+    "tool_version": { "type": "string" },
+    "created_at": { "type": "string" },
+    "identity_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "identity": {
+      "type": "object",
+      "required": ["tool_version", "seed", "data", "model", "tokenizer",
+                   "config", "environment", "code", "sha256"],
+      "properties": {
+        "seed": { "type": "integer", "minimum": 0 },
+        "data": {
+          "type": "object",
+          "required": ["data_identity_sha256", "dataset_logical_sha256",
+                       "split_manifest_sha256"],
+          "properties": {
+            "data_identity_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "dataset_logical_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "split_manifest_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "row_count": { "type": "integer" },
+            "source_dataset": { "type": "string" },
+            "source_revision": { "type": "string" }
+          }
+        },
+        "model": {
+          "type": "object",
+          "required": ["id", "revision", "adapter", "loader"],
+          "properties": {
+            "id": { "type": "string" },
+            "revision": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+            "adapter": { "type": "string" },
+            "loader": { "type": "string" }
+          }
+        },
+        "tokenizer": { "type": "object" },
+        "config": { "type": "object" },
+        "environment": {
+          "type": "object",
+          "required": ["lock_file", "lock_sha256", "packages"],
+          "properties": {
+            "lock_file": { "type": "string" },
+            "lock_sha256": { "type": ["string", "null"] },
+            "python_version": { "type": "string" },
+            "packages": { "type": "object" }
+          }
+        },
+        "code": {
+          "type": "object",
+          "required": ["sha256", "repo_commit"],
+          "properties": {
+            "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "repo_commit": { "type": "string" }
+          }
+        },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    }
+  }
+}

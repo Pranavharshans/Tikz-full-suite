@@ -1,0 +1,138 @@
+# Stage 1 common configuration. Model configs inherit from this file with
+# `inherit: common.yaml` and override the model, tokenizer and environment
+# sections. Merge semantics (see src/stage1/config.py): mappings merge
+# recursively, scalars and lists are replaced by the child.
+#
+# No user-specific remote paths are committed here. Every `null` path is
+# supplied at runtime on the command line and must be absolute.
+
+tool_version: stage1-sft-v1
+stage: 1
+# Single deterministic seed: dataset splitting, group shuffling and training
+# all derive from it, and it is part of the run identity.
+seed: 20260923
+
+model:
+  id: null              # required in the model config, e.g. Qwen/Qwen3.5-4B
+  revision: null        # required: exact 40-hex Hub commit SHA
+  adapter: null         # required: built-in adapter name (qwen3.5, minicpm5)
+  # unsloth-language-model | unsloth-vision-model
+  loader: unsloth-language-model
+  local_path: null      # optional absolute local snapshot directory
+  trust_remote_code: false
+  # null -> backend default (adapter-specific). Informational: the loader
+  # records the resolved value in the preflight and run environment.
+  attn_implementation: null
+
+tokenizer:
+  # Optional absolute path to a chat-template Jinja file. When null, the
+  # tokenizer's own template is used.
+  chat_template_file: null
+  # Passed to apply_chat_template. enable_thinking=false makes both shipped
+  # templates render an empty think block, which keeps the prompt a strict
+  # prefix of the full conversation.
+  chat_template_kwargs:
+    enable_thinking: false
+  pad_token: null       # override only when the tokenizer has no pad token
+
+data:
+  export_dir: null      # absolute; CLI --export
+  prepared_dir: null    # absolute; CLI --prepared
+  max_seq_len: 4096     # prompt + assistant ceiling; longer rows are quarantined
+  require_complete_export: true
+  # Refuse to prepare when more than this fraction of rows is quarantined.
+  max_quarantined_fraction: 0.02
+  splits:
+    validation_fraction: 0.01
+    test_fraction: 0.01
+
+training:
+  epochs: 1
+  learning_rate: 1.0e-5     # conservative default
+  lr_scheduler_type: cosine
+  warmup_ratio: 0.03        # 3% warmup
+  max_grad_norm: 1.0
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 8
+  optim: adamw_torch_fused  # fused AdamW where supported
+  bf16: true                # full-parameter BF16 only; QLoRA is not supported
+  gradient_checkpointing: true
+  gradient_checkpointing_use_reentrant: false
+  # Sequence packing is not supported: Stage 1 batches are right-padded only.
+  # The parser rejects packing: true with an explicit error.
+  packing: false
+  save_steps: 200
+  eval_steps: 200
+  save_total_limit: 3
+  logging_steps: 10
+  dataloader_num_workers: 2
+  max_steps: -1             # -1 -> epochs decide the schedule
+  validate_batches: true    # assert loss masks and padding on every batch
+  eval_max_rows: 500        # cap for training-time evaluation (validation split)
+  report_to: []
+
+# Gate overrides are deliberately limited to run-shape knobs. Learning rate,
+# batch sizes, sequence length, optimizer and the split definition stay in the
+# base config; the base config is what the run identity covers.
+gates:
+  overfit-100:
+    max_rows: 100
+    epochs: 40
+    # 100 rows / batch 2 / accumulation 8 gives ~6-7 optimizer steps per epoch,
+    # ~240-280 steps total, so these intervals are reachable.
+    save_steps: 50
+    eval_steps: 50
+    logging_steps: 5
+    success_eval_loss: 0.05
+    min_loss_reduction: 0.9
+    generation_samples: 1
+    check_gradients: true
+  smoke-1000:
+    max_rows: 1000
+    epochs: 1
+    # 1000 rows / batch 2 / accumulation 8 gives ~62-63 optimizer steps, so
+    # save_steps and eval_steps must stay below that (the gate requires a
+    # checkpoint to exist; the trainer refuses an unreachable interval).
+    save_steps: 25
+    eval_steps: 25
+    logging_steps: 10
+    generation_samples: 2
+    check_gradients: true
+  full:
+    max_rows: null
+    epochs: 1
+    save_steps: 200
+    eval_steps: 200
+    logging_steps: 10
+    generation_samples: 4
+    check_gradients: false
+
+evaluation:
+  max_new_tokens: 1024
+  do_sample: false          # greedy by default; sampled decoding is opt-in
+  temperature: 1.0
+  top_p: 0.95
+  batch_size: 8
+  max_examples: 200         # per evaluation run; full test split via --all
+  duplicate_ngram_size: 8
+  duplicate_overlap_threshold: 0.8
+  memorization_sample: 5000 # train targets sampled for near-duplicate detection
+  compile:
+    engine: pdflatex
+    timeout_seconds: 20
+    render: true            # pdftoppm -> png for image similarity
+    keep_artifacts: false
+  render_similarity:
+    enabled: true
+    size: 64
+
+hardware:
+  expected_gpu_name_regex: "RTX PRO 6000"
+  min_vram_gib: 88
+  min_free_disk_gib: 250
+  device: cuda:0
+
+environment:
+  lock_file: null       # required in the model config
+  python_version: "3.12"

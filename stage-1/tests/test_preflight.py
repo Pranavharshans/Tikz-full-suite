@@ -1,0 +1,231 @@
+"""Tests for preflight orchestration, individual checks and the no-train rule."""
+import json
+import tempfile
+import types
+import unittest
+from pathlib import Path
+
+from tests import support
+
+from stage1 import identity, preflight
+from stage1.errors import DataError
+
+STAGE1 = Path(__file__).resolve().parents[1]
+
+
+def context(tmpdir=None, config=None, **scratch):
+    run_dir = Path(tmpdir) if tmpdir else Path("/tmp/stage1-test-run")
+    ctx = preflight.PreflightContext(
+        config=config or support.make_config(), run_dir=run_dir,
+        identity={"data": {"data_identity_sha256": "0" * 64}},
+        prepared={"data_identity_sha256": "0" * 64, "manifest": {
+            "data_identity": {"dataset_logical_sha256": "1" * 64}}})
+    ctx.scratch.update(scratch)
+    return ctx
+
+
+def ok(detail="ok"):
+    return {"status": "pass", "detail": detail, "data": {}}
+
+
+def bad(detail="bad"):
+    return {"status": "fail", "detail": detail, "data": {}}
+
+
+class OrchestrationTests(unittest.TestCase):
+    def test_prerequisite_failure_skips_dependents(self):
+        calls = []
+
+        def first(ctx):
+            calls.append("first")
+            return bad("first failed")
+
+        def second(ctx):
+            calls.append("second")
+            return ok()
+
+        report = preflight.run_preflight(context(), checks=(
+            ("first", first, ()),
+            ("second", second, ("first",)),
+        ))
+        self.assertEqual(calls, ["first"])
+        self.assertEqual(report["status"], "failed")
+        self.assertEqual(report["failed"], ["first"])
+        self.assertEqual(report["skipped"], ["second"])
+        self.assertFalse(report["complete"])
+
+    def test_all_passing_is_complete(self):
+        report = preflight.run_preflight(context(), checks=(
+            ("a", lambda ctx: ok(), ()),
+            ("b", lambda ctx: ok(), ("a",)),
+        ))
+        self.assertEqual(report["status"], "passed")
+        self.assertTrue(report["complete"])
+
+    def test_explicit_skip_marks_incomplete(self):
+        report = preflight.run_preflight(context(), checks=(
+            ("a", lambda ctx: ok(), ()),
+            ("b", lambda ctx: ok(), ()),
+        ), skip=("b",))
+        self.assertEqual(report["status"], "passed")
+        self.assertFalse(report["complete"])
+        self.assertEqual(report["skipped"], ["b"])
+
+    def test_unknown_skip_is_refused(self):
+        with self.assertRaisesRegex(DataError, "Unknown --skip-check"):
+            preflight.run_preflight(context(), skip=("nope",))
+
+    def test_check_exception_becomes_failure(self):
+        def explode(ctx):
+            raise RuntimeError("kaboom")
+
+        report = preflight.run_preflight(context(), checks=(("a", explode, ()),))
+        self.assertEqual(report["status"], "failed")
+        self.assertIn("RuntimeError", report["checks"][0]["detail"])
+
+    def test_report_never_claims_to_start_training(self):
+        report = preflight.run_preflight(context(), checks=(
+            ("a", lambda ctx: ok(), ()),))
+        self.assertFalse(report["started_training"])
+
+    def test_specs_are_structurally_sound(self):
+        names = [name for name, _, _ in preflight.CHECK_SPECS]
+        self.assertEqual(len(names), len(set(names)))
+        for name, function_name, requires in preflight.CHECK_SPECS:
+            self.assertTrue(callable(getattr(preflight, function_name, None)),
+                            function_name)
+            for prerequisite in requires:
+                self.assertIn(prerequisite, names)
+
+
+class IndividualCheckTests(unittest.TestCase):
+    def test_python_version_check(self):
+        import sys
+        from unittest import mock
+        actual = ".".join(str(part) for part in sys.version_info[:2])
+        ctx = context()
+        ctx.config.environment.python_version = actual
+        with mock.patch.object(preflight, "python_version_pin", return_value=actual):
+            self.assertEqual(preflight.check_python_version(ctx)["status"], "pass")
+        ctx.config.environment.python_version = "3.4"
+        with mock.patch.object(preflight, "python_version_pin", return_value="3.4"):
+            self.assertEqual(preflight.check_python_version(ctx)["status"], "fail")
+
+    def test_python_version_check_detects_repo_pin_disagreement(self):
+        import sys
+        from unittest import mock
+        actual = ".".join(str(part) for part in sys.version_info[:2])
+        ctx = context()
+        ctx.config.environment.python_version = actual
+        with mock.patch.object(preflight, "python_version_pin", return_value="3.12"):
+            outcome = preflight.check_python_version(ctx)
+        self.assertEqual(outcome["status"], "fail")
+        self.assertIn(".python-version", outcome["detail"])
+
+    def test_disk_space_check(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ctx = context(directory)
+            ctx.config.hardware.min_free_disk_gib = 0.0001
+            self.assertEqual(preflight.check_disk_space(ctx)["status"], "pass")
+            ctx.config.hardware.min_free_disk_gib = 10 ** 9
+            outcome = preflight.check_disk_space(ctx)
+            self.assertEqual(outcome["status"], "fail")
+            self.assertIn("free", outcome["detail"])
+
+    def test_disk_space_estimates_checkpoints_from_parameter_count(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ctx = context(directory, parameter_count=4_000_000_000)
+            ctx.config.hardware.min_free_disk_gib = 0.0001
+            outcome = preflight.check_disk_space(ctx)
+            self.assertIsNotNone(outcome["data"]["estimate_bytes"])
+            # 4B params * 10 bytes * retention 3
+            self.assertEqual(outcome["data"]["estimate_bytes"],
+                             4_000_000_000 * 10 * 3)
+
+    def test_environment_lock_check(self):
+        with tempfile.TemporaryDirectory() as directory:
+            lock = Path(directory) / "test.lock"
+            installed = {"pyarrow": "25.0.1", "yaml": "6.0.3", "PIL": "12.3.0"}
+            lock.write_text("pyarrow==25.0.1\nPyYAML==6.0.3\npillow==12.3.0\n")
+            ctx = context(directory)
+            ctx.config.environment.lock_path = lock
+            ctx.scratch["installed_versions"] = installed
+            self.assertEqual(preflight.check_environment_lock(ctx)["status"], "pass")
+            lock.write_text("torch==9.9.9\n")
+            outcome = preflight.check_environment_lock(ctx)
+            self.assertEqual(outcome["status"], "fail")
+            self.assertIn("torch", outcome["data"]["differences"][0])
+
+    def test_environment_lock_check_against_the_real_environment(self):
+        # In any environment, an empty/unknown lock must not pass silently.
+        with tempfile.TemporaryDirectory() as directory:
+            lock = Path(directory) / "test.lock"
+            lock.write_text("torch==9.9.9\n")
+            ctx = context(directory)
+            ctx.config.environment.lock_path = lock
+            outcome = preflight.check_environment_lock(ctx)
+            self.assertEqual(outcome["status"], "fail")
+
+    def test_attention_backend_is_informational(self):
+        outcome = preflight.check_attention_backend(context())
+        self.assertEqual(outcome["status"], "pass")
+        self.assertIn("flash_attn", outcome["data"])
+
+    def test_checkpoint_reload_and_resume_fail_without_a_model(self):
+        ctx = context()
+        ctx.torch = types.SimpleNamespace()  # avoid importing the real torch
+        for check in (preflight.check_model_reload,
+                      preflight.check_trainer_resume):
+            outcome = check(ctx)
+            self.assertEqual(outcome["status"], "fail")
+            self.assertIn("model", outcome["detail"])
+
+    def test_checkpoint_checks_are_truthfully_named(self):
+        names = [name for name, _, _ in preflight.CHECK_SPECS]
+        self.assertIn("checkpoint.weight_serialization", names)
+        self.assertIn("checkpoint.model_reload", names)
+        self.assertIn("checkpoint.trainer_resume", names)
+        self.assertNotIn("checkpoint.roundtrip", names)
+
+    def test_missing_lock_path_fails(self):
+        outcome = preflight.check_environment_lock(context())
+        self.assertEqual(outcome["status"], "fail")
+
+
+class NoTrainingRuleTests(unittest.TestCase):
+    def test_preflight_module_never_imports_or_calls_the_trainer(self):
+        source = (STAGE1 / "src" / "stage1" / "preflight.py").read_text()
+        self.assertNotIn("run_training", source)
+        self.assertNotIn("import stage1.train", source)
+        self.assertNotIn("from stage1.train", source)
+        self.assertNotIn("from .train", source)
+
+    def test_preflight_script_never_imports_or_calls_the_trainer(self):
+        source = (STAGE1 / "scripts" / "preflight.py").read_text()
+        self.assertNotIn("run_training", source)
+        self.assertNotIn("stage1.train", source)
+        self.assertNotIn("train_module", source)
+
+
+class ReportSchemaTests(unittest.TestCase):
+    def test_written_preflight_report_matches_schema(self):
+        from stage1 import schema
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            identity.write_preflight_report(
+                run_dir, identity_sha256="a" * 64,
+                checks=[{"name": "gpu.identity", "status": "pass", "detail": "ok",
+                         "data": {}}],
+                status="passed", complete=True,
+                payload={"peak_vram_bytes": 1, "load_report": None,
+                         "failed": [], "skipped": [],
+                         "started_training": False})
+            payload = json.loads(
+                identity.preflight_report_path(run_dir).read_text())
+            schema.validate_artifact(payload,
+                                     schema.load_schema("preflight.schema.json"),
+                                     "preflight report")
+
+
+if __name__ == "__main__":
+    unittest.main()
