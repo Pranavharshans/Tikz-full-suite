@@ -39,7 +39,10 @@ tokenizer:
 data:
   export_dir: null      # absolute; CLI --export
   prepared_dir: null    # absolute; CLI --prepared
-  max_seq_len: 4096     # prompt + assistant ceiling; longer rows are quarantined
+  # Chosen from the Qwen token audit: 8,192 retains 98.13% of rows while
+  # excluding the pathological 12k-32k assistant-target tail. The 2% gate
+  # remains strict and must also pass independently for MiniCPM.
+  max_seq_len: 8192     # prompt + assistant ceiling; longer rows are quarantined
   require_complete_export: true
   # Refuse to prepare when more than this fraction of rows is quarantined.
   max_quarantined_fraction: 0.02
