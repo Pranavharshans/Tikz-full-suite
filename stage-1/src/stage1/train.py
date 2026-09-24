@@ -763,6 +763,9 @@ def run_training(config, paths, gate_name: str, *, local_files_only: bool = Fals
 
     try:
         import torch
+        # Unsloth explicitly requires import before Transformers/PEFT so its
+        # performance and memory patches are active for the production run.
+        import unsloth  # noqa: F401
         import transformers
         from transformers import TrainingArguments
     except ImportError as exc:  # pragma: no cover - environment dependent

@@ -23,6 +23,7 @@ import _bootstrap  # noqa: F401
 
 from stage1 import (adapters, cli, config as config_module, data, formatting,
                     identity, preflight)
+from stage1.errors import DataError
 from stage1.util import dependency_versions, detect_repo_commit
 
 
@@ -48,6 +49,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv) -> int:
     args = build_parser().parse_args(argv)
+    # Unsloth must patch Transformers before AutoTokenizer imports it below.
+    # This stays after argument parsing so ``--help`` remains usable on a
+    # CPU/login node where Unsloth deliberately refuses to initialize.
+    try:
+        import unsloth  # noqa: F401
+    except Exception as exc:
+        raise DataError(
+            f"Unable to initialize Unsloth before Transformers: "
+            f"{type(exc).__name__}: {exc}") from exc
     config = config_module.load_config(args.config)
     paths = config_module.resolve_run_paths(
         config, export=args.export, prepared=args.prepared, run_dir=args.run_dir)
