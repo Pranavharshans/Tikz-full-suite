@@ -349,7 +349,7 @@ def make_export(root, rows=None, *, shard_size: int = 2,
         tikz = row["tikz_code"]
         records.append({
             "id": row.get("id") or stable_row_id(index, tikz, image),
-            "source_row_index": index,
+            "source_row_index": row.get("source_row_index", index),
             "file_id": row.get("file_id"),
             "png_image": image,
             "tikz_code": tikz,

@@ -225,7 +225,8 @@ def verify_export(export_dir, *, require_complete: bool = True,
 
     logical_hashes = []
     total_rows = 0
-    expected_index = 0
+    previous_source_index = None
+    row_ordinal = 0
     seen_ids = set()
     for record in shard_records:
         name = record.get("name")
@@ -251,16 +252,23 @@ def verify_export(export_dir, *, require_complete: bool = True,
                     raise DataError(f"Shard {name}: row is missing {key!r}")
             digest_parts.append(logical_row_json(row) + "\n")
             if not quick:
-                _verify_row_content(row, name, expected_index)
+                _verify_row_content(row, name, row_ordinal)
                 if row["id"] in seen_ids:
                     raise DataError(f"Shard {name}: duplicate row id {row['id']}")
                 seen_ids.add(row["id"])
-                if row["source_row_index"] != expected_index:
+                source_index = row["source_row_index"]
+                if not isinstance(source_index, int) or source_index < 0:
                     raise DataError(
-                        f"Shard {name}: expected source_row_index {expected_index}, "
-                        f"found {row['source_row_index']}; shards are not a "
-                        "contiguous ordered export")
-                expected_index += 1
+                        f"Shard {name}: row {row['id']} has invalid "
+                        f"source_row_index {source_index!r}")
+                if (previous_source_index is not None
+                        and source_index <= previous_source_index):
+                    raise DataError(
+                        f"Shard {name}: source_row_index {source_index} follows "
+                        f"{previous_source_index}; completed rows are not in "
+                        "strict source order")
+                previous_source_index = source_index
+                row_ordinal += 1
                 for key, expected in (("source_dataset", source_dataset),
                                       ("source_revision", source_revision),
                                       ("caption_model", caption_model),
@@ -270,6 +278,13 @@ def verify_export(export_dir, *, require_complete: bool = True,
                         raise DataError(
                             f"Shard {name}: row {row['id']} has {key}="
                             f"{row.get(key)!r}, expected {expected!r}")
+        if rows:
+            for key, actual in (("first_index", rows[0]["source_row_index"]),
+                                ("last_index", rows[-1]["source_row_index"])):
+                if key in record and record.get(key) != actual:
+                    raise DataError(
+                        f"Shard {name} {key} mismatch: metadata says "
+                        f"{record.get(key)}, file has {actual}")
         shard_digest = sha256_text("".join(digest_parts))
         if shard_digest != record.get("logical_sha256"):
             raise DataError(

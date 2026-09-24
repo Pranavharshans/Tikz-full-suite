@@ -113,6 +113,16 @@ class VerifyExportTests(unittest.TestCase):
         with self.assertRaises(DataError):
             data_module.verify_export(self.export["root"])
 
+    def test_rejected_source_index_gap_is_allowed(self):
+        rows = support.default_rows()
+        for index, row in enumerate(rows):
+            row["source_row_index"] = index if index < 3 else index + 1
+        export = support.make_export(self.root / "gap-export", rows=rows,
+                                     rejected_rows=1)
+        info = data_module.verify_export(export["root"])
+        self.assertEqual(info.rows, len(rows))
+        self.assertEqual(info.rejected_rows, 1)
+
     def test_duplicate_row_ids_are_detected(self):
         import pyarrow as pa
         import pyarrow.parquet as parquet
