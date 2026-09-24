@@ -1,0 +1,12 @@
+{#
+  Single-turn Stage 1 template. Assistant content is emitted byte-for-byte:
+  never parse <think> tags because they may be literal text inside TikZ.
+#}
+{%- for message in messages %}
+    {{- '<|im_start|>' + message['role'] + '\n' }}
+    {{- message['content'] }}
+    {{- '<|im_end|>\n' }}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+{%- endif %}

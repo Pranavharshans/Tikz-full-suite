@@ -3,8 +3,9 @@
 Design rules:
 
 - Every unknown key is an error. There is no silent acceptance of typos.
-- Paths that reach the filesystem must be absolute. User-specific remote paths
-  are never committed; configs ship with ``null`` and CLIs supply them.
+- User-specific data/model paths must be absolute and are supplied by CLIs.
+  Repository auxiliary files such as locks and chat templates may be relative
+  and are resolved deterministically against the config location.
 - Identity-bearing settings are separated from provenance-only settings. A
   resolved config exposes ``identity_payload()``; local paths are excluded
   because content hashes (dataset logical hash, split-manifest hash, lock file
@@ -488,8 +489,11 @@ def _parse_model(raw: dict, source: str) -> ModelConfig:
 def _parse_tokenizer(raw: dict, source: str) -> TokenizerConfig:
     path = f"{source}.tokenizer"
     _check_keys(raw, ("chat_template_file", "chat_template_kwargs", "pad_token"), path)
-    template = _optional_absolute(raw.get("chat_template_file"),
-                                  f"{path}.chat_template_file")
+    template_value = raw.get("chat_template_file")
+    template = None
+    if template_value is not None:
+        template = Path(_expect_str(
+            template_value, f"{path}.chat_template_file"))
     kwargs = _expect_mapping(raw.get("chat_template_kwargs", {}),
                              f"{path}.chat_template_kwargs")
     for key in kwargs:
@@ -854,6 +858,9 @@ def load_config(path) -> Stage1Config:
     config = parse_config(raw, source=str(path))
     config.config_path = path
     config.source_sha256 = canonical_digest(raw)
+    if config.tokenizer.chat_template_file:
+        config.tokenizer.chat_template_file = resolve_aux_file(
+            path, str(config.tokenizer.chat_template_file))
     if config.environment.lock_file:
         lock_path = resolve_aux_file(path, config.environment.lock_file)
         config.environment.lock_path = lock_path

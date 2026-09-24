@@ -1,9 +1,9 @@
-"""Network-marked integration tests for the real tokenizers and templates.
+"""Network-marked integration tests for the real tokenizers and pinned template.
 
 Skipped unless ``STAGE1_ALLOW_NETWORK_TESTS=1`` is set, so ordinary unit test
 runs never download anything. Run this on the GPU host (or any networked
 machine) before the preflight: it proves that both pinned tokenizers load, that
-the native chat templates render the expected empty think block, and that the
+the verbatim template preserves literal thinking tags, and that the
 assistant-only mask boundary lands exactly on the target text.
 
   STAGE1_ALLOW_NETWORK_TESTS=1 python3 -m unittest tests.test_network_integration -v
@@ -22,8 +22,8 @@ ALLOW = os.environ.get("STAGE1_ALLOW_NETWORK_TESTS") == "1"
 HAS_TRANSFORMERS = importlib.util.find_spec("transformers") is not None
 
 INSTRUCTION = "Draw a right triangle with a labeled hypotenuse."
-TIKZ = ("\\begin{tikzpicture}\\draw (0,0) -- (2,0) -- (0,1.5) -- cycle;"
-        "\\end{tikzpicture}")
+TIKZ = ("\\begin{tikzpicture}\\node {<think>literal</think>};"
+        "\\draw (0,0) -- (2,0) -- (0,1.5) -- cycle;\\end{tikzpicture}")
 
 CONFIGS = {
     "qwen3.5": "configs/qwen3.5-4b-full.yaml",
@@ -61,8 +61,8 @@ class RealTokenizerTests(unittest.TestCase):
                     template=template,
                     kwargs=config.tokenizer.chat_template_kwargs)
                 self.assertTrue(full_text.startswith(prompt_text))
-                self.assertIn("</think>", prompt_text,
-                              "expected the empty think block in the prompt")
+                self.assertEqual(full_text[len(prompt_text):-len("<|im_end|>\n")],
+                                 TIKZ)
 
 
 if __name__ == "__main__":

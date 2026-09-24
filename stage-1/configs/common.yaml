@@ -25,12 +25,13 @@ model:
   attn_implementation: null
 
 tokenizer:
-  # Optional absolute path to a chat-template Jinja file. When null, the
-  # tokenizer's own template is used.
-  chat_template_file: null
-  # Passed to apply_chat_template. enable_thinking=false makes both shipped
-  # templates render an empty think block, which keeps the prompt a strict
-  # prefix of the full conversation.
+  # The native Qwen template treats any literal </think> inside assistant
+  # content as a reasoning delimiter. TikZ can contain that text in labels,
+  # so Stage 1 uses a pinned verbatim ChatML template that never rewrites the
+  # target. Relative auxiliary paths resolve from this config or stage-1/.
+  chat_template_file: templates/verbatim-chatml.jinja
+  # Passed to apply_chat_template. The pinned verbatim template deliberately
+  # ignores model-specific thinking switches.
   chat_template_kwargs:
     enable_thinking: false
   pad_token: null       # override only when the tokenizer has no pad token

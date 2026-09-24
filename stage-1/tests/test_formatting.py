@@ -150,6 +150,16 @@ class TemplateResolutionTests(unittest.TestCase):
             self.assertEqual(template.source, str(path))
             self.assertIn("messages", template.text)
 
+    @support.requires_yaml
+    def test_shipped_template_does_not_parse_literal_think_tags(self):
+        config = config_module.load_config(
+            Path(__file__).resolve().parents[1] /
+            "configs/qwen3.5-4b-lora.yaml")
+        template = formatting.resolve_chat_template(
+            support.FakeTokenizer(), config.tokenizer)
+        self.assertNotIn("split('</think>')", template.text)
+        self.assertIn("message['content']", template.text)
+
 
 class ExampleJsonTests(unittest.TestCase):
     def test_to_jsonable_has_no_token_lists(self):

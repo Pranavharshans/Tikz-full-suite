@@ -58,6 +58,15 @@ class ParsingTests(unittest.TestCase):
         with self.assertRaisesRegex(ConfigError, "absolute"):
             support.make_config(model={"local_path": "relative/model"})
 
+    @support.requires_yaml
+    def test_shipped_relative_chat_template_is_resolved(self):
+        config = config_module.load_config(
+            REPO_STAGE1 / "configs/minicpm5-2b-lora.yaml")
+        self.assertTrue(config.tokenizer.chat_template_file.is_absolute())
+        self.assertEqual(config.tokenizer.chat_template_file.name,
+                         "verbatim-chatml.jinja")
+        self.assertTrue(config.tokenizer.chat_template_file.is_file())
+
     def test_split_fractions_must_sum_below_one(self):
         with self.assertRaisesRegex(ConfigError, "must be < 1"):
             support.make_config(data={"splits": {"validation_fraction": 0.5,
