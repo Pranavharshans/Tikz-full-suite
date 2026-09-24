@@ -401,6 +401,24 @@ class ReloadTrainingStateTests(unittest.TestCase):
             "labels": torch.tensor([[1, 2, 3, 4]]),
         }
 
+    def test_eval_dtype_cast_is_detected_before_silent_precision_loss(self):
+        """bf16_full_eval casts the live model in place; the verifier must
+        refuse to compare a bf16 live adapter against the fp32 artifact."""
+        import torch
+
+        model = self.reload_adapter()
+        directory = self.root / "adapter"
+        adapter_dtype = next(parameter.dtype for name, parameter
+                             in model.named_parameters() if "lora_" in name)
+        self.assertEqual(adapter_dtype, torch.float32)
+        model.to(torch.bfloat16)
+        with self.assertRaisesRegex(CheckpointError, "dtype mismatch"):
+            checkpointing.load_artifact_weights(model, directory, method="lora")
+        model.to(torch.float32)
+        report = checkpointing.load_artifact_weights(
+            model, directory, method="lora")
+        self.assertTrue(report["readback_verified"])
+
     def test_flag_only_reload_fails_a_training_forward_in_the_decoder(self):
         model = self.reload_adapter()
         _FlagOnlyForTraining.for_training(model)

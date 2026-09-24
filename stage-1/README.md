@@ -377,6 +377,12 @@ preflight additionally replays the next optimizer step from recorded gradients
 on the restored state and requires identical weights, optimizer state and
 learning rate.
 
+Because `training.bf16_full_eval` makes `Trainer.evaluate()` cast the live
+model to bfloat16 in place, the gate's final evaluation runs **after**
+checkpoint verification and the final-weight restore: verifying or restoring
+the fp32 artifacts against a bf16-cast model would round the adapters and fail
+the exact comparison (or silently degrade the restored weights).
+
 **Hardware profiles.** `hardware.profile` selects a built-in expectation
 bundle:
 

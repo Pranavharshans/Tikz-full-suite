@@ -995,14 +995,6 @@ def run_training(config, paths, gate_name: str, *, local_files_only: bool = Fals
         "verified": True,
     }
 
-    eval_loss = None
-    if eval_stats["examples"] > 0:
-        evaluation = trainer.evaluate()
-        eval_loss = evaluation.get("eval_loss")
-        if eval_loss is not None and not math.isfinite(float(eval_loss)):
-            eval_loss = None
-            say("warning: final validation loss was not finite")
-
     say("verifying the latest same-gate checkpoint")
     checkpoints = checkpointing.list_checkpoints(paths.run_dir, gate_name)
     checkpoint_report = {"path": None, "verified": False,
@@ -1036,6 +1028,19 @@ def run_training(config, paths, gate_name: str, *, local_files_only: bool = Fals
         checkpoint_report["reason"] = (
             "no checkpoint was written; lower training.save_steps so at least "
             "one checkpoint lands inside the gate")
+
+    # The final evaluation runs only after checkpoint verification and the
+    # final weight restore. With bf16_full_eval the Trainer casts the live
+    # model to bfloat16 in place; doing that first would round the fp32 LoRA
+    # adapters and make the exact artifact comparison below fail (and would
+    # silently degrade the restored weights).
+    eval_loss = None
+    if eval_stats["examples"] > 0:
+        evaluation = trainer.evaluate()
+        eval_loss = evaluation.get("eval_loss")
+        if eval_loss is not None and not math.isfinite(float(eval_loss)):
+            eval_loss = None
+            say("warning: final validation loss was not finite")
 
     say("running the fixed evaluation sample for this gate")
     generation_split = _gate_generation_split(gate_name, eligibility)
