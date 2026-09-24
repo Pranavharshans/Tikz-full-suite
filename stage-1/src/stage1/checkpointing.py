@@ -320,7 +320,13 @@ def _tensors_equal(left, right) -> bool:
         if getattr(right, "shape", None) != left.shape:
             return False
         try:
-            return bool((left == right).all())
+            # Saved safetensors are read on CPU while the live PEFT adapter is
+            # normally on CUDA. Compare values on the same device; treating a
+            # cross-device comparison error as inequality creates a false
+            # failure even when the numeric delta is exactly zero.
+            left_value = left.detach().cpu() if hasattr(left, "detach") else left
+            right_value = right.detach().cpu() if hasattr(right, "detach") else right
+            return bool((left_value == right_value).all())
         except Exception:  # pragma: no cover - exotic tensor types
             return False
     return left == right

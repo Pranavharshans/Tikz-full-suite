@@ -191,6 +191,17 @@ class GpuProfileTests(unittest.TestCase):
 
 
 class IndividualCheckTests(unittest.TestCase):
+    def test_lazy_unsloth_logits_are_valid_for_loss_only_forward(self):
+        lazy_logits = types.SimpleNamespace(shape=lambda: None)
+        outputs = types.SimpleNamespace(logits=lazy_logits)
+        self.assertIsNone(preflight._materialized_logits_shape(outputs))
+
+    def test_materialized_logits_shape_is_recorded(self):
+        outputs = types.SimpleNamespace(
+            logits=types.SimpleNamespace(shape=(2, 17, 130560)))
+        self.assertEqual(
+            preflight._materialized_logits_shape(outputs), (2, 17, 130560))
+
     def test_direct_forward_explicitly_disables_kv_cache(self):
         calls = []
 

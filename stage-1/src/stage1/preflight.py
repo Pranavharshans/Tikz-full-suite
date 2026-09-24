@@ -68,6 +68,23 @@ def _forward_no_cache(model, batch):
     return model(**batch, use_cache=False)
 
 
+def _materialized_logits_shape(outputs):
+    """Return a logits shape only when the training forward materialized one.
+
+    Unsloth may deliberately replace logits with a lazy sentinel while still
+    returning a valid loss. SFT training consumes that loss, so absence of a
+    materialized logits tensor is not a failed forward.
+    """
+    logits = getattr(outputs, "logits", None)
+    shape = getattr(logits, "shape", None)
+    if shape is None or callable(shape):
+        return None
+    try:
+        return tuple(shape)
+    except TypeError:
+        return None
+
+
 @dataclass
 class PreflightContext:
     config: object
@@ -461,7 +478,7 @@ def check_one_step(ctx: PreflightContext) -> dict:
         with torch.no_grad():
             eval_outputs = _forward_no_cache(model, batch)
         eval_loss = float(eval_outputs.loss)
-        logits_shape = tuple(eval_outputs.logits.shape)
+        logits_shape = _materialized_logits_shape(eval_outputs)
     except Exception as exc:
         return _fail(
             f"eval-mode forward failed: {type(exc).__name__}: {exc}\n"
@@ -479,7 +496,9 @@ def check_one_step(ctx: PreflightContext) -> dict:
     return _pass(
         f"loss {float(loss):.4f}, grad norm {grad_norm:.4f}, "
         f"{elapsed:.2f}s, peak VRAM {peak_detail}",
-        loss=float(loss), eval_loss=eval_loss, logits_shape=list(logits_shape),
+        loss=float(loss), eval_loss=eval_loss,
+        logits_shape=(list(logits_shape) if logits_shape is not None else None),
+        logits_materialized=logits_shape is not None,
         grad_norm=grad_norm, seconds=round(elapsed, 4),
         peak_vram_bytes=peak_vram, supervised_tokens=plan.supervised_tokens)
 
@@ -631,7 +650,7 @@ def check_model_reload(ctx: PreflightContext, *, base_loader=None,
     plan = ctx.scratch.get("batch_plan")
     loss_before = ctx.scratch.get("eval_loss")
     shape_before = ctx.scratch.get("logits_shape")
-    if plan is None or loss_before is None or shape_before is None:
+    if plan is None or loss_before is None:
         return _fail(
             "the one-step check did not record an eval-mode batch to compare "
             "against; cannot verify a reload")
@@ -684,12 +703,14 @@ def check_model_reload(ctx: PreflightContext, *, base_loader=None,
                 f"forward pass on the reloaded model failed: "
                 f"{type(exc).__name__}: {exc}")
         loss_after = float(outputs.loss)
-        shape_after = tuple(outputs.logits.shape)
+        shape_after = _materialized_logits_shape(outputs)
         if loss_after != loss_after or loss_after == float("inf"):
             return _fail(f"reloaded loss is not finite: {loss_after}")
-        if shape_after != tuple(shape_before):
+        if ((shape_before is None) != (shape_after is None) or
+                (shape_before is not None and shape_after != tuple(shape_before))):
             return _fail(
-                f"reloaded logits shape {shape_after} != original {tuple(shape_before)}")
+                f"reloaded logits shape {shape_after} != original "
+                f"{tuple(shape_before) if shape_before is not None else None}")
         difference = abs(loss_after - float(loss_before))
         if difference > 0.1:
             return _fail(
@@ -698,9 +719,11 @@ def check_model_reload(ctx: PreflightContext, *, base_loader=None,
         return _pass(
             f"reloaded through {report['loader']}; eval loss "
             f"{loss_before:.6f} -> {loss_after:.6f} (diff {difference:.2e}), "
-            f"logits shape {shape_after}",
+            f"logits shape {shape_after if shape_after is not None else 'not materialized'}",
             loss_before=float(loss_before), loss_after=loss_after,
-            loss_abs_diff=difference, logits_shape=list(shape_after),
+            loss_abs_diff=difference,
+            logits_shape=(list(shape_after) if shape_after is not None else None),
+            logits_materialized=shape_after is not None,
             reload_verified=True, loader=report["loader"])
     finally:
         shutil.rmtree(directory, ignore_errors=True)

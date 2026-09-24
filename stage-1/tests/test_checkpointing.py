@@ -134,6 +134,31 @@ class AdapterStateComparisonTests(unittest.TestCase):
         self.assertEqual(report["compared"], 2)
         self.assertEqual(report["adapter_parameters"], 2)
 
+    def test_tensor_values_are_compared_on_cpu(self):
+        class DeviceTensor(_AdapterTensor):
+            def __init__(self, value, device):
+                super().__init__(value)
+                self.device = device
+
+            def detach(self):
+                return self
+
+            def cpu(self):
+                return DeviceTensor(self.value, "cpu")
+
+            def __eq__(self, other):
+                if self.device != getattr(other, "device", None):
+                    raise RuntimeError("cross-device comparison")
+                return _AdapterMask(self.value == other.value)
+
+        saved = {"model.layers.0.q_proj.lora_A.weight":
+                 DeviceTensor(7, "cpu")}
+        restored = {"model.layers.0.q_proj.lora_A.weight":
+                    DeviceTensor(7, "cuda")}
+        report = checkpointing.compare_adapter_states(saved, restored)
+        self.assertEqual(report["problems"], [])
+        self.assertEqual(report["compared"], 1)
+
     def test_base_weight_omissions_are_not_problems(self):
         # The saved adapter never contains base weights; only adapter keys are
         # compared, so their absence can never be reported.
