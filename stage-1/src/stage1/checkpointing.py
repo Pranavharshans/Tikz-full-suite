@@ -20,6 +20,7 @@ directory is copied.
 """
 from __future__ import annotations
 
+import math
 import re
 from pathlib import Path
 
@@ -509,6 +510,142 @@ def load_artifact_weights(model, directory, *, method: str = "full",
 # Resume-state verification (torch injected)
 # ---------------------------------------------------------------------------
 
+RESUME_PLAN_FILE = "stage1-resume-plan.json"
+
+# The exact weight-decay filter Hugging Face Trainer applies in
+# ``get_decay_parameter_names`` (transformers 4.57): bias and every norm
+# spelling. The parity test compares this against the installed Trainer.
+DECAY_FORBIDDEN_NAME_PATTERNS = (
+    r"bias", r"layernorm", r"rmsnorm",
+    r"(?:^|\.)norm(?:$|\.)", r"_norm(?:$|\.)")
+
+
+def decay_parameter_names(model) -> list:
+    """Names of parameters that receive weight decay, per the Trainer filter."""
+    try:
+        from torch import nn
+        from transformers.trainer_pt_utils import get_parameter_names
+    except ImportError as exc:  # pragma: no cover - environment dependent
+        raise CheckpointError(
+            "torch and transformers are required to reconstruct the production "
+            "optimizer grouping") from exc
+    return get_parameter_names(
+        model, [nn.LayerNorm], list(DECAY_FORBIDDEN_NAME_PATTERNS))
+
+
+def build_optimizer(torch, model, *, learning_rate, fused, decay_names=None,
+                    weight_decay=0.0, betas=(0.9, 0.999), eps=1e-8):
+    """The same named, two-group AdamW layout used by the production Trainer.
+
+    The groups keep Hugging Face Trainer's exact layout (decay first, no-decay
+    second, both present even when empty). A ``state_dict`` post-hook stamps
+    ``param_names`` into ``optimizer.pt``, so every serialized state entry can
+    be anchored to a model parameter instead of the flattened order; building
+    the groups from ``named_parameters()`` directly would make PyTorch reject
+    the mixed named/unnamed case an empty group creates.
+    """
+    if decay_names is None:
+        decay_names = decay_parameter_names(model)
+    decay_names = set(decay_names)
+    named = [(name, parameter) for name, parameter in model.named_parameters()
+             if parameter.requires_grad]
+    groups = [
+        {"params": [parameter for name, parameter in named
+                    if name in decay_names],
+         "weight_decay": weight_decay},
+        {"params": [parameter for name, parameter in named
+                    if name not in decay_names],
+         "weight_decay": 0.0},
+    ]
+    optimizer = torch.optim.AdamW(groups, lr=learning_rate, fused=fused,
+                                  betas=betas, eps=eps)
+    _register_parameter_names(optimizer, named)
+    return optimizer
+
+
+def _register_parameter_names(optimizer, named) -> None:
+    """Record each optimizer group entry's parameter name in ``state_dict()``.
+
+    PyTorch 2.12 stores ``param_names`` natively when groups are built from
+    ``named_parameters()``; stamping the packed state dict avoids the
+    named/unnamed constructor restriction while keeping the same information
+    inside ``optimizer.pt``.
+    """
+    register = getattr(optimizer, "register_state_dict_post_hook", None)
+    if register is None:  # pragma: no cover - older torch fallback
+        return
+    names_by_id = {id(parameter): name for name, parameter in named}
+
+    def add_parameter_names(optimizer, state_dict):
+        groups = state_dict.get("param_groups")
+        if not isinstance(groups, list):
+            return state_dict
+        for group, live_group in zip(groups, optimizer.param_groups):
+            group["param_names"] = [
+                names_by_id[id(parameter)] for parameter in live_group["params"]
+                if id(parameter) in names_by_id]
+        return state_dict
+
+    register(add_parameter_names)
+
+
+def write_resume_plan(directory, *, model, optimizer, num_training_steps,
+                      num_warmup_steps):
+    """Persist information LambdaLR intentionally omits from state_dict()."""
+    names = {id(parameter): name for name, parameter in model.named_parameters()}
+    groups = [[names[id(parameter)] for parameter in group["params"]]
+              for group in optimizer.param_groups]
+    write_json_atomic(Path(directory) / RESUME_PLAN_FILE, {
+        "schema_version": 1, "scheduler": "cosine",
+        "num_training_steps": int(num_training_steps),
+        "num_warmup_steps": int(num_warmup_steps),
+        "parameter_groups": groups,
+    })
+
+
+def optimizer_group_names(state) -> list | None:
+    """Parameter names serialized by a names-aware optimizer, if present.
+
+    ``build_optimizer`` stamps ``param_names`` into every group inside
+    ``optimizer.pt``. A checkpoint carrying them was written by this code and
+    must also carry the resume plan, so a missing sidecar can never silently
+    downgrade verification.
+    """
+    if not isinstance(state, dict):
+        return None
+    groups = state.get("param_groups")
+    if not isinstance(groups, list) or not groups:
+        return None
+    names = []
+    for group in groups:
+        if not isinstance(group, dict) or not isinstance(group.get("param_names"), list):
+            return None
+        names.append(list(group["param_names"]))
+    return names
+
+
+def _optimizer_from_plan(torch, model, saved, plan, *, learning_rate, fused):
+    """Bind checkpoint groups to names, never to coincidental tensor shapes."""
+    named = {name: parameter for name, parameter in model.named_parameters()
+             if parameter.requires_grad}
+    groups = plan.get("parameter_groups")
+    if not isinstance(groups, list) or len(groups) != len(saved["param_groups"]):
+        raise CheckpointError("Resume parameter-group metadata does not match optimizer")
+    flat = [name for group in groups for name in group]
+    if len(flat) != len(set(flat)) or set(flat) != set(named):
+        raise CheckpointError("Resume parameter names do not match trainable model parameters")
+    rebuilt = []
+    for names, saved_group in zip(groups, saved["param_groups"]):
+        if len(names) != len(saved_group["params"]):
+            raise CheckpointError("Resume parameter-group size does not match optimizer")
+        saved_names = saved_group.get("param_names")
+        if saved_names is not None and list(saved_names) != list(names):
+            raise CheckpointError(
+                "Resume parameter names disagree between the optimizer state "
+                "and the resume plan")
+        rebuilt.append({"params": [named[name] for name in names]})
+    return torch.optim.AdamW(rebuilt, lr=learning_rate, fused=fused)
+
 
 def _optimizer_states_equal(left: dict, right: dict) -> bool:
     if left.get("param_groups") != right.get("param_groups"):
@@ -525,7 +662,7 @@ def _optimizer_states_equal(left: dict, right: dict) -> bool:
             if hasattr(value, "shape"):
                 if getattr(other, "shape", None) != value.shape:
                     return False
-                if not bool((value == other).all()):
+                if not _tensors_equal(value, other):
                     return False
             elif value != other:
                 return False
@@ -715,7 +852,15 @@ def verify_scheduler_state(saved_state: dict, restored_state: dict, *,
 
 def _compare_lambda_schedules(saved_state, fresh_state, num_training_steps,
                               num_warmup_steps, *, tolerance: float) -> dict:
-    """Probe saved and freshly reconstructed lambdas at key steps."""
+    """Probe saved and freshly reconstructed lambdas at key steps.
+
+    Informational only: PyTorch does not serialize the lambdas (``LambdaLR``
+    saves ``None`` for plain functions and the callable's ``__dict__`` for
+    objects, which is ``{}`` for the ``functools.partial`` Transformers uses),
+    so a real checkpoint cannot be probed this way. Schedule identity comes
+    from the resume plan; this probe only compares when a caller passes
+    in-memory schedulers.
+    """
     saved_lambdas = saved_state.get("lr_lambdas")
     fresh_lambdas = fresh_state.get("lr_lambdas")
     if (not isinstance(saved_lambdas, (list, tuple)) or not saved_lambdas
@@ -723,6 +868,11 @@ def _compare_lambda_schedules(saved_state, fresh_state, num_training_steps,
             or len(fresh_lambdas) != len(saved_lambdas)):
         return {"compared": False, "match": None, "mismatched_steps": [],
                 "reason": "lambda lists are missing or have different lengths"}
+    if not all(callable(function) for function in saved_lambdas):
+        return {"compared": False, "match": None, "mismatched_steps": [],
+                "reason": ("PyTorch did not serialize the scheduler lambdas "
+                           "(None/__dict__ entries); schedule identity is "
+                           f"verified from {RESUME_PLAN_FILE}")}
     steps = sorted({0, max(0, num_warmup_steps - 1), num_warmup_steps,
                     num_training_steps // 2, num_training_steps - 1,
                     num_training_steps})
@@ -742,21 +892,51 @@ def _compare_lambda_schedules(saved_state, fresh_state, num_training_steps,
             "steps": steps, "lambdas": len(saved_lambdas)}
 
 
+def scheduler_current_lrs(scheduler) -> list | None:
+    """Recompute the LR the restored schedule assigns at its restored step.
+
+    Uses the scheduler's own lambdas, its saved ``base_lrs`` and its saved
+    ``last_epoch`` (both restored by ``load_state_dict``); returns ``None``
+    when they are not usable, so the check is skipped rather than claimed.
+    """
+    lambdas = getattr(scheduler, "lr_lambdas", None)
+    base_lrs = getattr(scheduler, "base_lrs", None)
+    last_epoch = getattr(scheduler, "last_epoch", None)
+    if (not isinstance(lambdas, (list, tuple))
+            or not isinstance(base_lrs, (list, tuple))
+            or len(lambdas) != len(base_lrs) or last_epoch is None
+            or not all(callable(function) for function in lambdas)):
+        return None
+    try:
+        return [float(function(last_epoch)) * float(base)
+                for function, base in zip(lambdas, base_lrs)]
+    except Exception:
+        return None
+
+
 def verify_resume_state(checkpoint_dir, *, torch, model, learning_rate: float,
                         fused: bool, num_training_steps: int,
                         num_warmup_steps: int, device="cuda",
                         expected_optimizer_state: dict | None = None,
-                        scheduler_factory=None) -> dict:
+                        scheduler_factory=None, continuation=None) -> dict:
     """Restore optimizer, scheduler and trainer state from a checkpoint.
 
     The scheduler is reconstructed exactly as production builds it -
     ``transformers.get_scheduler("cosine", optimizer, num_warmup_steps=...,
     num_training_steps=...)`` - and its state is loaded and verified. The
-    configured initial learning rate is compared against the saved scheduler
-    ``base_lrs`` *before* the optimizer state is loaded, because loading that
-    state restores its own param-group learning rates and would mask a
-    configuration mismatch. When ``expected_optimizer_state`` is supplied, the
-    restored optimizer state must equal it field for field.
+    restore order is PyTorch's required one: optimizer, then scheduler
+    construction, then the optimizer state, then the scheduler state
+    (constructing a scheduler overwrites ``param_group["lr"]`` and would
+    otherwise reset the restored LR to warmup step zero). The configured
+    initial LR is compared against the saved scheduler ``base_lrs`` *before*
+    the optimizer state is loaded; afterwards the restored ``initial_lr`` and
+    current ``lr`` are checked against the scheduler checkpoint and the
+    reconstructed schedule. Optimizer state is mapped per parameter, must be
+    complete after step >= 1, and a names-aware checkpoint must carry the
+    resume plan that pins the schedule (PyTorch does not serialize the
+    lambdas). When ``expected_optimizer_state`` is supplied, the restored
+    optimizer state must equal it field for field; ``continuation`` runs one
+    further step on the restored objects and may raise ``CheckpointError``.
     """
     import json as json_module
 
@@ -785,18 +965,50 @@ def verify_resume_state(checkpoint_dir, *, torch, model, learning_rate: float,
         num_warmup_steps=num_warmup_steps)
     # 2. Compare the configured initial LR before the optimizer state is loaded.
     initial_lr = check_saved_initial_lr(saved_scheduler_state, learning_rate)
+    resume_plan_path = checkpoint_dir / RESUME_PLAN_FILE
+    resume_plan = read_json(resume_plan_path) if resume_plan_path.is_file() else None
+    saved_group_names = optimizer_group_names(saved_optimizer_state)
+    if resume_plan is None and saved_group_names is not None:
+        # Names-aware groups only come from the corrected builder; such a
+        # checkpoint must carry the schedule sidecar. Refuse instead of
+        # silently falling back to an unverified reconstruction.
+        raise CheckpointError(
+            f"{checkpoint_dir} has a names-aware optimizer but no "
+            f"{RESUME_PLAN_FILE}; refusing to verify its schedule and "
+            "parameter mapping without the resume plan")
+    if resume_plan is not None:
+        for name, expected in (("scheduler", "cosine"),
+                               ("num_training_steps", num_training_steps),
+                               ("num_warmup_steps", num_warmup_steps)):
+            if resume_plan.get(name) != expected:
+                raise CheckpointError(
+                    f"Resume schedule {name}: checkpoint={resume_plan.get(name)!r}, "
+                    f"this run={expected!r}")
+        plan["schedule_parameters_verified"] = True
+        plan["proof"] = RESUME_PLAN_FILE
 
     # 3. Rebuild the production optimizer and scheduler, then load the states.
+    # PyTorch requires the scheduler to be initialized before
+    # optimizer.load_state_dict(): constructing LambdaLR after restoring the
+    # optimizer immediately rewrites its current LR to warmup step zero and
+    # corrupts the state we are trying to verify.
     try:
-        restored_optimizer = torch.optim.AdamW(trainable, lr=learning_rate,
-                                               fused=fused)
-        restored_optimizer.load_state_dict(saved_optimizer_state)
+        if resume_plan is not None:
+            restored_optimizer = _optimizer_from_plan(
+                torch, model, saved_optimizer_state, resume_plan,
+                learning_rate=learning_rate, fused=fused)
+        else:
+            # Legacy single-group probes can still be inspected, with explicit
+            # unverified schedule identity. Production checkpoints write names.
+            restored_optimizer = torch.optim.AdamW(trainable, lr=learning_rate,
+                                                   fused=fused)
         if scheduler_factory is None:
             scheduler_factory = _transformers_scheduler_factory()
         restored_scheduler = scheduler_factory(
             restored_optimizer, num_warmup_steps=plan["num_warmup_steps"],
             num_training_steps=plan["num_training_steps"])
         fresh_scheduler_state = restored_scheduler.state_dict()
+        restored_optimizer.load_state_dict(saved_optimizer_state)
         restored_scheduler.load_state_dict(saved_scheduler_state)
     except CheckpointError:
         raise
@@ -811,36 +1023,105 @@ def verify_resume_state(checkpoint_dir, *, torch, model, learning_rate: float,
         raise CheckpointError(
             f"{state_path} has an invalid global_step: {global_step!r}")
 
-    shapes = {}
-    for parameter, entry in zip(trainable, restored_optimizer.state.values()):
+    # 4. Parameter-mapped optimizer state: every entry must belong to an
+    # optimized parameter with the right shapes, and after at least one step
+    # every optimized parameter must carry a complete Adam state.
+    optimized_parameters = [parameter
+                            for group in restored_optimizer.param_groups
+                            for parameter in group["params"]]
+    state_fields = set()
+    required_adam_fields = {"step", "exp_avg", "exp_avg_sq"}
+    for parameter, entry in restored_optimizer.state.items():
+        missing_fields = required_adam_fields - set(entry)
+        if global_step >= 1 and missing_fields:
+            raise CheckpointError(
+                f"Optimizer state in {checkpoint_dir} is missing field(s) "
+                f"{sorted(missing_fields)} for an optimized parameter after "
+                f"step {global_step}")
         for field_name, value in entry.items():
             if hasattr(value, "shape") and hasattr(parameter, "shape"):
+                state_fields.add(field_name)
                 if field_name in ("exp_avg", "exp_avg_sq") and value.shape != parameter.shape:
                     raise CheckpointError(
                         f"Optimizer state {field_name} shape {tuple(value.shape)} "
                         f"does not match parameter shape {tuple(parameter.shape)}")
-                shapes[field_name] = list(value.shape) if hasattr(value, "shape") else None
+    if global_step >= 1 and len(restored_optimizer.state) != len(optimized_parameters):
+        raise CheckpointError(
+            f"Optimizer state in {checkpoint_dir} covers "
+            f"{len(restored_optimizer.state)} of {len(optimized_parameters)} "
+            f"optimized parameter(s) at global step {global_step}; refusing a "
+            "partial optimizer state")
     if expected_optimizer_state is not None and not _optimizer_states_equal(
             expected_optimizer_state, restored_optimizer.state_dict()):
         raise CheckpointError(
             f"Restored optimizer state in {checkpoint_dir} does not match the "
             "expected state")
-    restored_base_lrs = [group.get("lr") for group in restored_optimizer.param_groups]
+
+    # 5. Explicit base-vs-current LR checks. The optimizer state load restores
+    # the saved param-group learning rates; the scheduler state load restores
+    # last_epoch without touching them. Both the restored base LR
+    # (``initial_lr``) and the current LR are compared against the scheduler
+    # checkpoint and against the reconstructed schedule.
+    restored_base_lrs = []
+    missing_base_lrs = []
+    for index, group in enumerate(restored_optimizer.param_groups):
+        value = group.get("initial_lr")
+        if value is None:
+            missing_base_lrs.append(f"param_groups[{index}]")
+        else:
+            restored_base_lrs.append(float(value))
+    if missing_base_lrs:
+        raise CheckpointError(
+            "Restored optimizer state has no initial_lr for "
+            f"{missing_base_lrs}; the base learning rates cannot be verified "
+            "against the scheduler checkpoint")
+    restored_current_lrs = [float(group.get("lr"))
+                            for group in restored_optimizer.param_groups]
+    saved_last_lrs = saved_scheduler_state.get("_last_lr")
+    if saved_last_lrs is not None:
+        saved_current_lrs = [float(value) for value in saved_last_lrs]
+        if restored_current_lrs != saved_current_lrs:
+            raise CheckpointError(
+                "Restored optimizer learning rates do not match the scheduler "
+                f"checkpoint: optimizer={restored_current_lrs}, "
+                f"scheduler_last_lr={saved_current_lrs}")
+    expected_current_lrs = scheduler_current_lrs(restored_scheduler)
+    if expected_current_lrs is not None:
+        mismatched_lrs = [
+            index for index, (actual, expected) in
+            enumerate(zip(restored_current_lrs, expected_current_lrs))
+            if not math.isclose(actual, expected, rel_tol=1e-9, abs_tol=1e-12)]
+        if mismatched_lrs:
+            raise CheckpointError(
+                "Restored optimizer learning rates do not match the "
+                "reconstructed cosine schedule at step "
+                f"{restored_scheduler.last_epoch}: "
+                f"optimizer={restored_current_lrs}, "
+                f"schedule={expected_current_lrs}")
     scheduler_report = verify_scheduler_state(
         saved_scheduler_state, restored_scheduler.state_dict(),
-        fresh_state=fresh_scheduler_state, expected_base_lrs=restored_base_lrs,
+        fresh_state=fresh_scheduler_state,
+        expected_base_lrs=restored_base_lrs,
         expected_warmup_steps=plan["num_warmup_steps"],
         expected_training_steps=plan["num_training_steps"])
+    continuation_report = continuation(restored_optimizer, restored_scheduler) \
+        if continuation is not None else None
     return {
         "verified": True,
         "global_step": global_step,
         "epoch": state.get("epoch"),
         "optimizer_params_with_state": len(restored_optimizer.state),
+        "optimized_parameters": len(optimized_parameters),
+        "optimizer_state_fields": sorted(state_fields),
         "scheduler_last_epoch": scheduler_report["last_epoch"],
         "scheduler": scheduler_report,
         "scheduler_plan": plan,
         "initial_lr": initial_lr,
+        "restored_base_lrs": restored_base_lrs,
+        "restored_current_lrs": restored_current_lrs,
         "optimizer_state_matches_expected": expected_optimizer_state is not None,
+        "parameter_names_verified": resume_plan is not None,
+        "continuation": continuation_report,
     }
 
 

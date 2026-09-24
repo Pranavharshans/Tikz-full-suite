@@ -197,6 +197,25 @@ def make_trainer_class(transformers, monitor: TrainingMonitor, *, isfinite=None,
         grad_norm = _default_grad_norm
 
     class Stage1Trainer(transformers.Trainer):
+        def create_optimizer(self):
+            # Build the optimizer with the same shared code the resume
+            # verifier uses, so the Trainer's saved param groups (decay /
+            # no-decay, named entries) are exactly reconstructible. The
+            # config layer only allows the two AdamW variants, so
+            # get_optimizer_cls_and_kwargs would produce this same object.
+            if self.optimizer is None:
+                import torch
+                from .checkpointing import build_optimizer
+                self.optimizer = build_optimizer(
+                    torch, self.model, learning_rate=self.args.learning_rate,
+                    fused=str(getattr(self.args.optim, "value", self.args.optim))
+                    == "adamw_torch_fused",
+                    decay_names=self.get_decay_parameter_names(self.model),
+                    weight_decay=self.args.weight_decay,
+                    betas=(self.args.adam_beta1, self.args.adam_beta2),
+                    eps=self.args.adam_epsilon)
+            return self.optimizer
+
         def training_step(self, model, inputs, *args, **kwargs):
             labels = inputs.get("labels") if hasattr(inputs, "get") else None
             boundary = False
@@ -498,6 +517,10 @@ def make_callbacks(transformers, *, monitor: TrainingMonitor,
         def on_save(self, args, state, control, **kwargs):
             directory = Path(args.output_dir) / f"checkpoint-{int(state.global_step)}"
             if directory.is_dir():
+                checkpointing_module.write_resume_plan(
+                    directory, model=kwargs["model"], optimizer=kwargs["optimizer"],
+                    num_training_steps=state.max_steps,
+                    num_warmup_steps=args.get_warmup_steps(state.max_steps))
                 checkpointing_module.write_checkpoint_meta(
                     directory, identity_sha256=identity_sha256,
                     global_step=int(state.global_step),

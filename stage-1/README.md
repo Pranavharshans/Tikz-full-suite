@@ -355,6 +355,28 @@ run the same diagnostic before the first forward, so an incomplete state is a
 clear failure with the missing module names instead of a decoder
 `AttributeError`.
 
+**Resume-state verification.** `verify_resume_state` rebuilds the production
+objects and then restores them in PyTorch's required order: construct the
+optimizer and its `LambdaLR`, *then* load the optimizer state, *then* load the
+scheduler state. (Initializing a scheduler overwrites `param_group["lr"]`, so
+the older load-then-construct order silently reset the restored LR to warmup
+step zero.) The optimizer uses the Trainer's exact two-group AdamW layout
+(decay / no-decay, from `Trainer.get_decay_parameter_names`), built from shared
+code in `checkpointing.build_optimizer`; group parameter names are serialized
+into `optimizer.pt`. Because PyTorch does not serialize the scheduler lambdas
+(`LambdaLR` saves `None`/`__dict__` entries), each checkpoint also carries
+`stage1-resume-plan.json` with the schedule kind, steps and named parameter
+groups; a names-aware optimizer without that plan is refused rather than
+silently downgraded. Verification checks, explicitly: saved scheduler
+`base_lrs` against the configured rate before the optimizer state is loaded;
+every restored optimizer `initial_lr` and current `lr` against the scheduler
+checkpoint and against the reconstructed schedule; parameter-mapped optimizer
+state (every state entry belongs to an optimized parameter, with matching
+shapes and complete Adam fields, and no partial state after step ≥ 1). The
+preflight additionally replays the next optimizer step from recorded gradients
+on the restored state and requires identical weights, optimizer state and
+learning rate.
+
 **Hardware profiles.** `hardware.profile` selects a built-in expectation
 bundle:
 

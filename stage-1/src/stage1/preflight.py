@@ -792,8 +792,9 @@ def check_trainer_resume(ctx: PreflightContext) -> dict:
         device = ctx.scratch.get("device", "cuda")
         fused = (ctx.config.training.optim == "adamw_torch_fused"
                  and torch.cuda.is_available())
-        optimizer = torch.optim.AdamW(
-            trainable, lr=ctx.config.training.learning_rate, fused=fused)
+        optimizer = checkpointing.build_optimizer(
+            torch, model, learning_rate=ctx.config.training.learning_rate,
+            fused=fused)
         # The production schedule: transformers cosine with warmup (LambdaLR).
         resume_training_steps = 10
         resume_warmup_steps = 2
@@ -813,22 +814,27 @@ def check_trainer_resume(ctx: PreflightContext) -> dict:
                                          device=device),
         }
         model.train()
-        outputs = _forward_no_cache(model, batch)
-        if outputs.loss is None or not torch.isfinite(outputs.loss):
-            return _fail(f"loss is not finite before the resume check: {outputs.loss}")
-        outputs.loss.backward()
-        optimizer.step()
-        optimizer.zero_grad(set_to_none=True)
-        scheduler.step()
-        step = 1
+        for _ in range(2):
+            outputs = _forward_no_cache(model, batch)
+            if outputs.loss is None or not torch.isfinite(outputs.loss):
+                return _fail(f"loss is not finite before the resume check: {outputs.loss}")
+            outputs.loss.backward()
+            optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            scheduler.step()
+        step = 2
 
         # A minimal checkpoint shaped like the ones the Trainer writes.
         model.save_pretrained(str(directory), safe_serialization=True)
         torch.save(optimizer.state_dict(), directory / "optimizer.pt")
         torch.save(scheduler.state_dict(), directory / "scheduler.pt")
+        checkpointing.write_resume_plan(
+            directory, model=model, optimizer=optimizer,
+            num_training_steps=resume_training_steps,
+            num_warmup_steps=resume_warmup_steps)
         write_json_atomic(directory / "trainer_state.json", {
             "global_step": step, "epoch": 0.1,
-            "log_history": [{"loss": float(outputs.loss)}]})
+            "log_history": [{"loss": float(outputs.loss.detach())}]})
         method = ctx.config.training.method
         checkpointing.write_checkpoint_meta(
             directory, identity_sha256=ctx.identity["sha256"],
@@ -849,6 +855,39 @@ def check_trainer_resume(ctx: PreflightContext) -> dict:
         checkpointing.verify_checkpoint(directory, ctx.identity["sha256"],
                                         method=method)
 
+        # Record a real next-step gradient and an uninterrupted optimizer
+        # update. Replaying these same gradients avoids dropout/RNG differences
+        # while proving the restored Adam moments and LR continue identically.
+        outputs = _forward_no_cache(model, batch)
+        if outputs.loss is None or not torch.isfinite(outputs.loss):
+            return _fail("non-finite continuation loss")
+        outputs.loss.backward()
+        gradients = [p.grad.detach().cpu().clone() if p.grad is not None else None
+                     for p in trainable]
+        optimizer.step()
+        optimizer.zero_grad(set_to_none=True)
+        scheduler.step()
+        expected_weights = [p.detach().cpu().clone() for p in trainable]
+        expected_next_state = optimizer.state_dict()
+        expected_next_lrs = [group["lr"] for group in optimizer.param_groups]
+
+        def continue_restored(restored_optimizer, restored_scheduler):
+            for parameter, gradient in zip(trainable, gradients):
+                parameter.grad = gradient.to(parameter.device) if gradient is not None else None
+            restored_optimizer.step()
+            restored_optimizer.zero_grad(set_to_none=True)
+            restored_scheduler.step()
+            if not all(checkpointing._tensors_equal(value, parameter)
+                       for value, parameter in zip(expected_weights, trainable)):
+                raise CheckpointError("Resumed next update differs from uninterrupted weights")
+            if not checkpointing._optimizer_states_equal(
+                    expected_next_state, restored_optimizer.state_dict()):
+                raise CheckpointError("Resumed next optimizer update differs from uninterrupted state")
+            if [group["lr"] for group in restored_optimizer.param_groups] != expected_next_lrs:
+                raise CheckpointError("Resumed next learning rate differs from uninterrupted schedule")
+            return {"verified": True, "step": step + 1,
+                    "parameters_compared": len(trainable)}
+
         # Restore the model weights from the saved files (adapter-only for
         # LoRA, complete model for full finetuning).
         try:
@@ -865,7 +904,9 @@ def check_trainer_resume(ctx: PreflightContext) -> dict:
                 learning_rate=ctx.config.training.learning_rate, fused=fused,
                 num_training_steps=resume_training_steps,
                 num_warmup_steps=resume_warmup_steps,
-                expected_optimizer_state=optimizer.state_dict(),
+                expected_optimizer_state=torch.load(directory / "optimizer.pt",
+                                                    map_location="cpu"),
+                continuation=continue_restored,
                 device=device)
         except CheckpointError as exc:
             return _fail(f"resume state restore failed: {exc}")

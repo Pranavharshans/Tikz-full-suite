@@ -1,5 +1,7 @@
 """Regression tests for gate isolation, provenance and resume verification."""
 import functools
+import copy
+import types
 import json
 import math
 import tempfile
@@ -562,7 +564,8 @@ class ProductionSchedulerIntegrationTests(unittest.TestCase):
     def write_checkpoint(self, *, num_warmup_steps=2, num_training_steps=10,
                          learning_rate=1e-5, scheduler=None):
         torch = self.torch
-        optimizer = torch.optim.AdamW(self.model.parameters(), lr=learning_rate)
+        optimizer = checkpointing.build_optimizer(
+            torch, self.model, learning_rate=learning_rate, fused=False)
         self.model.weight.sum().backward()
         optimizer.step()
         optimizer.zero_grad(set_to_none=True)
@@ -575,6 +578,9 @@ class ProductionSchedulerIntegrationTests(unittest.TestCase):
         directory.mkdir(parents=True)
         torch.save(optimizer.state_dict(), directory / "optimizer.pt")
         torch.save(scheduler.state_dict(), directory / "scheduler.pt")
+        checkpointing.write_resume_plan(
+            directory, model=self.model, optimizer=optimizer,
+            num_training_steps=num_training_steps, num_warmup_steps=num_warmup_steps)
         (directory / "trainer_state.json").write_text(json.dumps(
             {"global_step": 1, "epoch": 0.1}))
         return directory, optimizer, scheduler
@@ -592,12 +598,78 @@ class ProductionSchedulerIntegrationTests(unittest.TestCase):
                              expected_optimizer_state=optimizer.state_dict())
         self.assertTrue(report["verified"])
         self.assertEqual(report["scheduler"]["kind"], "lambda")
-        self.assertTrue(report["scheduler"]["lambda_schedule_verified"])
+        self.assertFalse(report["scheduler"]["lambda_schedule_verified"])
+        self.assertTrue(report["scheduler_plan"]["schedule_parameters_verified"])
         self.assertEqual(report["scheduler"]["last_epoch"],
                          scheduler.last_epoch)
         self.assertEqual(report["scheduler_plan"]["num_training_steps"], 10)
         self.assertEqual(report["scheduler_plan"]["num_warmup_steps"], 2)
         self.assertTrue(report["initial_lr"]["initial_lr_verified"])
+        self.assertTrue(report["parameter_names_verified"])
+        self.assertEqual(report["optimizer_params_with_state"],
+                         report["optimized_parameters"])
+
+    def test_scheduler_construction_cannot_reset_the_loaded_learning_rate(self):
+        """Regression for the restore-order defect: constructing LambdaLR
+        zeroes the LR at warmup step zero, so the verifier must build it
+        before loading the optimizer state."""
+        directory, optimizer, _ = self.write_checkpoint()
+        saved_lrs = [float(group["lr"]) for group in optimizer.param_groups]
+        self.assertNotEqual(saved_lrs, [0.0] * len(saved_lrs))
+        report = self.verify(directory,
+                             expected_optimizer_state=optimizer.state_dict())
+        self.assertEqual(report["restored_current_lrs"], saved_lrs)
+        self.assertEqual(report["restored_base_lrs"],
+                         [float(group["initial_lr"])
+                          for group in optimizer.param_groups])
+
+    def test_current_lr_mismatch_is_refused(self):
+        directory, _, _ = self.write_checkpoint()
+        torch = self.torch
+        state = torch.load(directory / "scheduler.pt")
+        state["_last_lr"] = [float(value) * 2 for value in state["_last_lr"]]
+        torch.save(state, directory / "scheduler.pt")
+        with self.assertRaisesRegex(CheckpointError,
+                                    "learning rates do not match"):
+            self.verify(directory)
+
+    def test_missing_optimizer_initial_lr_is_refused(self):
+        directory, _, _ = self.write_checkpoint()
+        torch = self.torch
+        state = torch.load(directory / "optimizer.pt")
+        for group in state["param_groups"]:
+            group.pop("initial_lr", None)
+        torch.save(state, directory / "optimizer.pt")
+        with self.assertRaisesRegex(CheckpointError, "initial_lr"):
+            self.verify(directory)
+
+    def test_partial_optimizer_state_is_refused(self):
+        directory, _, _ = self.write_checkpoint()
+        torch = self.torch
+        state = torch.load(directory / "optimizer.pt")
+        state["state"].pop(next(iter(state["state"])))
+        torch.save(state, directory / "optimizer.pt")
+        with self.assertRaisesRegex(CheckpointError, "partial optimizer state"):
+            self.verify(directory)
+
+    def test_names_aware_checkpoint_requires_the_resume_plan(self):
+        directory, _, _ = self.write_checkpoint()
+        (directory / checkpointing.RESUME_PLAN_FILE).unlink()
+        with self.assertRaisesRegex(CheckpointError, "stage1-resume-plan"):
+            self.verify(directory)
+
+    def test_continuation_hook_runs_after_verification(self):
+        directory, _, _ = self.write_checkpoint()
+        seen = []
+
+        def continuation(restored_optimizer, restored_scheduler):
+            seen.append(restored_scheduler.last_epoch)
+            return {"verified": True, "probe": "ran"}
+
+        report = self.verify(directory, continuation=continuation)
+        self.assertEqual(report["continuation"],
+                         {"verified": True, "probe": "ran"})
+        self.assertEqual(seen, [3])
 
     def test_wrong_training_steps_are_refused(self):
         directory, _, _ = self.write_checkpoint(num_training_steps=10)
@@ -621,6 +693,60 @@ class ProductionSchedulerIntegrationTests(unittest.TestCase):
                 torch.optim.AdamW(self.model.parameters(), lr=1e-5), T_max=10)))
         with self.assertRaisesRegex(CheckpointError, "not a Transformers cosine"):
             self.verify(directory)
+
+
+@support.requires_transformers
+@support.requires_torch
+class OptimizerGroupingTests(unittest.TestCase):
+    """The verifier's optimizer construction must equal the installed Trainer's."""
+
+    def test_decay_names_match_the_installed_trainer(self):
+        import torch
+        from transformers import Trainer
+
+        class Tiny(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.embed = torch.nn.Embedding(4, 2)
+                self.proj = torch.nn.Linear(2, 2, bias=True)
+                self.norm = torch.nn.LayerNorm(2)
+
+        model = Tiny()
+        self.assertEqual(
+            sorted(checkpointing.decay_parameter_names(model)),
+            sorted(Trainer.get_decay_parameter_names(object(), model)))
+
+    def test_two_group_layout_matches_the_trainer_partition(self):
+        import torch
+
+        class Tiny(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.proj = torch.nn.Linear(2, 2, bias=True)
+                self.norm = torch.nn.LayerNorm(2)
+
+        model = Tiny()
+        optimizer = checkpointing.build_optimizer(
+            torch, model, learning_rate=1e-4, fused=False)
+        self.assertEqual(len(optimizer.param_groups), 2)
+        self.assertGreater(len(optimizer.param_groups[0]["params"]), 0)
+        self.assertGreater(len(optimizer.param_groups[1]["params"]), 0)
+        state = optimizer.state_dict()
+        for group, live_group in zip(state["param_groups"],
+                                     optimizer.param_groups):
+            self.assertIn("param_names", group)
+            self.assertEqual(len(group["param_names"]),
+                             len(live_group["params"]))
+
+    def test_empty_no_decay_group_still_serializes_names(self):
+        import torch
+
+        model = torch.nn.Linear(2, 2, bias=False)
+        optimizer = checkpointing.build_optimizer(
+            torch, model, learning_rate=1e-4, fused=False)
+        state = optimizer.state_dict()
+        self.assertEqual(state["param_groups"][1]["param_names"], [])
+        self.assertEqual(state["param_groups"][1]["params"], [])
 
 
 class ResumeStateTests(unittest.TestCase):

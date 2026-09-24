@@ -278,9 +278,14 @@ class CallbackTests(unittest.TestCase):
             checkpoint_dir = Path(directory) / "checkpoints" / "smoke-1000" / "checkpoint-3"
             checkpoint_dir.mkdir(parents=True)
             args = types.SimpleNamespace(
-                output_dir=str(Path(directory) / "checkpoints" / "smoke-1000"))
-            state = types.SimpleNamespace(global_step=3, epoch=0.2)
-            save_callback.on_save(args=args, state=state, control=None)
+                output_dir=str(Path(directory) / "checkpoints" / "smoke-1000"),
+                get_warmup_steps=lambda steps: 2)
+            state = types.SimpleNamespace(global_step=3, epoch=0.2, max_steps=10)
+            parameter = object()
+            model = types.SimpleNamespace(named_parameters=lambda: [("weight", parameter)])
+            optimizer = types.SimpleNamespace(param_groups=[{"params": [parameter]}])
+            save_callback.on_save(args=args, state=state, control=None,
+                                  model=model, optimizer=optimizer)
             meta = json.loads(
                 (checkpoint_dir / checkpointing.CHECKPOINT_META_NAME).read_text())
             self.assertEqual(meta["gate"], "smoke-1000")
