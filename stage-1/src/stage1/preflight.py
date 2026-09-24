@@ -396,15 +396,17 @@ def check_one_step(ctx: PreflightContext) -> dict:
     plan = collator.build_batch(
         examples, pad_token_id=ctx.tokenizer.pad_token_id)
     collator.assert_valid_batch(plan, pad_token_id=ctx.tokenizer.pad_token_id)
+    device = ctx.scratch.get("device", "cuda")
     batch = {
-        "input_ids": torch.tensor(plan.input_ids, dtype=torch.long, device="cuda"),
-        "labels": torch.tensor(plan.labels, dtype=torch.long, device="cuda"),
+        "input_ids": torch.tensor(plan.input_ids, dtype=torch.long, device=device),
+        "labels": torch.tensor(plan.labels, dtype=torch.long, device=device),
         "attention_mask": torch.tensor(plan.attention_mask, dtype=torch.long,
-                                       device="cuda"),
+                                       device=device),
         "position_ids": torch.tensor(plan.position_ids, dtype=torch.long,
-                                     device="cuda"),
+                                     device=device),
     }
-    torch.cuda.reset_peak_memory_stats()
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
     model = ctx.model
     model.train()
     started = time.monotonic()
@@ -425,7 +427,8 @@ def check_one_step(ctx: PreflightContext) -> dict:
         gradient_tensors += 1
         norm_squared += float(parameter.grad.detach().float().pow(2).sum().item())
     grad_norm = norm_squared ** 0.5
-    peak_vram = torch.cuda.max_memory_allocated()
+    peak_vram = (torch.cuda.max_memory_allocated()
+                 if torch.cuda.is_available() else None)
     model.zero_grad(set_to_none=True)
     if gradient_tensors == 0:
         return _fail("backward produced no gradients")
@@ -451,9 +454,10 @@ def check_one_step(ctx: PreflightContext) -> dict:
     ctx.scratch["eval_loss"] = eval_loss
     ctx.scratch["logits_shape"] = logits_shape
     ctx.scratch["peak_vram_bytes"] = peak_vram
+    peak_detail = human_bytes(peak_vram) if peak_vram is not None else "unmeasured"
     return _pass(
         f"loss {float(loss):.4f}, grad norm {grad_norm:.4f}, "
-        f"{elapsed:.2f}s, peak VRAM {human_bytes(peak_vram)}",
+        f"{elapsed:.2f}s, peak VRAM {peak_detail}",
         loss=float(loss), eval_loss=eval_loss, logits_shape=list(logits_shape),
         grad_norm=grad_norm, seconds=round(elapsed, 4),
         peak_vram_bytes=peak_vram, supervised_tokens=plan.supervised_tokens)
@@ -510,17 +514,25 @@ def check_weight_serialization(ctx: PreflightContext) -> dict:
         shutil.rmtree(directory, ignore_errors=True)
 
 
-def check_model_reload(ctx: PreflightContext) -> dict:
+def check_model_reload(ctx: PreflightContext, *, base_loader=None,
+                       adapter_attacher=None) -> dict:
     """Save, release the original model, reload it, and compare a forward pass.
 
-    The original model is released (and CUDA cache cleared) before the reload
-    so the two copies never need to fit in VRAM at the same time. The reloaded
-    model replaces ``ctx.model`` for the remaining checks.
+    The original model is released (and CUDA cache cleared when available)
+    before the reload so the two copies never need to fit in VRAM at the same
+    time. The reloaded model replaces ``ctx.model`` for the remaining checks.
+
+    For LoRA the reload uses the base-only loader (no fresh adapter) and then
+    attaches the saved adapter exactly once. ``base_loader`` and
+    ``adapter_attacher`` are injection seams for CPU/GPU tests.
     """
     import gc
     import tempfile
     from . import adapters
     torch = _torch(ctx)
+    base_loader = base_loader or adapters.load_base_model_and_tokenizer
+    adapter_attacher = adapter_attacher or adapters.attach_lora_adapter
+    device = ctx.scratch.get("device", "cuda")
     if ctx.model is None or ctx.tokenizer is None:
         return _fail("model or tokenizer not loaded")
     plan = ctx.scratch.get("batch_plan")
@@ -539,16 +551,18 @@ def check_model_reload(ctx: PreflightContext) -> dict:
         del ctx.model
         ctx.model = None
         gc.collect()
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
         try:
             if method == "lora":
                 # An adapter is not a standalone model: reload the pinned base
-                # through the supported loader and attach the saved adapter.
-                model, tokenizer, report = adapters.load_model_and_tokenizer(
+                # without any adapter, then attach the saved one exactly once.
+                model, tokenizer, report = base_loader(
                     ctx.config, local_files_only=ctx.local_files_only,
                     cache_dir=ctx.cache_dir, for_training=True)
-                model = adapters.attach_lora_adapter(model, directory)
+                model = adapter_attacher(model, directory)
                 report["source_kind"] = "lora_adapter"
+                report["adapter_attached"] = "once"
                 report["adapter"] = str(directory)
             else:
                 model, tokenizer, report = adapters.load_model_and_tokenizer(
@@ -561,12 +575,12 @@ def check_model_reload(ctx: PreflightContext) -> dict:
         ctx.model = model
         ctx.load_report = report
         batch = {
-            "input_ids": torch.tensor(plan.input_ids, dtype=torch.long, device="cuda"),
-            "labels": torch.tensor(plan.labels, dtype=torch.long, device="cuda"),
+            "input_ids": torch.tensor(plan.input_ids, dtype=torch.long, device=device),
+            "labels": torch.tensor(plan.labels, dtype=torch.long, device=device),
             "attention_mask": torch.tensor(plan.attention_mask, dtype=torch.long,
-                                           device="cuda"),
+                                           device=device),
             "position_ids": torch.tensor(plan.position_ids, dtype=torch.long,
-                                         device="cuda"),
+                                         device=device),
         }
         model.eval()
         try:
@@ -624,7 +638,9 @@ def check_trainer_resume(ctx: PreflightContext) -> dict:
                      if parameter.requires_grad]
         if not trainable:
             return _fail("model has no trainable parameters")
-        fused = ctx.config.training.optim == "adamw_torch_fused"
+        device = ctx.scratch.get("device", "cuda")
+        fused = (ctx.config.training.optim == "adamw_torch_fused"
+                 and torch.cuda.is_available())
         optimizer = torch.optim.AdamW(
             trainable, lr=ctx.config.training.learning_rate, fused=fused)
         # The production schedule: transformers cosine with warmup (LambdaLR).
@@ -638,12 +654,12 @@ def check_trainer_resume(ctx: PreflightContext) -> dict:
             "cosine", optimizer, num_warmup_steps=resume_warmup_steps,
             num_training_steps=resume_training_steps)
         batch = {
-            "input_ids": torch.tensor(plan.input_ids, dtype=torch.long, device="cuda"),
-            "labels": torch.tensor(plan.labels, dtype=torch.long, device="cuda"),
+            "input_ids": torch.tensor(plan.input_ids, dtype=torch.long, device=device),
+            "labels": torch.tensor(plan.labels, dtype=torch.long, device=device),
             "attention_mask": torch.tensor(plan.attention_mask, dtype=torch.long,
-                                           device="cuda"),
+                                           device=device),
             "position_ids": torch.tensor(plan.position_ids, dtype=torch.long,
-                                         device="cuda"),
+                                         device=device),
         }
         model.train()
         outputs = model(**batch)
@@ -698,7 +714,8 @@ def check_trainer_resume(ctx: PreflightContext) -> dict:
                 learning_rate=ctx.config.training.learning_rate, fused=fused,
                 num_training_steps=resume_training_steps,
                 num_warmup_steps=resume_warmup_steps,
-                expected_optimizer_state=optimizer.state_dict())
+                expected_optimizer_state=optimizer.state_dict(),
+                device=device)
         except CheckpointError as exc:
             return _fail(f"resume state restore failed: {exc}")
         checks = {

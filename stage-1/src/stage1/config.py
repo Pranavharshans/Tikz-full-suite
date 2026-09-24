@@ -290,12 +290,32 @@ class EvaluationConfig:
     render_similarity: RenderSimilarityConfig = field(default_factory=RenderSimilarityConfig)
 
 
+HARDWARE_PROFILES = {
+    # Full-parameter BF16 SFT on one RTX PRO 6000 Blackwell 96GB.
+    "rtxpro6000-full": {
+        "expected_gpu_name_regex": "RTX PRO 6000",
+        "min_vram_gib": 88.0,
+        "min_free_disk_gib": 250.0,
+    },
+    # BF16 LoRA on one A40 48GB: adapters need far less VRAM and disk.
+    "a40-lora": {
+        "expected_gpu_name_regex": r"\bA40\b",
+        "min_vram_gib": 44.0,
+        "min_free_disk_gib": 60.0,
+    },
+}
+
+
 @dataclass
 class HardwareConfig:
     expected_gpu_name_regex: str = "RTX PRO 6000"
     min_vram_gib: float = 88.0
     min_free_disk_gib: float = 250.0
     device: str = "cuda:0"
+    profile: str = "rtxpro6000-full"
+
+    def to_jsonable(self) -> dict:
+        return dataclasses.asdict(self)
 
 
 @dataclass
@@ -716,21 +736,31 @@ def _parse_evaluation(raw: dict, source: str) -> EvaluationConfig:
 
 def _parse_hardware(raw: dict, source: str) -> HardwareConfig:
     path = f"{source}.hardware"
-    _check_keys(raw, ("expected_gpu_name_regex", "min_vram_gib",
+    _check_keys(raw, ("profile", "expected_gpu_name_regex", "min_vram_gib",
                       "min_free_disk_gib", "device"), path)
-    pattern = _expect_str(raw.get("expected_gpu_name_regex", "RTX PRO 6000"),
-                          f"{path}.expected_gpu_name_regex")
+    profile = _expect_str(raw.get("profile", "rtxpro6000-full"),
+                          f"{path}.profile")
+    if profile not in HARDWARE_PROFILES:
+        raise ConfigError(
+            f"{path}.profile: {profile!r} is not a known hardware profile; "
+            f"choose one of {sorted(HARDWARE_PROFILES)}")
+    defaults = HARDWARE_PROFILES[profile]
+    pattern = _expect_str(
+        raw.get("expected_gpu_name_regex", defaults["expected_gpu_name_regex"]),
+        f"{path}.expected_gpu_name_regex")
     try:
         re.compile(pattern)
     except re.error as exc:
         raise ConfigError(f"{path}.expected_gpu_name_regex: invalid regex: {exc}")
-    min_vram = _expect_float(raw.get("min_vram_gib", 88.0), f"{path}.min_vram_gib",
-                             exclusive_minimum=0.0)
-    min_disk = _expect_float(raw.get("min_free_disk_gib", 250.0),
-                             f"{path}.min_free_disk_gib", exclusive_minimum=0.0)
+    min_vram = _expect_float(raw.get("min_vram_gib", defaults["min_vram_gib"]),
+                             f"{path}.min_vram_gib", exclusive_minimum=0.0)
+    min_disk = _expect_float(
+        raw.get("min_free_disk_gib", defaults["min_free_disk_gib"]),
+        f"{path}.min_free_disk_gib", exclusive_minimum=0.0)
     device = _expect_str(raw.get("device", "cuda:0"), f"{path}.device")
     return HardwareConfig(expected_gpu_name_regex=pattern, min_vram_gib=min_vram,
-                          min_free_disk_gib=min_disk, device=device)
+                          min_free_disk_gib=min_disk, device=device,
+                          profile=profile)
 
 
 def _parse_environment(raw: dict, source: str) -> EnvironmentConfig:

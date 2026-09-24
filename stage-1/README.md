@@ -335,12 +335,34 @@ scheduler objects for resume (the preflight's state check is verification
 only, and the dependency-gated integration test exercises a fresh Trainer
 continuing from a native checkpoint).
 
+**Hardware profiles.** `hardware.profile` selects a built-in expectation
+bundle: `rtxpro6000-full` (full-parameter SFT: `RTX PRO 6000`, 88 GiB minimum,
+250 GiB free disk) and `a40-lora` (BF16 LoRA: `A40`, 44 GiB minimum within the
+44–48 GiB range, 60 GiB free disk). Explicit `expected_gpu_name_regex` /
+`min_vram_gib` / `min_free_disk_gib` values override the profile; unknown
+profiles are refused. Full configs keep the RTX PRO 6000 profile; the LoRA
+configs use `a40-lora`.
+
+**Base-only loading and single attach.** Evaluation, preflight reload and
+merge load the pinned BF16 base through `load_base_model_and_tokenizer`, which
+can never create a fresh adapter, and then attach the saved adapter exactly
+once (`attach_lora_adapter` refuses a model that already carries one). The
+same rule applies to base-model evaluation: a LoRA config evaluated without a
+checkpoint still loads the base without adapters.
+
+**Adapter restore.** Restoring adapter weights (gate checkpoint verification,
+final-weight restore after verification) goes through PEFT's supported
+adapter-state API, `peft.set_peft_model_state_dict`, followed by a tensor
+read-back against the saved file. Raw `load_state_dict` is used only for full
+artifacts.
+
 **Merge (separate command).** `scripts/merge_adapter.py` is the only way to
 produce a merged model; training never merges automatically. It verifies the
-adapter artifact, loads the pinned base, checks that base-plus-adapter and
-merged logits agree within `--tolerance` (default `1e-3`, LoRA dropout
-disabled in eval mode), and writes the merged model plus a
-`merge-metadata.json` record with the verification numbers.
+adapter artifact, loads the pinned base base-only, attaches the saved adapter
+once, checks that base-plus-adapter and merged logits agree within
+`--tolerance` (default `1e-3`, LoRA dropout disabled in eval mode), and writes
+the merged model plus a `merge-metadata.json` record. The flow lives in
+`src/stage1/merge.py` so it is executable in tests with injected loaders.
 
 ```bash
 python3 stage-1/scripts/merge_adapter.py \
@@ -406,8 +428,9 @@ the current run identity, model id, exact revision, adapter and (optionally)
 `--expect-gate`. Missing metadata, foreign identity, wrong model/revision,
 wrong adapter, wrong gate and incomplete checkpoints are all refused. The
 verified artifact identity is recorded in the evaluation metrics under
-`artifact`. Quarantined rows are excluded from the evaluated split and from
-memorization sampling.
+`artifact`. LoRA artifacts are loaded base-only first (no fresh adapter) and
+the saved adapter is attached exactly once. Quarantined rows are excluded from
+the evaluated split and from memorization sampling.
 
 Metrics: generation completion/truncation/empty counts, TikZ extraction,
 compilation success with timeout and error categories, output length,

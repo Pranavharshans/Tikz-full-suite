@@ -230,6 +230,38 @@ class IdentityPayloadTests(unittest.TestCase):
             config.identity_payload()
 
 
+class HardwareProfileTests(unittest.TestCase):
+    def test_default_profile_is_rtxpro6000_full(self):
+        config = support.make_config()
+        self.assertEqual(config.hardware.profile, "rtxpro6000-full")
+        self.assertEqual(config.hardware.expected_gpu_name_regex, "RTX PRO 6000")
+        self.assertEqual(config.hardware.min_vram_gib, 88.0)
+
+    def test_a40_lora_profile_defaults(self):
+        config = support.make_config(hardware={"profile": "a40-lora"})
+        self.assertEqual(config.hardware.profile, "a40-lora")
+        self.assertRegex("NVIDIA A40", config.hardware.expected_gpu_name_regex)
+        self.assertEqual(config.hardware.min_vram_gib, 44.0)
+        self.assertEqual(config.hardware.min_free_disk_gib, 60.0)
+        self.assertIsNone(
+            __import__("re").search(config.hardware.expected_gpu_name_regex,
+                                    "NVIDIA A4000"))
+
+    def test_explicit_values_override_the_profile(self):
+        config = support.make_config(hardware={
+            "profile": "a40-lora", "min_vram_gib": 46.0})
+        self.assertEqual(config.hardware.min_vram_gib, 46.0)
+        self.assertEqual(config.hardware.expected_gpu_name_regex, r"\bA40\b")
+
+    def test_unknown_profile_is_refused(self):
+        with self.assertRaisesRegex(ConfigError, "hardware profile"):
+            support.make_config(hardware={"profile": "h100-hero"})
+
+    def test_hardware_profile_is_recorded_in_jsonable(self):
+        config = support.make_config(hardware={"profile": "a40-lora"})
+        self.assertEqual(config.hardware.to_jsonable()["profile"], "a40-lora")
+
+
 class LoraConfigTests(unittest.TestCase):
     def test_method_defaults_to_full_and_rejects_lora_section(self):
         config = support.make_config()
@@ -344,6 +376,24 @@ class ShippedConfigTests(unittest.TestCase):
             config = config_module.load_config(REPO_STAGE1 / "configs" / name)
             adapter = adapters.validate_config_against_adapter(config)
             self.assertLessEqual(config.data.max_seq_len, adapter.context_length)
+
+    @support.requires_yaml
+    def test_shipped_lora_configs_use_the_a40_profile(self):
+        for name in ("qwen3.5-4b-lora.yaml", "minicpm5-2b-lora.yaml"):
+            with self.subTest(config=name):
+                config = config_module.load_config(REPO_STAGE1 / "configs" / name)
+                self.assertEqual(config.hardware.profile, "a40-lora")
+                self.assertEqual(config.hardware.min_vram_gib, 44.0)
+
+    @support.requires_yaml
+    def test_shipped_full_configs_keep_the_rtx_profile(self):
+        for name in ("qwen3.5-4b-full.yaml", "minicpm5-2b-full.yaml"):
+            with self.subTest(config=name):
+                config = config_module.load_config(REPO_STAGE1 / "configs" / name)
+                self.assertEqual(config.hardware.profile, "rtxpro6000-full")
+                self.assertEqual(config.hardware.min_vram_gib, 88.0)
+                self.assertRegex("NVIDIA RTX PRO 6000 Blackwell Server Edition",
+                                 config.hardware.expected_gpu_name_regex)
 
     @support.requires_yaml
     def test_shipped_lora_configs_resolve(self):

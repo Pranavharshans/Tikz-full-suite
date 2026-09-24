@@ -462,28 +462,97 @@ class ArtifactWeightTests(unittest.TestCase):
         (adapter / "adapter_model.safetensors").write_bytes(b"adapter")
 
         class AdapterModel(FakeModel):
-            def state_dict(self):
-                return {"base.weight": 1,
-                        "base.lora_A.default.weight": 2}
+            """Fake PEFT-shaped model: adapter state goes through the setter."""
 
+            def __init__(self):
+                super().__init__()
+                self.state = {"base.weight": 1,
+                              "base.lora_A.default.weight": 10,
+                              "base.lora_B.default.weight": 20}
+                self.setter_calls = []
+                self.load_state_dict_calls = 0
+
+            def state_dict(self):
+                return dict(self.state)
+
+            def load_state_dict(self, state, strict=False):
+                self.load_state_dict_calls += 1
+                return [], []
+
+        def make_setter(model):
+            def setter(target, state_dict):
+                model.setter_calls.append(dict(state_dict))
+                model.state.update(state_dict)
+                return None
+            return setter
+
+        model = AdapterModel()
         # Adapter file containing a base-model tensor is refused.
         base_tensor_loader = lambda path: {"base.weight": 1}
         with self.assertRaisesRegex(CheckpointError, "non-adapter tensors"):
             checkpointing.load_artifact_weights(
-                AdapterModel(), adapter, method="lora",
-                loader=base_tensor_loader)
+                model, adapter, method="lora", loader=base_tensor_loader,
+                adapter_state_setter=make_setter(model))
         # Adapter file missing a live adapter parameter is refused.
         partial_loader = lambda path: {"base.lora_B.default.weight": 2}
         with self.assertRaisesRegex(CheckpointError, "does not cover"):
             checkpointing.load_artifact_weights(
-                AdapterModel(), adapter, method="lora", loader=partial_loader)
-        # A complete adapter loads.
+                model, adapter, method="lora", loader=partial_loader,
+                adapter_state_setter=make_setter(model))
+        # A complete adapter is applied through the PEFT setter, not through
+        # a raw load_state_dict, and the read-back matches the saved tensors.
         complete_loader = lambda path: {"base.lora_A.default.weight": 1,
                                         "base.lora_B.default.weight": 2}
         report = checkpointing.load_artifact_weights(
-            AdapterModel(), adapter, method="lora", loader=complete_loader)
+            model, adapter, method="lora", loader=complete_loader,
+            adapter_state_setter=make_setter(model))
         self.assertEqual(report["method"], "lora")
         self.assertEqual(report["tensors"], 2)
+        self.assertEqual(report["restore_api"], "peft.set_peft_model_state_dict")
+        self.assertTrue(report["readback_verified"])
+        self.assertEqual(len(model.setter_calls), 1)
+        self.assertEqual(model.setter_calls[0],
+                         {"base.lora_A.default.weight": 1,
+                          "base.lora_B.default.weight": 2})
+        self.assertEqual(model.load_state_dict_calls, 0)
+
+    def test_lora_restore_detects_a_failed_readback(self):
+        adapter = self.root / "adapter2"
+        adapter.mkdir()
+        (adapter / "adapter_model.safetensors").write_bytes(b"adapter")
+
+        class AdapterModel(FakeModel):
+            def state_dict(self):
+                return {"base.lora_A.default.weight": 999,
+                        "base.lora_B.default.weight": 999}
+
+            def load_state_dict(self, state, strict=False):
+                return [], []
+
+        loader = lambda path: {"base.lora_A.default.weight": 1,
+                               "base.lora_B.default.weight": 2}
+        with self.assertRaisesRegex(CheckpointError, "read-back"):
+            checkpointing.load_artifact_weights(
+                AdapterModel(), adapter, method="lora", loader=loader,
+                adapter_state_setter=lambda model, state: None)
+
+    def test_lora_restore_requires_peft_without_a_seam(self):
+        adapter = self.root / "adapter3"
+        adapter.mkdir()
+        (adapter / "adapter_model.safetensors").write_bytes(b"adapter")
+
+        class AdapterModel(FakeModel):
+            def state_dict(self):
+                return {"base.lora_A.default.weight": 1, "base.lora_B.default.weight": 2}
+
+            def load_state_dict(self, state, strict=False):
+                return [], []
+
+        loader = lambda path: {"base.lora_A.default.weight": 1,
+                               "base.lora_B.default.weight": 2}
+        with self.assertRaisesRegex(CheckpointError, "peft is required"):
+            checkpointing.load_artifact_weights(
+                AdapterModel(), adapter, method="lora", loader=loader)
 
     def test_restore_final_weights_runs_after_checkpoint_weights(self):
         model = FakeModel(loss=0.125, shape=(2, 4))

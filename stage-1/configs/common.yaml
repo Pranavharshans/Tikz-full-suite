@@ -133,9 +133,12 @@ evaluation:
     size: 64
 
 hardware:
-  expected_gpu_name_regex: "RTX PRO 6000"
-  min_vram_gib: 88
-  min_free_disk_gib: 250
+  # Built-in profiles: "rtxpro6000-full" (full-parameter SFT: RTX PRO 6000,
+  # 88 GiB minimum, 250 GiB free disk) and "a40-lora" (BF16 LoRA: A40, 44 GiB
+  # minimum within the 44-48 GiB range, 60 GiB free disk). The profile
+  # provides these values; explicit keys here or in a model config override
+  # the profile defaults.
+  profile: rtxpro6000-full
   device: cuda:0
 
 environment:

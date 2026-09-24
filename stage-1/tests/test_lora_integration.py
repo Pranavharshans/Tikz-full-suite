@@ -5,6 +5,9 @@ only fake:
 
 - applying LoRA through PEFT and asserting the trainable-parameter contract,
 - native adapter save -> fresh-base attach -> identical logits,
+- the **production restore function** recovering corrupted adapter weights,
+- the production evaluation, preflight-reload and merge paths loading the base
+  exactly once and attaching the saved adapter exactly once,
 - merge equivalence (base+adapter vs merged logits),
 - artifact verification of a real adapter directory,
 - a fresh transformers Trainer resuming from a native checkpoint written by a
@@ -21,12 +24,22 @@ from pathlib import Path
 
 from tests import support
 
-from stage1 import checkpointing
-from stage1.errors import CheckpointError
+from stage1 import adapters, checkpointing, collator, merge, preflight
+from stage1.errors import CheckpointError, DataError
 
 HAS_PEFT = importlib.util.find_spec("peft") is not None
-requires_peft = unittest.skipUnless(HAS_PEFT, "peft is not installed")
 HAS_DATASETS = importlib.util.find_spec("datasets") is not None
+requires_peft = unittest.skipUnless(HAS_PEFT, "peft is not installed")
+
+
+class StubTokenizer:
+    """Minimal tokenizer stand-in for save/attach paths."""
+
+    def __init__(self):
+        self.pad_token_id = 0
+
+    def save_pretrained(self, directory):
+        Path(directory, "tokenizer_config.json").write_text("{}")
 
 
 def tiny_llama():
@@ -40,12 +53,27 @@ def tiny_llama():
     return LlamaForCausalLM(config)
 
 
-def apply_peft_lora(model, targets=("q_proj", "k_proj", "v_proj", "o_proj")):
+def apply_peft_lora(model, targets=("q_proj", "k_proj", "v_proj", "o_proj"),
+                    *, randomize=True):
+    import torch
     from peft import LoraConfig, get_peft_model
 
-    return get_peft_model(model, LoraConfig(
+    wrapped = get_peft_model(model, LoraConfig(
         r=4, lora_alpha=4, lora_dropout=0.0, bias="none",
         target_modules=list(targets), task_type="CAUSAL_LM"))
+    if randomize:
+        # Adapters start as identity; randomize so logit comparisons are real.
+        torch.manual_seed(1)
+        with torch.no_grad():
+            for name, parameter in wrapped.named_parameters():
+                if "lora_" in name:
+                    parameter.normal_(0.0, 0.02)
+    return wrapped
+
+
+def state_copy(model):
+    return {key: value.detach().clone()
+            for key, value in model.state_dict().items()}
 
 
 @support.requires_transformers
@@ -55,6 +83,10 @@ class AdapterRoundTripTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
+        self.config = support.make_config(
+            training={"method": "lora", "learning_rate": 1e-4},
+            lora={"rank": 4, "alpha": 4, "dropout": 0.0, "bias": "none",
+                  "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"]})
 
     def tearDown(self):
         self.temporary.cleanup()
@@ -65,8 +97,6 @@ class AdapterRoundTripTests(unittest.TestCase):
                           target_modules=("q_proj", "k_proj", "v_proj", "o_proj"))
 
     def test_trainable_assertions_on_a_real_peft_model(self):
-        from stage1 import adapters
-
         model = apply_peft_lora(tiny_llama())
         report = adapters.verify_lora_trainables(model.named_parameters(),
                                                  self.stage1_lora())
@@ -78,7 +108,6 @@ class AdapterRoundTripTests(unittest.TestCase):
 
     def test_adapter_save_attach_and_identical_logits(self):
         import torch
-        from stage1 import adapters
 
         model = apply_peft_lora(tiny_llama())
         inputs = torch.tensor([[1, 2, 3, 4, 5]])
@@ -97,20 +126,166 @@ class AdapterRoundTripTests(unittest.TestCase):
         self.assertTrue(torch.allclose(before, after, atol=1e-6),
                         f"max diff {(before - after).abs().max().item()}")
 
-    def test_merge_equivalence(self):
+    def test_production_restore_recovers_a_mutated_adapter(self):
+        """The production restore uses PEFT's API and is fully reversible."""
         import torch
 
         model = apply_peft_lora(tiny_llama())
-        inputs = torch.tensor([[2, 3, 4]])
+        inputs = torch.tensor([[1, 2, 3, 4]])
         model.eval()
         with torch.no_grad():
-            before = model(inputs).logits.detach().float()
-        merged = model.merge_and_unload()
+            expected = model(inputs).logits.detach().clone()
+        directory = self.root / "adapter"
+        model.save_pretrained(str(directory))
+
+        with torch.no_grad():
+            for name, parameter in model.named_parameters():
+                if "lora_" in name:
+                    parameter.add_(0.5)
+        with torch.no_grad():
+            corrupted = model(inputs).logits.detach().clone()
+        self.assertFalse(torch.allclose(expected, corrupted, atol=1e-6))
+
+        report = checkpointing.load_artifact_weights(model, directory,
+                                                     method="lora")
+        self.assertEqual(report["restore_api"],
+                         "peft.set_peft_model_state_dict")
+        self.assertTrue(report["readback_verified"])
+        with torch.no_grad():
+            restored = model(inputs).logits.detach().clone()
+        self.assertTrue(torch.allclose(expected, restored, atol=1e-6),
+                        f"max diff {(expected - restored).abs().max().item()}")
+
+    def test_evaluation_path_loads_base_only_then_attaches_once(self):
+        """Production evaluation path: one base load, one adapter attach."""
+        import torch
+
+        base = tiny_llama()
+        base_state = state_copy(base)
+        reference = apply_peft_lora(base)
+        inputs = torch.tensor([[1, 2, 3, 4]])
+        reference.eval()
+        with torch.no_grad():
+            expected = reference(inputs).logits.detach().clone()
+        adapter_dir = self.root / "adapter"
+        reference.save_pretrained(str(adapter_dir))
+
+        calls = []
+
+        def base_loader(config, **kwargs):
+            calls.append(kwargs)
+            fresh = tiny_llama()
+            fresh.load_state_dict(base_state, strict=False)
+            return fresh, StubTokenizer(), {"training_method": "base"}
+
+        model, tokenizer, report = adapters.load_model_for_evaluation(
+            self.config, checkpoint_dir=adapter_dir,
+            artifact_meta={"training_method": "lora",
+                           "base_model_id": self.config.model.id,
+                           "base_model_revision": self.config.model.revision},
+            base_loader=base_loader)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(report["source_kind"], "lora_adapter")
+        self.assertEqual(report["adapter_attached"], "once")
+        self.assertIsNotNone(getattr(model, "peft_config", None))
+        model.eval()
+        with torch.no_grad():
+            actual = model(inputs).logits.detach().clone()
+        self.assertTrue(torch.allclose(expected, actual, atol=1e-5),
+                        f"max diff {(expected - actual).abs().max().item()}")
+
+    def test_preflight_reload_path_loads_base_only_then_attaches_once(self):
+        """Production preflight reload: base-only load, one attach, forward check."""
+        import torch
+
+        base = tiny_llama()
+        base_state = state_copy(base)
+        model = apply_peft_lora(base)
+        plan = collator.pad_batch(
+            [{"input_ids": [1, 2, 3, 4], "labels": [1, 2, 3, 4]}],
+            pad_token_id=0)
+        batch = {
+            "input_ids": torch.tensor(plan.input_ids, dtype=torch.long),
+            "labels": torch.tensor(plan.labels, dtype=torch.long),
+            "attention_mask": torch.tensor(plan.attention_mask, dtype=torch.long),
+            "position_ids": torch.tensor(plan.position_ids, dtype=torch.long),
+        }
+        model.eval()
+        with torch.no_grad():
+            outputs = model(**batch)
+            eval_loss = float(outputs.loss)
+        config = support.make_config(
+            training={"method": "lora", "learning_rate": 1e-4,
+                      "optim": "adamw_torch"},
+            lora={"rank": 4, "alpha": 4, "dropout": 0.0})
+        ctx = preflight.PreflightContext(
+            config=config, run_dir=self.root / "run", identity={}, prepared={})
+        ctx.model = model
+        ctx.tokenizer = StubTokenizer()
+        ctx.scratch.update({"batch_plan": plan, "eval_loss": eval_loss,
+                            "logits_shape": tuple(outputs.logits.shape),
+                            "device": "cpu"})
+        calls = []
+
+        def base_loader(config, **kwargs):
+            calls.append(kwargs)
+            fresh = tiny_llama()
+            fresh.load_state_dict(base_state, strict=False)
+            return fresh, StubTokenizer(), {}
+
+        outcome = preflight.check_model_reload(ctx, base_loader=base_loader)
+        self.assertEqual(outcome["status"], "pass", outcome["detail"])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(ctx.load_report["adapter_attached"], "once")
+        self.assertIsNotNone(getattr(ctx.model, "peft_config", None))
+        # The reloaded model reproduces the original (base + adapter) logits.
+        ctx.model.eval()
+        with torch.no_grad():
+            restored = ctx.model(**batch).logits.detach().clone()
+            original = model(**batch).logits.detach().clone()
+        self.assertTrue(torch.allclose(original, restored, atol=1e-5))
+
+    def test_merge_path_loads_base_only_and_verifies_equivalence(self):
+        """Production merge flow: base-only load, one attach, logit equivalence."""
+        import torch
+        from transformers import LlamaForCausalLM
+
+        base = tiny_llama()
+        base_state = state_copy(base)
+        reference = apply_peft_lora(base)
+        adapter_dir = self.root / "adapter"
+        reference.save_pretrained(str(adapter_dir))
+        inputs = torch.tensor([[1, 2, 3, 4]])
+        calls = []
+
+        def base_loader(config, **kwargs):
+            calls.append(kwargs)
+            fresh = tiny_llama()
+            fresh.load_state_dict(base_state, strict=False)
+            return fresh, StubTokenizer(), {}
+
+        out_dir = self.root / "merged"
+        result = merge.merge_adapter(
+            self.config, adapter_dir, out_dir, batch={"input_ids": inputs},
+            base_loader=base_loader, tolerance=1e-4)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(result["load_report"]["adapter_attached"], "once")
+        self.assertTrue(result["verification"]["passed"],
+                        result["verification"])
+        self.assertTrue(result["verification"]["checked"])
+        merged = LlamaForCausalLM.from_pretrained(out_dir)
         merged.eval()
         with torch.no_grad():
-            after = merged(inputs).logits.detach().float()
-        max_diff = float((before - after).abs().max())
-        self.assertLessEqual(max_diff, 1e-4, f"merge diff {max_diff}")
+            merged_logits = merged(inputs).logits.detach().float()
+            reference_logits = reference(inputs).logits.detach().float()
+        self.assertTrue(torch.allclose(reference_logits, merged_logits, atol=1e-4))
+
+    def test_attach_refuses_a_second_adapter_on_a_real_peft_model(self):
+        model = apply_peft_lora(tiny_llama())
+        directory = self.root / "adapter"
+        model.save_pretrained(str(directory))
+        with self.assertRaisesRegex(DataError, "already carries a PEFT adapter"):
+            adapters.attach_lora_adapter(model, directory)
 
     def test_real_adapter_passes_artifact_verification(self):
         model = apply_peft_lora(tiny_llama())

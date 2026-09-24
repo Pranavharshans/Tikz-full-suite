@@ -288,18 +288,26 @@ def _parameter_summary(model) -> dict:
 def load_model_and_tokenizer(config, *, local_files_only: bool = False,
                              cache_dir=None, for_training: bool = False,
                              for_inference: bool = False,
-                             source_override=None, method: str | None = None):
+                             source_override=None, method: str | None = None,
+                             with_adapter: bool = True):
     """Load the exact checkpoint through Unsloth; never a silent fallback.
 
     ``method`` defaults to ``config.training.method``. ``"full"`` keeps the
     existing full-parameter BF16 path; ``"lora"`` loads the same unquantized
     BF16 base model and applies adapters through Unsloth's native PEFT
-    integration (``get_peft_model``). Returns ``(model, tokenizer, report)``.
+    integration (``get_peft_model``). With ``with_adapter=False`` the pinned
+    base checkpoint is returned without any adapter - use
+    :func:`load_base_model_and_tokenizer` for that so callers never create a
+    fresh adapter that would then collide with a saved one. Returns
+    ``(model, tokenizer, report)``.
     """
     validate_config_against_adapter(config)
     method = method or config.training.method
     if method not in ("full", "lora"):
         raise DataError(f"Unknown training method {method!r}")
+    if with_adapter and method == "lora" and config.lora is None:
+        raise DataError(
+            "training.method is 'lora' but no lora configuration is present")
     try:
         import torch
     except ImportError as exc:  # pragma: no cover - environment dependent
@@ -344,7 +352,7 @@ def load_model_and_tokenizer(config, *, local_files_only: bool = False,
         from unsloth import FastLanguageModel as Loader
         loader_name = "FastLanguageModel"
 
-    if method == "full":
+    if method == "full" and with_adapter:
         full_finetuning_supported = "full_finetuning" in _callable_parameters(
             Loader.from_pretrained)
         if not full_finetuning_supported:
@@ -357,7 +365,7 @@ def load_model_and_tokenizer(config, *, local_files_only: bool = False,
 
     accepted, rejected = _split_kwargs(Loader.from_pretrained, load_kwargs)
     critical = {"revision", "local_files_only", "cache_dir"}
-    if method == "full":
+    if method == "full" and with_adapter:
         critical.add("full_finetuning")
     dropped_critical = sorted(critical & set(rejected))
     if dropped_critical:
@@ -388,8 +396,9 @@ def load_model_and_tokenizer(config, *, local_files_only: bool = False,
     report = {
         "loader": loader_name,
         "loader_module_version": getattr(unsloth, "__version__", "unknown"),
-        "training_method": method,
-        "full_finetuning": method == "full",
+        "training_method": method if with_adapter else "base",
+        "adapter_applied": bool(with_adapter and method == "lora"),
+        "full_finetuning": method == "full" and with_adapter,
         "quantization": "none",
         "load_in_4bit": False,
         "load_in_8bit": False,
@@ -402,10 +411,7 @@ def load_model_and_tokenizer(config, *, local_files_only: bool = False,
         "rejected_kwargs": sorted(rejected),
     }
 
-    if method == "lora":
-        if config.lora is None:
-            raise DataError(
-                "training.method is 'lora' but no lora configuration is present")
+    if with_adapter and method == "lora":
         target_report = validate_target_modules(
             module_short_names(model), config.lora.target_modules)
         model, lora_applied = _apply_lora(model, Loader, config, report)
@@ -491,14 +497,41 @@ def _apply_lora(model, Loader, config, report):
     }
 
 
+def load_base_model_and_tokenizer(config, **kwargs):
+    """Load the pinned BF16 base checkpoint with no adapter.
+
+    Evaluation, preflight reload and merge must never create a fresh adapter
+    (a later ``attach_lora_adapter`` would then collide with it). This loader
+    is the single entry point for that: it disables the LoRA attachment path
+    and records ``training_method: "base"`` in the report.
+    """
+    kwargs["with_adapter"] = False
+    return load_model_and_tokenizer(config, **kwargs)
+
+
 def attach_lora_adapter(model, adapter_dir):
-    """Attach a saved PEFT adapter to an already-loaded base model."""
+    """Attach a saved PEFT adapter to an already-loaded base model.
+
+    Refuses a model that already carries an adapter, so a saved adapter is
+    attached exactly once. The guard runs before the peft import so it holds
+    even for a model from another adapter stack.
+    """
+    if getattr(model, "peft_config", None) is not None:
+        raise DataError(
+            "The loaded model already carries a PEFT adapter; refusing to "
+            "attach a second one. Use load_base_model_and_tokenizer for the "
+            "base checkpoint.")
     try:
         from peft import PeftModel
     except ImportError as exc:  # pragma: no cover - environment dependent
         raise DataError(
             "peft is required to attach a saved LoRA adapter; install the "
             "pinned environment from environment.lock_file") from exc
+    if isinstance(model, PeftModel):
+        raise DataError(
+            "The loaded model already carries a PEFT adapter; refusing to "
+            "attach a second one. Use load_base_model_and_tokenizer for the "
+            "base checkpoint.")
     adapter_dir = Path(adapter_dir).resolve()
     if not adapter_dir.is_dir():
         raise DataError(f"Adapter directory does not exist: {adapter_dir}")
@@ -511,17 +544,19 @@ def attach_lora_adapter(model, adapter_dir):
 
 
 def load_model_for_evaluation(config, *, checkpoint_dir=None, artifact_meta=None,
-                              local_files_only: bool = False, cache_dir=None):
+                              local_files_only: bool = False, cache_dir=None,
+                              base_loader=None):
     """Load the pinned base model, optionally with a saved Stage 1 artifact.
 
     ``"full"`` artifacts are complete model directories. ``"lora"`` artifacts
-    are PEFT adapters: the exact pinned BF16 base model is loaded first and the
-    adapter is attached to it, so an adapter is never mistaken for a standalone
-    model. ``artifact_meta`` should be the verified metadata from
-    ``checkpointing.verify_evaluation_artifact``.
+    are PEFT adapters: the exact pinned BF16 base model is loaded **base-only**
+    (no fresh adapter is created) and the saved adapter is attached exactly
+    once. ``base_loader`` is an injection seam for tests; production uses
+    :func:`load_base_model_and_tokenizer`.
     """
+    base_loader = base_loader or load_base_model_and_tokenizer
     if checkpoint_dir is None:
-        model, tokenizer, report = load_model_and_tokenizer(
+        model, tokenizer, report = base_loader(
             config, local_files_only=local_files_only, cache_dir=cache_dir,
             for_inference=True)
         report["source_kind"] = "base"
@@ -535,12 +570,14 @@ def load_model_for_evaluation(config, *, checkpoint_dir=None, artifact_meta=None
         artifact_meta = checkpointing.read_artifact_meta(checkpoint_dir, required=True)
     method = artifact_meta.get("training_method")
     if method == "lora":
-        model, tokenizer, report = load_model_and_tokenizer(
+        model, tokenizer, report = base_loader(
             config, local_files_only=local_files_only, cache_dir=cache_dir,
             for_inference=True)
         model = attach_lora_adapter(model, checkpoint_dir)
         report.update({
             "source_kind": "lora_adapter",
+            "training_method": "lora",
+            "adapter_attached": "once",
             "checkpoint_dir": str(checkpoint_dir),
             "adapter": str(checkpoint_dir),
             "base_model_id": artifact_meta.get("base_model_id"),

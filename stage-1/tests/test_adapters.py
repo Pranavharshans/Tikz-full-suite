@@ -1,15 +1,26 @@
 """Dependency-free tests for the LoRA adapter layer.
 
-These exercise the pure helpers used before and after Unsloth attaches
-adapters: target-module validation against the loaded model, trainable
-parameter assertions, and the numbers recorded in the load report. The actual
-PEFT save/load/resume/merge round trips are dependency-gated in
-``test_lora_integration.py``.
+The loading tests install fake ``torch``/``unsloth`` modules so the real
+loader functions execute end to end without Unsloth: they prove the base-only
+loader never calls ``get_peft_model``, the LoRA loader calls it exactly once,
+and the adapter attachment refuses a second adapter. The pure helpers
+(target validation, trainable assertions) are tested directly. Real PEFT round
+trips live in ``test_lora_integration.py``.
 """
+import sys
+import types
 import unittest
+from unittest import mock
+
+from tests import support
 
 from stage1 import adapters
 from stage1.errors import DataError
+
+
+class FakeEmbedding:
+    def __init__(self):
+        self.weight = types.SimpleNamespace(dtype="bfloat16")
 
 
 class FakeParameter:
@@ -21,16 +32,171 @@ class FakeParameter:
         return self._numel
 
 
-class FakeModule:
-    """Minimal named_modules() source: (name, object) pairs."""
+TARGETS = ("q_proj", "k_proj", "v_proj", "o_proj",
+           "gate_proj", "up_proj", "down_proj")
 
-    def __init__(self, names):
-        self._names = names
+
+class FakeModel:
+    """A tiny stand-in with the attributes the loaders and checks use."""
+
+    def __init__(self, *, with_adapter=False):
+        self.with_adapter = with_adapter
+        self.named = [
+            ("base.layers.0.self_attn.q_proj.weight", FakeParameter(64, False)),
+            ("base.layers.0.self_attn.q_proj.bias", FakeParameter(8, False)),
+        ]
+        if with_adapter:
+            for target in TARGETS:
+                self.named.append(
+                    (f"base.layers.0.{target}.lora_A.default.weight",
+                     FakeParameter(4, True)))
+                self.named.append(
+                    (f"base.layers.0.{target}.lora_B.default.weight",
+                     FakeParameter(4, True)))
+        self.saved_pretrained = []
+
+    def get_input_embeddings(self):
+        return FakeEmbedding()
 
     def named_modules(self):
         yield "", self
-        for name in self._names:
-            yield name, object()
+        for target in TARGETS:
+            yield f"base.layers.0.{target}", object()
+
+    def parameters(self):
+        for _, parameter in self.named:
+            yield parameter
+
+    def named_parameters(self):
+        for name, parameter in self.named:
+            yield name, parameter
+
+    def state_dict(self):
+        return {name: types.SimpleNamespace(shape=(2,)) for name, _ in self.named}
+
+    def save_pretrained(self, directory, **kwargs):
+        self.saved_pretrained.append(directory)
+
+    def train(self):
+        return self
+
+    def eval(self):
+        return self
+
+
+class FakeFastLanguageModel:
+    def __init__(self):
+        self.load_calls = []
+        self.peft_calls = []
+
+    def from_pretrained(self, model_name, **kwargs):
+        self.load_calls.append({"model_name": model_name, "kwargs": dict(kwargs)})
+        return FakeModel(), types.SimpleNamespace(pad_token_id=0)
+
+    def get_peft_model(self, model, r, lora_alpha, lora_dropout, bias,
+                       target_modules, random_state=None,
+                       use_gradient_checkpointing=None):
+        self.peft_calls.append({
+            "model": model, "r": r, "lora_alpha": lora_alpha,
+            "lora_dropout": lora_dropout, "bias": bias,
+            "target_modules": list(target_modules),
+            "use_gradient_checkpointing": use_gradient_checkpointing})
+        return FakeModel(with_adapter=True)
+
+    def for_training(self, model):
+        return model
+
+    def for_inference(self, model):
+        return model
+
+
+class FakeLoaderModule:
+    def __init__(self):
+        self.FastLanguageModel = FakeFastLanguageModel()
+
+
+def fake_modules():
+    loader = FakeLoaderModule()
+    torch = types.ModuleType("torch")
+    torch.bfloat16 = "bfloat16"
+    unsloth = types.ModuleType("unsloth")
+    unsloth.FastLanguageModel = loader.FastLanguageModel
+    unsloth.__version__ = "fake-1.0"
+    return loader, {"torch": torch, "unsloth": unsloth}
+
+
+class BaseOnlyLoaderTests(unittest.TestCase):
+    def setUp(self):
+        self.loader, self.modules = fake_modules()
+        self.config = support.make_config(training={"method": "lora"}, lora={})
+
+    def test_base_loader_never_creates_an_adapter(self):
+        with mock.patch.dict(sys.modules, self.modules):
+            model, tokenizer, report = adapters.load_base_model_and_tokenizer(
+                self.config)
+        self.assertEqual(self.loader.FastLanguageModel.peft_calls, [])
+        self.assertEqual(len(self.loader.FastLanguageModel.load_calls), 1)
+        self.assertEqual(report["training_method"], "base")
+        self.assertFalse(report["adapter_applied"])
+        self.assertEqual(report["quantization"], "none")
+        self.assertFalse(report["load_in_4bit"])
+        self.assertFalse(report["load_in_8bit"])
+
+    def test_lora_loader_creates_exactly_one_adapter(self):
+        with mock.patch.dict(sys.modules, self.modules):
+            model, tokenizer, report = adapters.load_model_and_tokenizer(
+                self.config)
+        self.assertEqual(len(self.loader.FastLanguageModel.peft_calls), 1)
+        call = self.loader.FastLanguageModel.peft_calls[0]
+        self.assertEqual(call["r"], 64)
+        self.assertEqual(call["lora_alpha"], 64)
+        self.assertEqual(call["bias"], "none")
+        self.assertEqual(call["target_modules"], list(TARGETS))
+        self.assertEqual(call["use_gradient_checkpointing"], "unsloth")
+        self.assertEqual(report["training_method"], "lora")
+        self.assertTrue(report["adapter_applied"])
+        self.assertEqual(report["target_modules"]["total_matched_modules"],
+                         len(TARGETS))
+        self.assertTrue(report["base_frozen"])
+
+    def test_base_loader_reports_missing_targets_before_adapting(self):
+        loader, modules = fake_modules()
+
+        class NoTargets(FakeModel):
+            def named_modules(self):
+                yield "", self
+                yield "base.layers.0.attention.wq", object()
+
+        loader.FastLanguageModel.from_pretrained = lambda model_name, **kwargs: (
+            NoTargets(), types.SimpleNamespace(pad_token_id=0))
+        modules["unsloth"].FastLanguageModel = loader.FastLanguageModel
+        with mock.patch.dict(sys.modules, modules):
+            with self.assertRaisesRegex(DataError, "not found in the loaded model"):
+                adapters.load_model_and_tokenizer(self.config)
+        self.assertFalse(loader.FastLanguageModel.peft_calls)
+
+    def test_attach_refuses_a_model_that_already_has_an_adapter(self):
+        model = FakeModel()
+        model.peft_config = {"default": object()}
+        with self.assertRaisesRegex(DataError, "already carries a PEFT adapter"):
+            adapters.attach_lora_adapter(model, "/tmp/does-not-matter")
+
+
+class EvaluationBaseBranchTests(unittest.TestCase):
+    def test_base_evaluation_uses_the_base_only_loader(self):
+        calls = []
+
+        def loader(config, **kwargs):
+            calls.append(kwargs)
+            return FakeModel(), types.SimpleNamespace(pad_token_id=0), {
+                "training_method": "base"}
+
+        config = support.make_config(training={"method": "lora"}, lora={})
+        model, tokenizer, report = adapters.load_model_for_evaluation(
+            config, base_loader=loader)
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(calls[0]["for_inference"])
+        self.assertEqual(report["source_kind"], "base")
 
 
 class TargetModuleTests(unittest.TestCase):
@@ -56,12 +222,14 @@ class TargetModuleTests(unittest.TestCase):
             adapters.validate_target_modules({"q_proj": 0}, ["q_proj"])
 
     def test_module_short_names_counts_occurrences(self):
-        model = FakeModule([
-            "model.layers.0.self_attn.q_proj",
-            "model.layers.1.self_attn.q_proj",
-            "model.layers.0.mlp.gate_proj",
-        ])
-        counts = adapters.module_short_names(model)
+        class Fake:
+            def named_modules(self):
+                yield "", self
+                yield "model.layers.0.self_attn.q_proj", object()
+                yield "model.layers.1.self_attn.q_proj", object()
+                yield "model.layers.0.mlp.gate_proj", object()
+
+        counts = adapters.module_short_names(Fake())
         self.assertEqual(counts["q_proj"], 2)
         self.assertEqual(counts["gate_proj"], 1)
         self.assertIsNone(counts.get("o_proj"))
@@ -126,19 +294,6 @@ class TrainableAssertionTests(unittest.TestCase):
             named, self.lora_config(bias="all"))
         self.assertEqual(report["base_parameters_trainable"], 0)
         self.assertTrue(report["base_frozen"])
-
-
-class EvaluationLoadTests(unittest.TestCase):
-    def test_base_and_adapter_loading_is_method_aware(self):
-        # load_model_for_evaluation must never load a LoRA adapter as if it
-        # were a complete model; the dispatch is by artifact metadata.
-        import inspect
-        signature = inspect.signature(adapters.load_model_for_evaluation)
-        self.assertIn("artifact_meta", signature.parameters)
-        self.assertIn("attach_lora_adapter", dir(adapters))
-        source = inspect.getsource(adapters.load_model_for_evaluation)
-        self.assertIn('method == "lora"', source)
-        self.assertIn("attach_lora_adapter", source)
 
 
 if __name__ == "__main__":

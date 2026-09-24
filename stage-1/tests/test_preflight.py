@@ -98,6 +98,58 @@ class OrchestrationTests(unittest.TestCase):
                 self.assertIn(prerequisite, names)
 
 
+class GpuProfileTests(unittest.TestCase):
+    """Hardware profiles: A40 LoRA versus RTX PRO 6000 full SFT."""
+
+    def device(self, name, total_gib):
+        cuda = types.SimpleNamespace(
+            is_available=lambda: True,
+            device_count=lambda: 1,
+            get_device_properties=lambda index: types.SimpleNamespace(
+                name=name, total_memory=int(total_gib * 1024 ** 3)))
+        return types.SimpleNamespace(cuda=cuda)
+
+    def run_check(self, name, total_gib, **config_overrides):
+        ctx = context(config=support.make_config(**config_overrides))
+        ctx.torch = self.device(name, total_gib)
+        return preflight.check_gpu_identity(ctx)
+
+    def test_a40_profile_accepts_an_a40_with_48_gib(self):
+        outcome = self.run_check("NVIDIA A40", 48,
+                                 hardware={"profile": "a40-lora"})
+        self.assertEqual(outcome["status"], "pass", outcome["detail"])
+        self.assertAlmostEqual(outcome["data"]["vram_gib"], 48.0, places=1)
+
+    def test_a40_profile_rejects_a40_below_the_threshold(self):
+        outcome = self.run_check("NVIDIA A40", 40,
+                                 hardware={"profile": "a40-lora"})
+        self.assertEqual(outcome["status"], "fail")
+        self.assertIn("min_vram_gib", outcome["detail"])
+
+    def test_a40_profile_rejects_an_rtx_pro_6000(self):
+        outcome = self.run_check("NVIDIA RTX PRO 6000 Blackwell Server Edition",
+                                 96, hardware={"profile": "a40-lora"})
+        self.assertEqual(outcome["status"], "fail")
+        self.assertIn("does not match", outcome["detail"])
+
+    def test_rtx_profile_accepts_an_rtx_pro_6000(self):
+        outcome = self.run_check("NVIDIA RTX PRO 6000 Blackwell Server Edition",
+                                 96)
+        self.assertEqual(outcome["status"], "pass", outcome["detail"])
+
+    def test_rtx_profile_rejects_an_a40(self):
+        outcome = self.run_check("NVIDIA A40", 48)
+        self.assertEqual(outcome["status"], "fail")
+        self.assertIn("does not match", outcome["detail"])
+
+    def test_a40_profile_explicit_vram_override(self):
+        outcome = self.run_check("NVIDIA A40", 46,
+                                 hardware={"profile": "a40-lora",
+                                           "min_vram_gib": 47.0})
+        self.assertEqual(outcome["status"], "fail")
+        self.assertIn("47.0", outcome["detail"])
+
+
 class IndividualCheckTests(unittest.TestCase):
     def test_python_version_check(self):
         import sys

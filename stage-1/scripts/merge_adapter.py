@@ -5,10 +5,11 @@ This command is always separate from training: nothing in the training path
 calls it, and it never runs automatically. It:
 
 1. verifies the adapter artifact (identity, model, revision, base provenance),
-2. loads the exact pinned BF16 base model through the supported loading path,
-3. attaches the adapter and records base-plus-adapter logits on a fixed input,
-4. merges the adapter (``merge_and_unload``) and checks that the merged logits
-   match within ``--tolerance`` (LoRA dropout is disabled in eval mode),
+2. loads the exact pinned BF16 base model **base-only** (no fresh adapter),
+3. attaches the saved adapter exactly once,
+4. records base-plus-adapter logits on a fixed input, merges the adapter
+   (``merge_and_unload``) and checks the merged logits match within
+   ``--tolerance`` (LoRA dropout is disabled in eval mode),
 5. writes the merged model, tokenizer and a ``merge-metadata.json`` record.
 
 Example:
@@ -25,12 +26,11 @@ import sys
 
 import _bootstrap  # noqa: F401
 
-from stage1 import (adapters, checkpointing, cli, config as config_module,
-                    data, formatting, identity)
+from stage1 import (adapters, checkpointing, cli, config as config_module, data,
+                    formatting, identity, merge)
 from stage1.errors import DataError
-from stage1.util import (canonical_digest, dependency_versions,
-                         detect_repo_commit, require_absolute, utc_now_iso,
-                         write_json_atomic)
+from stage1.util import (dependency_versions, detect_repo_commit,
+                         require_absolute, utc_now_iso)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -121,74 +121,40 @@ def main(argv) -> int:
             f"{artifact_meta.get('base_model_revision')}, but this config pins "
             f"{config.model.id}@{config.model.revision}")
 
-    print(f"loading the pinned base model {config.model.id} and attaching the adapter",
-          file=sys.stderr)
-    model, tokenizer, load_report = adapters.load_model_and_tokenizer(
-        config, local_files_only=args.local_files_only, cache_dir=args.cache_dir)
-    model = adapters.attach_lora_adapter(model, adapter_dir)
+    split = "validation" if eligibility["by_split"]["validation"]["eligible"] else "train"
+    ids = data.select_split_ids(prepared["manifest"], split, limit=1,
+                                seed=config.seed,
+                                exclude=eligibility["quarantined"])
+    rows = data.load_rows_by_ids(export_info, ids)
+    if not rows:
+        raise DataError("no eligible row is available for the merge check")
+    example = formatting.format_example(
+        tokenizer, row_id=rows[0]["id"], instruction=rows[0]["instruction"],
+        tikz=rows[0]["tikz_code"], template=template,
+        kwargs=config.tokenizer.chat_template_kwargs)
+    batch = {
+        "input_ids": torch.tensor([example.input_ids], dtype=torch.long),
+        "attention_mask": torch.tensor([[1] * len(example.input_ids)],
+                                       dtype=torch.long),
+        "position_ids": torch.tensor([list(range(len(example.input_ids)))],
+                                     dtype=torch.long),
+    }
 
-    verification = {"checked": False, "reason": "--skip-verify"}
-    if not args.skip_verify:
-        split = "validation" if eligibility["by_split"]["validation"]["eligible"] else "train"
-        ids = data.select_split_ids(prepared["manifest"], split, limit=1,
-                                    seed=config.seed,
-                                    exclude=eligibility["quarantined"])
-        rows = data.load_rows_by_ids(export_info, ids)
-        if not rows:
-            raise DataError("no eligible row is available for the merge check")
-        example = formatting.format_example(
-            tokenizer, row_id=rows[0]["id"], instruction=rows[0]["instruction"],
-            tikz=rows[0]["tikz_code"], template=template,
-            kwargs=config.tokenizer.chat_template_kwargs)
-        batch = {
-            "input_ids": torch.tensor([example.input_ids], dtype=torch.long),
-            "attention_mask": torch.tensor([[1] * len(example.input_ids)],
-                                           dtype=torch.long),
-            "position_ids": torch.tensor([list(range(len(example.input_ids)))],
-                                         dtype=torch.long),
-        }
-        model.eval()
-        with torch.no_grad():
-            before = model(**batch).logits.detach().float()
-        merged = model.merge_and_unload()
-        with torch.no_grad():
-            after = merged(**batch).logits.detach().float()
-        max_abs_diff = float((before - after).abs().max())
-        verification = {
-            "checked": True,
-            "row_id": rows[0]["id"],
-            "tokens": len(example.input_ids),
-            "max_abs_diff": max_abs_diff,
-            "tolerance": args.tolerance,
-            "passed": max_abs_diff <= args.tolerance,
-        }
-        if max_abs_diff > args.tolerance:
-            raise DataError(
-                f"Merged logits differ from base+adapter by {max_abs_diff} "
-                f"(tolerance {args.tolerance}); refusing to export an "
-                "unverified merged model")
-    else:  # pragma: no cover - exercised through the CLI
-        merged = model.merge_and_unload()
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    merged.save_pretrained(str(out_dir), safe_serialization=True)
-    tokenizer.save_pretrained(str(out_dir))
-    write_json_atomic(out_dir / "merge-metadata.json", {
-        "schema_version": "stage1-merge-v1",
-        "created_at": utc_now_iso(),
-        "run_identity_sha256": run_identity["sha256"],
-        "adapter": str(adapter_dir),
-        "adapter_training_method": artifact_meta["training_method"],
-        "base_model_id": config.model.id,
-        "base_model_revision": config.model.revision,
-        "merged_from_adapter": True,
-        "config_source_sha256": config.source_sha256,
-        "load_report": load_report,
-        "verification": verification,
-        "merged_logits_sha256": canonical_digest(verification),
-    })
-    print(f"merged model written to {out_dir}")
-    print(f"verification: {verification}")
+    print(f"loading the pinned base model {config.model.id} base-only and "
+          "attaching the saved adapter exactly once", file=sys.stderr)
+    result = merge.merge_adapter(
+        config, adapter_dir, out_dir, batch=batch,
+        tolerance=args.tolerance, verify=not args.skip_verify,
+        local_files_only=args.local_files_only, cache_dir=args.cache_dir,
+        metadata={"run_identity_sha256": run_identity["sha256"],
+                  "sample_row_id": rows[0]["id"],
+                  "sample_tokens": len(example.input_ids),
+                  "created_at": utc_now_iso()})
+    print(f"merged model written to {result['out_dir']}")
+    print(f"verification: {result['verification']}")
+    if not result["verification"].get("checked"):
+        print("warning: logit equivalence was skipped for this merge",
+              file=sys.stderr)
     return 0
 
 

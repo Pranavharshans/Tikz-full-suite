@@ -312,14 +312,31 @@ def verify_evaluation_artifact(directory, *, identity_sha256: str, model_id: str
         model_revision=model_revision, adapter=adapter, gate=gate, method=method)
 
 
-def load_artifact_weights(model, directory, *, method: str = "full",
-                          loader=None) -> dict:
-    """Load an artifact's weights into the model, exactly and method-aware.
+def _tensors_equal(left, right) -> bool:
+    """Duck-typed tensor/list equality for weight read-back checks."""
+    if left is None or right is None:
+        return False
+    if hasattr(left, "shape"):
+        if getattr(right, "shape", None) != left.shape:
+            return False
+        try:
+            return bool((left == right).all())
+        except Exception:  # pragma: no cover - exotic tensor types
+            return False
+    return left == right
 
-    Full artifacts load the complete model state dict. LoRA artifacts load only
-    adapter tensors: the saved keys must be adapter keys, must cover every
-    adapter parameter of the live model, and must not touch base weights.
-    ``loader`` is an injection seam for tests.
+
+def load_artifact_weights(model, directory, *, method: str = "full",
+                          loader=None, adapter_state_setter=None) -> dict:
+    """Restore an artifact's weights into the model, exactly and method-aware.
+
+    Full artifacts load the complete model state dict. LoRA artifacts are
+    restored through PEFT's supported adapter-state API
+    (``peft.set_peft_model_state_dict``), never a raw ``load_state_dict``:
+    the saved keys must be adapter keys, must cover every adapter parameter of
+    the live model, and the restored tensors are read back and compared to the
+    saved ones. ``loader`` and ``adapter_state_setter`` are injection seams for
+    tests.
     """
     if method not in TRAINING_METHODS:
         raise CheckpointError(f"Unknown training method {method!r}")
@@ -339,34 +356,65 @@ def load_artifact_weights(model, directory, *, method: str = "full",
         raise CheckpointError(
             f"No {'adapter ' if method == 'lora' else ''}weight file found in "
             f"{directory}")
-    if method == "lora":
-        non_adapter = sorted(key for key in saved if "lora_" not in key)
-        if non_adapter:
-            raise CheckpointError(
-                f"Adapter file in {directory} contains non-adapter tensors "
-                f"({non_adapter[:3]}); refusing to treat it as a LoRA artifact")
-        live = model.state_dict()
-        expected = {key for key in live if "lora_" in key}
-        if not expected:
-            raise CheckpointError(
-                "The live model has no adapter parameters; refusing to load a "
-                "LoRA artifact into a non-LoRA model")
-        missing = sorted(expected - set(saved))
-        if missing:
-            raise CheckpointError(
-                f"Adapter in {directory} does not cover the model's adapter "
-                f"parameters; missing {len(missing)} key(s), first "
-                f"{missing[0]}")
-    missing, unexpected = model.load_state_dict(saved, strict=False)
+
     if method == "full":
+        missing, unexpected = model.load_state_dict(saved, strict=False)
         if missing or unexpected:
             raise CheckpointError(
                 f"Artifact {directory} does not match the model: "
                 f"missing={list(missing)[:3]}, unexpected={list(unexpected)[:3]}")
+        return {"path": str(directory), "method": method, "tensors": len(saved),
+                "restore_api": "Module.load_state_dict"}
+
+    non_adapter = sorted(key for key in saved if "lora_" not in key)
+    if non_adapter:
+        raise CheckpointError(
+            f"Adapter file in {directory} contains non-adapter tensors "
+            f"({non_adapter[:3]}); refusing to treat it as a LoRA artifact")
+    live = model.state_dict()
+    expected = {key for key in live if "lora_" in key}
+    if not expected:
+        raise CheckpointError(
+            "The live model has no adapter parameters; refusing to restore a "
+            "LoRA artifact into a non-LoRA model")
+    missing = sorted(expected - set(saved))
+    if missing:
+        raise CheckpointError(
+            f"Adapter in {directory} does not cover the model's adapter "
+            f"parameters; missing {len(missing)} key(s), first {missing[0]}")
+    if adapter_state_setter is None:
+        try:
+            from peft import set_peft_model_state_dict as adapter_state_setter
+        except ImportError as exc:  # pragma: no cover - environment dependent
+            raise CheckpointError(
+                "peft is required to restore LoRA adapter state through its "
+                "supported API; install the pinned environment from "
+                "environment.lock_file") from exc
+    try:
+        result = adapter_state_setter(model, saved)
+    except Exception as exc:
+        raise CheckpointError(
+            f"PEFT failed to restore the adapter in {directory} "
+            f"({type(exc).__name__}: {exc})") from exc
+    missing_keys = list(getattr(result, "missing_keys", []) or [])
+    unexpected_keys = list(getattr(result, "unexpected_keys", []) or [])
+    if missing_keys or unexpected_keys:
+        raise CheckpointError(
+            f"PEFT reported an incomplete adapter restore from {directory}: "
+            f"missing={missing_keys[:3]}, unexpected={unexpected_keys[:3]}")
+    restored = model.state_dict()
+    mismatched = [key for key in saved if not _tensors_equal(restored.get(key),
+                                                             saved[key])]
+    if mismatched:
+        raise CheckpointError(
+            f"Adapter read-back in {directory} does not match the saved "
+            f"tensors; first mismatch {mismatched[0]}")
     return {
         "path": str(directory),
         "method": method,
         "tensors": len(saved),
+        "restore_api": "peft.set_peft_model_state_dict",
+        "readback_verified": True,
     }
 
 

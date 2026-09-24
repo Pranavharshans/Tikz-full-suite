@@ -274,9 +274,8 @@ def config_dict(**overrides) -> dict:
             "render_similarity": {"enabled": True, "size": 64},
         },
         "hardware": {
-            "expected_gpu_name_regex": "RTX PRO 6000",
-            "min_vram_gib": 88.0,
-            "min_free_disk_gib": 250.0,
+            # Mirrors configs/common.yaml: the profile supplies the values.
+            "profile": "rtxpro6000-full",
             "device": "cuda:0",
         },
         "environment": {"lock_file": "locks/test.lock", "python_version": "3.12"},

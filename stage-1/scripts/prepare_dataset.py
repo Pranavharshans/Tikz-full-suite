@@ -59,6 +59,8 @@ def main(argv) -> int:
                 "training_method": config.training.method,
                 "lora": config.lora.to_jsonable() if config.lora else None,
                 "effective_batch_size": config.training.effective_batch_size,
+                "hardware_profile": config.hardware.profile,
+                "min_vram_gib": config.hardware.min_vram_gib,
                 "max_seq_len": config.data.max_seq_len,
                 "splits": dataclasses.asdict(config.data.splits),
                 "gates": {name: config.gate(name).to_jsonable()

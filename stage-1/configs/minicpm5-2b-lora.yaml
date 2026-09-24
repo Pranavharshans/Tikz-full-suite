@@ -39,3 +39,9 @@ lora:
 environment:
   lock_file: locks/minicpm5-2b.lock
   python_version: "3.12"
+
+hardware:
+  # BF16 LoRA runs on a single A40 (44 GiB threshold within the 44-48 GiB
+  # range); this profile also lowers the disk requirement for adapter-sized
+  # checkpoints. Full-parameter SFT keeps the RTX PRO 6000 profile.
+  profile: a40-lora
