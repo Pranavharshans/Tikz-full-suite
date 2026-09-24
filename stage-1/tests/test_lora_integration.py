@@ -257,7 +257,8 @@ class AdapterRoundTripTests(unittest.TestCase):
             calls.append(kwargs)
             fresh = tiny_llama()
             fresh.load_state_dict(base_state, strict=False)
-            return fresh, StubTokenizer(), {}
+            return fresh, StubTokenizer(), {
+                "loader": "stub-base-loader", "training_method": "base"}
 
         outcome = preflight.check_model_reload(ctx, base_loader=base_loader)
         self.assertEqual(outcome["status"], "pass", outcome["detail"])
@@ -372,7 +373,11 @@ class ReloadTrainingStateTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)
         self.config = support.make_config(
-            training={"method": "lora", "learning_rate": 1e-4}, lora={})
+            training={"method": "lora", "learning_rate": 1e-4},
+            lora={"rank": 4, "alpha": 4, "dropout": 0.0,
+                  # apply_peft_lora saves q/k/v/o adapters; the config must
+                  # match or the trainable check refuses the partial adapter.
+                  "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj"]})
 
     def tearDown(self):
         self.temporary.cleanup()

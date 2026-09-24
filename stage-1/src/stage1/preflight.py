@@ -741,15 +741,16 @@ def check_model_reload(ctx: PreflightContext, *, base_loader=None,
             return _fail(
                 f"reloaded loss {loss_after:.6f} differs from the original "
                 f"eval loss {float(loss_before):.6f} by {difference:.6f}")
+        loader_name = report.get("loader", "injected base loader")
         return _pass(
-            f"reloaded through {report['loader']}; eval loss "
+            f"reloaded through {loader_name}; eval loss "
             f"{loss_before:.6f} -> {loss_after:.6f} (diff {difference:.2e}), "
             f"logits shape {shape_after if shape_after is not None else 'not materialized'}",
             loss_before=float(loss_before), loss_after=loss_after,
             loss_abs_diff=difference,
             logits_shape=(list(shape_after) if shape_after is not None else None),
             logits_materialized=shape_after is not None,
-            reload_verified=True, loader=report["loader"])
+            reload_verified=True, loader=loader_name)
     finally:
         shutil.rmtree(directory, ignore_errors=True)
 
