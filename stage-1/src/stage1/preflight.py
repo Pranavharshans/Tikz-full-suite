@@ -12,6 +12,7 @@ accounting, failure aggregation) is unit-testable with fakes.
 from __future__ import annotations
 
 import shutil
+import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -462,7 +463,9 @@ def check_one_step(ctx: PreflightContext) -> dict:
         eval_loss = float(eval_outputs.loss)
         logits_shape = tuple(eval_outputs.logits.shape)
     except Exception as exc:
-        return _fail(f"eval-mode forward failed: {type(exc).__name__}: {exc}")
+        return _fail(
+            f"eval-mode forward failed: {type(exc).__name__}: {exc}\n"
+            f"{traceback.format_exc()}")
     finally:
         model.train()
     if eval_loss != eval_loss or eval_loss == float("inf"):
@@ -516,7 +519,8 @@ def check_weight_serialization(ctx: PreflightContext, *,
                 except ImportError:
                     return _fail("peft is not importable")
                 adapter_state_getter = get_peft_model_state_dict
-            from .checkpointing import compare_adapter_states
+            from .checkpointing import (compare_adapter_states,
+                                        normalize_adapter_key)
             try:
                 live_adapter = adapter_state_getter(ctx.model)
             except Exception as exc:
@@ -525,9 +529,49 @@ def check_weight_serialization(ctx: PreflightContext, *,
                     f"{type(exc).__name__}: {exc}")
             comparison = compare_adapter_states(loaded, live_adapter)
             if comparison["problems"]:
+                preview = comparison["problems"][:20]
+                remaining = len(comparison["problems"]) - len(preview)
+                suffix = (f"\n  - ... {remaining} additional mismatch(es)"
+                          if remaining else "")
+                loaded_norm = {
+                    normalize_adapter_key(key): value
+                    for key, value in loaded.items()}
+                live_norm = {
+                    normalize_adapter_key(key): value
+                    for key, value in live_adapter.items()}
+                deltas = []
+                for key in sorted(set(loaded_norm) & set(live_norm)):
+                    left, right = loaded_norm[key], live_norm[key]
+                    if not hasattr(left, "detach") or not hasattr(right, "detach"):
+                        continue
+                    try:
+                        difference = (left.detach().float().cpu()
+                                      - right.detach().float().cpu()).abs()
+                        if difference.numel():
+                            deltas.append({
+                                "key": key,
+                                "max_abs": float(difference.max().item()),
+                                "mean_abs": float(difference.mean().item()),
+                                "saved_dtype": str(left.dtype),
+                                "live_dtype": str(right.dtype),
+                            })
+                    except Exception:
+                        continue
+                    if len(deltas) == 3:
+                        break
+                delta_text = "".join(
+                    f"\n  - diagnostic {item['key']}: "
+                    f"max_abs={item['max_abs']:.8g}, "
+                    f"mean_abs={item['mean_abs']:.8g}, "
+                    f"saved={item['saved_dtype']}, live={item['live_dtype']}"
+                    for item in deltas)
                 return _fail(
                     "adapter serialization failed:\n" + "\n".join(
-                        f"  - {line}" for line in comparison["problems"]))
+                        f"  - {line}" for line in preview) + suffix + delta_text,
+                    mismatch_count=len(comparison["problems"]),
+                    missing_from_artifact=comparison["missing_from_artifact"],
+                    not_part_of_adapter=comparison["not_part_of_adapter"],
+                    value_delta_preview=deltas)
             return _pass(
                 f"saved {len(weight_files)} adapter weight file(s), compared "
                 f"all {comparison['compared']} PEFT tensors, read-back matches "
