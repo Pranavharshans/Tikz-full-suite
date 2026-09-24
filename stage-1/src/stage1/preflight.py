@@ -238,13 +238,35 @@ def check_unsloth_import(ctx: PreflightContext) -> dict:
     if loader is None:
         return _fail(f"unsloth {version} has no {loader_name}", version=version)
     from .adapters import _callable_parameters
+    import inspect as _inspect
+    method = ctx.config.training.method
+    if method == "lora":
+        get_peft_model = getattr(loader, "get_peft_model", None)
+        if get_peft_model is None:
+            return _fail(
+                f"unsloth {version} {loader_name} has no get_peft_model; LoRA "
+                "mode requires the native PEFT integration", version=version)
+        parameters = _callable_parameters(get_peft_model)
+        required = {"r", "lora_alpha", "lora_dropout", "bias", "target_modules"}
+        accepts_any = any(
+            parameter.kind is _inspect.Parameter.VAR_KEYWORD
+            for parameter in parameters.values())
+        missing = sorted(required - set(parameters)) if not accepts_any else []
+        if missing:
+            return _fail(
+                f"unsloth {version} {loader_name}.get_peft_model does not "
+                f"accept {missing}", version=version)
+        return _pass(
+            f"unsloth {version}, {loader_name}.get_peft_model with the "
+            "required adapter parameters", version=version, loader=loader_name,
+            method=method)
     if "full_finetuning" not in _callable_parameters(loader.from_pretrained):
         return _fail(
             f"unsloth {version} {loader_name}.from_pretrained has no "
             "full_finetuning parameter; Stage 1 requires full-parameter training",
             version=version)
     return _pass(f"unsloth {version}, {loader_name} with full_finetuning",
-                 version=version, loader=loader_name)
+                 version=version, loader=loader_name, method=method)
 
 
 def check_attention_backend(ctx: PreflightContext) -> dict:
@@ -328,10 +350,13 @@ def check_model_load(ctx: PreflightContext) -> dict:
     ctx.model = model
     ctx.load_report = report
     ctx.scratch["parameter_count"] = report["parameter_count"]
-    return _pass(
-        f"{report['loader']} loaded {report['parameter_count'] / 1e9:.2f}B params "
-        f"({report['dtype']}), attn={report['attn_implementation']}",
-        **report)
+    detail = (f"{report['loader']} loaded {report['parameter_count'] / 1e9:.2f}B params "
+              f"({report['dtype']}), method={report['training_method']}, "
+              f"attn={report['attn_implementation']}")
+    if report["training_method"] == "lora":
+        detail += (f", trainable {report['trainable_parameter_count'] / 1e6:.1f}M "
+                   f"({report['trainable_percentage']:.4f}%)")
+    return _pass(detail, **report)
 
 
 def check_one_step(ctx: PreflightContext) -> dict:
@@ -508,6 +533,7 @@ def check_model_reload(ctx: PreflightContext) -> dict:
 
     directory = Path(tempfile.mkdtemp(prefix="stage1-preflight-reload-"))
     try:
+        method = ctx.config.training.method
         ctx.model.save_pretrained(str(directory), safe_serialization=True)
         ctx.tokenizer.save_pretrained(str(directory))
         del ctx.model
@@ -515,9 +541,19 @@ def check_model_reload(ctx: PreflightContext) -> dict:
         gc.collect()
         torch.cuda.empty_cache()
         try:
-            model, tokenizer, report = adapters.load_model_and_tokenizer(
-                ctx.config, local_files_only=True, cache_dir=ctx.cache_dir,
-                for_training=True, source_override=directory)
+            if method == "lora":
+                # An adapter is not a standalone model: reload the pinned base
+                # through the supported loader and attach the saved adapter.
+                model, tokenizer, report = adapters.load_model_and_tokenizer(
+                    ctx.config, local_files_only=ctx.local_files_only,
+                    cache_dir=ctx.cache_dir, for_training=True)
+                model = adapters.attach_lora_adapter(model, directory)
+                report["source_kind"] = "lora_adapter"
+                report["adapter"] = str(directory)
+            else:
+                model, tokenizer, report = adapters.load_model_and_tokenizer(
+                    ctx.config, local_files_only=True, cache_dir=ctx.cache_dir,
+                    for_training=True, source_override=directory)
         except Exception as exc:
             return _fail(
                 f"reload through the supported loading path failed: "
@@ -626,32 +662,32 @@ def check_trainer_resume(ctx: PreflightContext) -> dict:
         write_json_atomic(directory / "trainer_state.json", {
             "global_step": step, "epoch": 0.1,
             "log_history": [{"loss": float(outputs.loss)}]})
+        method = ctx.config.training.method
         checkpointing.write_checkpoint_meta(
             directory, identity_sha256=ctx.identity["sha256"],
             global_step=step, supervised_tokens_seen=0, epochs_completed=0.1,
             gate=None, run_id=ctx.identity["sha256"][:16],
             model_id=ctx.config.model.id,
             model_revision=ctx.config.model.revision,
-            adapter=ctx.config.model.adapter)
+            adapter=ctx.config.model.adapter,
+            training_method=method,
+            base_model_id=ctx.config.model.id if method == "lora" else None,
+            base_model_revision=ctx.config.model.revision if method == "lora" else None,
+            lora=(ctx.config.lora.to_jsonable()
+                  if method == "lora" and ctx.config.lora is not None else None))
 
-        reason = checkpointing.incomplete_reason(directory)
+        reason = checkpointing.incomplete_reason(directory, method=method)
         if reason:
             return _fail(f"minimal checkpoint is incomplete: {reason}")
-        checkpointing.verify_checkpoint(directory, ctx.identity["sha256"])
+        checkpointing.verify_checkpoint(directory, ctx.identity["sha256"],
+                                        method=method)
 
-        # Restore the model weights from the saved files.
+        # Restore the model weights from the saved files (adapter-only for
+        # LoRA, complete model for full finetuning).
         try:
-            from safetensors.torch import load_file
-        except ImportError:
-            return _fail("safetensors is not importable")
-        saved_state = {}
-        for path in sorted(directory.glob("*.safetensors")):
-            saved_state.update(load_file(str(path)))
-        missing, unexpected = model.load_state_dict(saved_state, strict=False)
-        if missing or unexpected:
-            return _fail(
-                f"model restore is not exact: missing={list(missing)[:3]}, "
-                f"unexpected={list(unexpected)[:3]}")
+            checkpointing.load_artifact_weights(model, directory, method=method)
+        except CheckpointError as exc:
+            return _fail(f"model restore is not exact: {exc}")
 
         # Restore optimizer, scheduler and trainer state into fresh objects and
         # require the restored state to equal the state we saved. The scheduler

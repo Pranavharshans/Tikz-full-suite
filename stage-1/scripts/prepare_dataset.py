@@ -56,6 +56,9 @@ def main(argv) -> int:
                 "revision": config.model.revision,
                 "adapter": config.model.adapter,
                 "loader": config.model.loader,
+                "training_method": config.training.method,
+                "lora": config.lora.to_jsonable() if config.lora else None,
+                "effective_batch_size": config.training.effective_batch_size,
                 "max_seq_len": config.data.max_seq_len,
                 "splits": dataclasses.asdict(config.data.splits),
                 "gates": {name: config.gate(name).to_jsonable()

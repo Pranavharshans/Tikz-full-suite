@@ -124,28 +124,44 @@ def main(argv) -> int:
     train_rows = data.load_rows_by_ids(export_info, train_sample_ids)
     train_targets = [(row["id"], row["tikz_code"]) for row in train_rows]
 
+    artifact_meta = None
     artifact = {"kind": "base", "verified": True,
+                "training_method": "base",
                 "identity_sha256": run_identity["sha256"],
                 "model_id": config.model.id,
                 "model_revision": config.model.revision,
                 "adapter": config.model.adapter, "gate": None}
     if args.checkpoint:
-        artifact = checkpointing.verify_evaluation_artifact(
+        artifact_meta = checkpointing.verify_evaluation_artifact(
             args.checkpoint, identity_sha256=run_identity["sha256"],
             model_id=config.model.id, model_revision=config.model.revision,
             adapter=config.model.adapter, gate=args.expect_gate)
-        artifact = {"kind": artifact["kind"], "verified": True,
-                    "identity_sha256": artifact["identity_sha256"],
-                    "model_id": artifact["model_id"],
-                    "model_revision": artifact["model_revision"],
-                    "adapter": artifact["adapter"], "gate": artifact["gate"],
-                    "global_step": artifact["global_step"],
+        artifact = {"kind": artifact_meta["kind"], "verified": True,
+                    "training_method": artifact_meta["training_method"],
+                    "identity_sha256": artifact_meta["identity_sha256"],
+                    "model_id": artifact_meta["model_id"],
+                    "model_revision": artifact_meta["model_revision"],
+                    "adapter": artifact_meta["adapter"],
+                    "base_model_id": artifact_meta.get("base_model_id"),
+                    "base_model_revision": artifact_meta.get("base_model_revision"),
+                    "gate": artifact_meta["gate"],
+                    "global_step": artifact_meta["global_step"],
                     "path": str(args.checkpoint)}
+        if artifact_meta["training_method"] == "lora":
+            # An adapter is not a standalone model: it must have been created
+            # for the pinned base checkpoint configured for this run.
+            if (artifact_meta.get("base_model_id") != config.model.id
+                    or artifact_meta.get("base_model_revision") != config.model.revision):
+                raise data.DataError(
+                    f"Adapter {args.checkpoint} was saved for base "
+                    f"{artifact_meta.get('base_model_id')}@"
+                    f"{artifact_meta.get('base_model_revision')}, but this "
+                    f"config pins {config.model.id}@{config.model.revision}")
 
     print(f"loading {'checkpoint ' + args.checkpoint if args.checkpoint else 'base model'}",
           file=sys.stderr)
     model, tokenizer, load_report = adapters.load_model_for_evaluation(
-        config, checkpoint_dir=args.checkpoint,
+        config, checkpoint_dir=args.checkpoint, artifact_meta=artifact_meta,
         local_files_only=args.local_files_only, cache_dir=args.cache_dir)
     records = generate.generate_records(
         model, tokenizer, rows, template=template,
@@ -174,6 +190,11 @@ def main(argv) -> int:
         "source_kind": load_report.get("source_kind"),
         "checkpoint_dir": load_report.get("checkpoint_dir"),
         "artifact": artifact,
+        "training_method": artifact["training_method"],
+        "max_seq_len": config.data.max_seq_len,
+        "effective_batch_size": config.training.effective_batch_size,
+        "evaluation_set_sha256": evaluate.evaluation_set_hash(ids),
+        "evaluation_set_size": len(ids),
         "eligible": {
             "quarantined_excluded": len(quarantined),
             "by_split": eligibility["by_split"],

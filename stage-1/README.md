@@ -1,13 +1,29 @@
 # Stage 1: supervised fine-tuning
 
-Full-parameter BF16 SFT for text-to-TikZ generation, trained with Unsloth on
-one NVIDIA RTX PRO 6000 Blackwell (96 GB). Two models share one training
+BF16 supervised fine-tuning for text-to-TikZ generation, trained with Unsloth
+on one NVIDIA RTX PRO 6000 Blackwell (96 GB). Two models share one training
 implementation and differ only by configuration:
 
 | Config | Model | Adapter |
 | --- | --- | --- |
 | `configs/qwen3.5-4b-full.yaml` | `Qwen/Qwen3.5-4B` @ `851bf6e8…` | `qwen3.5` (multimodal checkpoint, trained text-only) |
 | `configs/minicpm5-2b-full.yaml` | `openbmb/MiniCPM5-2B` @ `12a3808a…` | `minicpm5` (text-only Llama, the comparison baseline) |
+| `configs/qwen3.5-4b-lora.yaml` | same model, BF16 LoRA | `qwen3.5` |
+| `configs/minicpm5-2b-lora.yaml` | same model, BF16 LoRA | `minicpm5` |
+
+Training mode is explicit and first-class:
+
+```yaml
+training:
+  method: full   # full-parameter BF16 SFT (default), or
+  method: lora   # BF16 LoRA through Unsloth's native PEFT integration
+```
+
+LoRA is **not** QLoRA: the base checkpoint is always loaded unquantized in
+BF16 (`load_in_4bit: false`, `load_in_8bit: false`), and full-parameter mode
+is unchanged. The two methods have different run identities, checkpoint
+layouts and final artifacts, so they can never share or resume each other's
+work.
 
 The first comparable experiment is **text-only for both models**: no images
 are supplied to either model. `png_image` from the export is retained for
@@ -24,11 +40,11 @@ stage-1/
   README.md                 this runbook
   .python-version           interpreter pin (3.12) for the GPU environments
   pyproject.toml            packaging (loose bounds; locks are authoritative)
-  configs/                  common.yaml + one YAML per model
+  configs/                  common.yaml + full and lora YAML per model
   locks/                    pinned pip requirements, one file per model
   schemas/                  JSON Schemas for the artifacts listed in section 9
   src/stage1/               the shared implementation
-  scripts/                  six CLI entry points (see below)
+  scripts/                  seven CLI entry points (see below)
   tests/                    synthetic CPU tests; GPU/network tests are marked
 ```
 
@@ -272,6 +288,74 @@ pass before generation or any metric is produced, and records
 `restore_tensors`, so the reported generation never describes a stale
 checkpoint.
 
+### LoRA mode (BF16, native PEFT)
+
+`training.method: lora` loads the same pinned unquantized BF16 base model and
+attaches adapters through Unsloth's native integration
+(`FastLanguageModel`/`FastVisionModel.get_peft_model`, which uses PEFT). No
+adapter layers are implemented by hand and no optimizer/scheduler behavior is
+recreated: training and resume go through the Hugging Face Trainer exactly as
+in full mode.
+
+Defaults (`lora:` section): rank 64, alpha 64, dropout 0.0, bias `none`, and
+target modules `q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj`.
+Default LoRA learning rate is `1.0e-4`, cosine schedule, 3% warmup, max grad
+norm 1.0.
+
+**Target validation.** Before adapters are attached, every configured target
+name is checked against the loaded model's module names. A target that does
+not exist fails the load with the available projection-like module names; a
+target is never silently ignored. The load report records the matched-module
+count per target, so partial architectural coverage (for example only the
+full-attention blocks of a hybrid model) is visible before training.
+
+**Trainable assertions.** After attaching, base parameters must be frozen and
+only adapter parameters (plus biases when `bias` is not `none`) may be
+trainable; a missing target, an unattached adapter or a trainable base
+parameter fails the load. The run records total parameters, trainable
+parameters and percentage, rank/alpha/dropout/targets, base-model id and
+revision, the tokenizer fingerprint hash and the dataset identity.
+
+**Artifacts.** Full artifacts are complete model directories. LoRA artifacts
+are native PEFT adapters (`adapter_config.json` + adapter weights) with
+base-model provenance in `stage1-checkpoint.json`/`stage1-final.json`
+(`training_method: lora`, `base_model_id`, `base_model_revision`). An adapter
+directory is never treated as a standalone model: verification refuses an
+adapter without base provenance, and evaluation always loads the pinned BF16
+base first and then attaches the adapter.
+
+**Isolation.** The run identity includes `training.method` and the complete
+LoRA configuration, and artifact metadata records the method. Full and LoRA
+runs cannot share a run directory, a checkpoint namespace or a resume: any
+cross-method attempt fails with an explicit message.
+
+**Resume.** Resume uses the Trainer's public `resume_from_checkpoint` path
+with the same-gate, same-method checkpoint; nothing reconstructs optimizer or
+scheduler objects for resume (the preflight's state check is verification
+only, and the dependency-gated integration test exercises a fresh Trainer
+continuing from a native checkpoint).
+
+**Merge (separate command).** `scripts/merge_adapter.py` is the only way to
+produce a merged model; training never merges automatically. It verifies the
+adapter artifact, loads the pinned base, checks that base-plus-adapter and
+merged logits agree within `--tolerance` (default `1e-3`, LoRA dropout
+disabled in eval mode), and writes the merged model plus a
+`merge-metadata.json` record with the verification numbers.
+
+```bash
+python3 stage-1/scripts/merge_adapter.py \
+  --config stage-1/configs/minicpm5-2b-lora.yaml \
+  --export /shared/$USER/tikz-production/export \
+  --prepared /shared/$USER/tikz-stage1/prepared \
+  --run-dir /shared/$USER/tikz-stage1/runs/minicpm5-2b-lora \
+  --adapter /shared/$USER/tikz-stage1/runs/minicpm5-2b-lora/final/smoke-1000 \
+  --out /shared/$USER/tikz-stage1/merged/minicpm5-2b-smoke
+```
+
+**Effective batch.** `per_device_train_batch_size * gradient_accumulation_steps`
+must equal 16 for both methods (one A40, no multi-GPU); the config parser
+enforces it.
+
 ### Sequence packing is not supported
 
 Stage 1 rejects `training.packing: true` at configuration parse time with an
@@ -349,13 +433,20 @@ python3 stage-1/scripts/compare_models.py \
   --out /shared/$USER/tikz-stage1/comparison
 ```
 
-Writes `comparison.json` and a readable `comparison.md`. The experiment is only
-declared READY when at least one base-model evaluation and one trained-artifact
-evaluation exist for the **same data identity and split**; otherwise the
-command exits `1` with the reasons (`--allow-incomplete` exits 0 for
-intermediate inspection). Compile improvement is not required until a
-base-model baseline exists, and missing fields are shown as `-`, never
-silently treated as zero.
+Writes `comparison.json` and a readable `comparison.md`. The table shows the
+training method per candidate. The experiment is only declared READY when at
+least one base-model evaluation and one trained-artifact evaluation exist for
+the **same data identity and split**; otherwise the command exits `1` with the
+reasons (`--allow-incomplete` exits 0 for intermediate inspection).
+
+Comparison candidates must also be comparable: same training method (base
+evaluations are compatible with either single method, but full and LoRA
+candidates are never mixed), same dataset identity, same sequence limit and
+the same evaluation set (recorded as `evaluation_set_sha256`). Violations exit
+`1` with the specific disagreement unless `--allow-non-comparable` is passed,
+and the report always states `Comparability: OK / NOT COMPARABLE`. Compile
+improvement is not required until a base-model baseline exists, and missing
+fields are shown as `-`, never silently treated as zero.
 
 ## 8. Slurm
 
@@ -471,11 +562,14 @@ STAGE1_ALLOW_NETWORK_TESTS=1 python3 -m unittest tests.test_network_integration 
 exercises real `pdflatex` when it is installed (including the shell-escape
 refusal). `tests/test_checkpointing.py::ProductionSchedulerIntegrationTests`
 runs the resume round trip against the real `transformers.get_scheduler`
-cosine schedule when torch and Transformers are installed; without them the
-test is skipped and the resume gate is explicitly unverified. Tests that need
-`pyarrow`, `PyYAML`, `Pillow`, `torch`, `transformers`, a GPU or network access
-skip cleanly with the reason printed by `unittest -v`; the skip count therefore
-depends on the environment (see the run report).
+cosine schedule, and `tests/test_lora_integration.py` runs the real PEFT
+adapter save/attach/merge round trips and a fresh-Trainer resume from a native
+checkpoint, when torch, Transformers, PEFT and datasets are installed; without
+them those tests are skipped and the corresponding LoRA/resume gates are
+explicitly unverified. Tests that need `pyarrow`, `PyYAML`, `Pillow`, `torch`,
+`transformers`, `peft`, `datasets`, a GPU or network access skip cleanly with
+the reason printed by `unittest -v`; the skip count therefore depends on the
+environment (see the run report).
 
 ## 12. Known limitations and compatibility risks
 

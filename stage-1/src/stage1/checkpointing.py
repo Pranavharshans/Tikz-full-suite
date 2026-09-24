@@ -32,14 +32,19 @@ FINAL_META_NAME = "stage1-final.json"
 CHECKPOINT_DIR_RE = re.compile(r"checkpoint-(\d+)")
 
 TRAINING_GATES = ("overfit-100", "smoke-1000", "full")
+TRAINING_METHODS = ("full", "lora")
 
 REQUIRED_CHECKPOINT_FILES = ("config.json", "trainer_state.json", "optimizer.pt",
                              "scheduler.pt")
 WEIGHT_FILES = ("model.safetensors", "pytorch_model.bin",
                 "model.safetensors.index.json", "pytorch_model.bin.index.json")
+ADAPTER_CONFIG_FILE = "adapter_config.json"
+ADAPTER_WEIGHT_FILES = ("adapter_model.safetensors", "adapter_model.bin")
 TOKENIZER_FILES = ("tokenizer_config.json", "tokenizer.json")
 
 META_FILES = (CHECKPOINT_META_NAME, FINAL_META_NAME)
+
+BASE_PROVENANCE_FIELDS = ("base_model_id", "base_model_revision")
 
 
 # ---------------------------------------------------------------------------
@@ -68,11 +73,21 @@ def write_artifact_meta(directory, *, kind: str, identity_sha256: str,
                         model_id: str, model_revision: str, adapter: str,
                         gate: str | None, global_step: int,
                         supervised_tokens_seen: int, epochs_completed: float,
+                        training_method: str = "full",
+                        base_model_id: str | None = None,
+                        base_model_revision: str | None = None,
+                        lora: dict | None = None,
                         run_id: str | None = None) -> Path:
     if kind not in ("checkpoint", "final"):
         raise CheckpointError(f"Unknown artifact kind {kind!r}")
     if gate is not None and gate not in TRAINING_GATES:
         raise CheckpointError(f"Unknown gate {gate!r}")
+    if training_method not in TRAINING_METHODS:
+        raise CheckpointError(f"Unknown training method {training_method!r}")
+    if training_method == "lora" and not (base_model_id and base_model_revision):
+        raise CheckpointError(
+            "LoRA artifacts must record the base model id and revision; an "
+            "adapter is not a standalone model")
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
     meta = {
@@ -85,6 +100,10 @@ def write_artifact_meta(directory, *, kind: str, identity_sha256: str,
         "model_id": model_id,
         "model_revision": model_revision,
         "adapter": adapter,
+        "training_method": training_method,
+        "base_model_id": base_model_id,
+        "base_model_revision": base_model_revision,
+        "lora": lora,
         "global_step": int(global_step),
         "supervised_tokens_seen": int(supervised_tokens_seen),
         "epochs_completed": float(epochs_completed),
@@ -130,6 +149,7 @@ def verify_artifact_meta(meta: dict, *, path, identity_sha256: str | None = None
                          model_id: str | None = None,
                          model_revision: str | None = None,
                          adapter: str | None = None, gate: str | None = None,
+                         method: str | None = None,
                          kinds=("checkpoint", "final")) -> dict:
     """Validate provenance fields; raise ``CheckpointError`` on any mismatch."""
     if meta.get("kind") not in kinds:
@@ -140,6 +160,22 @@ def verify_artifact_meta(meta: dict, *, path, identity_sha256: str | None = None
         raise CheckpointError(f"{path} has an invalid global_step")
     if not isinstance(meta.get("supervised_tokens_seen"), int):
         raise CheckpointError(f"{path} has an invalid supervised_tokens_seen")
+    artifact_method = meta.get("training_method")
+    if artifact_method not in TRAINING_METHODS:
+        raise CheckpointError(
+            f"{path} has training_method={artifact_method!r}; expected one of "
+            f"{list(TRAINING_METHODS)}")
+    if method is not None and artifact_method != method:
+        raise CheckpointError(
+            f"{path} belongs to a {artifact_method!r} run, but this run uses "
+            f"{method!r}; full and LoRA checkpoints never share or resume each "
+            "other.")
+    if artifact_method == "lora":
+        missing = [field for field in BASE_PROVENANCE_FIELDS if not meta.get(field)]
+        if missing:
+            raise CheckpointError(
+                f"{path} is a LoRA adapter without base-model provenance "
+                f"({missing}); refusing to use an adapter as a standalone model.")
     expected = {
         "identity_sha256": identity_sha256,
         "model_id": model_id,
@@ -166,16 +202,26 @@ def verify_artifact_meta(meta: dict, *, path, identity_sha256: str | None = None
 # ---------------------------------------------------------------------------
 
 
-def incomplete_reason(checkpoint_dir) -> str | None:
+def incomplete_reason(checkpoint_dir, *, method: str = "full") -> str | None:
+    """Missing-file reason for a resumable checkpoint of the given method."""
+    if method not in TRAINING_METHODS:
+        return f"unknown training method {method!r}"
     checkpoint_dir = Path(checkpoint_dir)
     if not checkpoint_dir.is_dir():
         return f"{checkpoint_dir} is not a directory"
-    missing = [name for name in REQUIRED_CHECKPOINT_FILES
-               if not (checkpoint_dir / name).is_file()]
+    if method == "lora":
+        required = (ADAPTER_CONFIG_FILE,) + REQUIRED_CHECKPOINT_FILES[1:]
+        weight_files = ADAPTER_WEIGHT_FILES
+        weight_hint = "no adapter weight file (adapter_model.safetensors)"
+    else:
+        required = REQUIRED_CHECKPOINT_FILES
+        weight_files = WEIGHT_FILES
+        weight_hint = "no model weight file (model.safetensors / pytorch_model.bin)"
+    missing = [name for name in required if not (checkpoint_dir / name).is_file()]
     if missing:
         return f"missing files: {', '.join(missing)}"
-    if not any((checkpoint_dir / name).is_file() for name in WEIGHT_FILES):
-        return "no model weight file (model.safetensors / pytorch_model.bin)"
+    if not any((checkpoint_dir / name).is_file() for name in weight_files):
+        return weight_hint
     return None
 
 
@@ -183,39 +229,66 @@ def verify_checkpoint(checkpoint_dir, identity_sha256: str, *,
                       gate: str | None = None, model_id: str | None = None,
                       model_revision: str | None = None,
                       adapter: str | None = None,
+                      method: str | None = None,
                       require_meta: bool = True) -> dict:
-    """Verify a resumable checkpoint: completeness, metadata, provenance."""
+    """Verify a resumable checkpoint: metadata/provenance first, then files.
+
+    Provenance errors (foreign identity, model, gate or training method) are
+    reported before layout errors, so a full artifact presented to a LoRA run
+    fails with the cross-method message rather than a missing-adapter message.
+    Completeness is then checked against the artifact's own method.
+    """
     checkpoint_dir = Path(checkpoint_dir)
-    reason = incomplete_reason(checkpoint_dir)
+    meta = read_artifact_meta(checkpoint_dir, required=require_meta)
+    if meta is not None:
+        meta = verify_artifact_meta(
+            meta, path=checkpoint_dir, identity_sha256=identity_sha256,
+            model_id=model_id, model_revision=model_revision, adapter=adapter,
+            gate=gate, method=method, kinds=("checkpoint",))
+        artifact_method = meta["training_method"]
+    else:
+        artifact_method = method or "full"
+    reason = incomplete_reason(checkpoint_dir, method=artifact_method)
     if reason:
         raise CheckpointError(
             f"Checkpoint {checkpoint_dir} is incomplete ({reason}); refusing to "
             "resume. Remove or repair it explicitly.")
-    meta = read_artifact_meta(checkpoint_dir, required=require_meta)
     if meta is None:
         return {}
-    return verify_artifact_meta(
-        meta, path=checkpoint_dir, identity_sha256=identity_sha256,
-        model_id=model_id, model_revision=model_revision, adapter=adapter,
-        gate=gate, kinds=("checkpoint",))
+    return meta
 
 
 def verify_final_artifact(directory, *, identity_sha256: str,
                           model_id: str, model_revision: str, adapter: str,
-                          gate: str | None = None) -> dict:
-    """Verify a final model artifact: metadata, weights and tokenizer files."""
+                          gate: str | None = None,
+                          method: str | None = None) -> dict:
+    """Verify a final artifact: metadata, weights and tokenizer files.
+
+    Full artifacts are complete model directories; LoRA artifacts are native
+    PEFT adapters that require the pinned base model, so they must carry base
+    provenance and adapter files instead of full model weights.
+    """
     directory = Path(directory)
     if not directory.is_dir():
         raise CheckpointError(f"Final artifact directory does not exist: {directory}")
     meta = read_artifact_meta(directory, required=True)
     meta = verify_artifact_meta(
         meta, path=directory, identity_sha256=identity_sha256, model_id=model_id,
-        model_revision=model_revision, adapter=adapter, gate=gate,
+        model_revision=model_revision, adapter=adapter, gate=gate, method=method,
         kinds=("final",))
-    if not (directory / "config.json").is_file():
-        raise CheckpointError(f"Final artifact {directory} has no config.json")
-    if not any((directory / name).is_file() for name in WEIGHT_FILES):
-        raise CheckpointError(f"Final artifact {directory} has no model weights")
+    if meta.get("training_method") == "lora":
+        if not (directory / ADAPTER_CONFIG_FILE).is_file():
+            raise CheckpointError(
+                f"LoRA final artifact {directory} has no {ADAPTER_CONFIG_FILE}; "
+                "an adapter directory is not a standalone model")
+        if not any((directory / name).is_file() for name in ADAPTER_WEIGHT_FILES):
+            raise CheckpointError(
+                f"LoRA final artifact {directory} has no adapter weights")
+    else:
+        if not (directory / "config.json").is_file():
+            raise CheckpointError(f"Final artifact {directory} has no config.json")
+        if not any((directory / name).is_file() for name in WEIGHT_FILES):
+            raise CheckpointError(f"Final artifact {directory} has no model weights")
     if not any((directory / name).is_file() for name in TOKENIZER_FILES):
         raise CheckpointError(
             f"Final artifact {directory} has no tokenizer files; evaluation "
@@ -225,17 +298,76 @@ def verify_final_artifact(directory, *, identity_sha256: str,
 
 def verify_evaluation_artifact(directory, *, identity_sha256: str, model_id: str,
                                model_revision: str, adapter: str,
-                               gate: str | None = None) -> dict:
+                               gate: str | None = None,
+                               method: str | None = None) -> dict:
     """Verify either a resumable checkpoint or a final artifact for evaluation."""
     directory = Path(directory)
     meta = read_artifact_meta(directory, required=True)
     if meta.get("kind") == "checkpoint":
         return verify_checkpoint(
             directory, identity_sha256, gate=gate, model_id=model_id,
-            model_revision=model_revision, adapter=adapter)
+            model_revision=model_revision, adapter=adapter, method=method)
     return verify_final_artifact(
         directory, identity_sha256=identity_sha256, model_id=model_id,
-        model_revision=model_revision, adapter=adapter, gate=gate)
+        model_revision=model_revision, adapter=adapter, gate=gate, method=method)
+
+
+def load_artifact_weights(model, directory, *, method: str = "full",
+                          loader=None) -> dict:
+    """Load an artifact's weights into the model, exactly and method-aware.
+
+    Full artifacts load the complete model state dict. LoRA artifacts load only
+    adapter tensors: the saved keys must be adapter keys, must cover every
+    adapter parameter of the live model, and must not touch base weights.
+    ``loader`` is an injection seam for tests.
+    """
+    if method not in TRAINING_METHODS:
+        raise CheckpointError(f"Unknown training method {method!r}")
+    if loader is None:
+        try:
+            from safetensors.torch import load_file as loader
+        except ImportError as exc:  # pragma: no cover - environment dependent
+            raise CheckpointError(
+                "safetensors is required to load artifact weights") from exc
+    weight_names = ADAPTER_WEIGHT_FILES if method == "lora" else WEIGHT_FILES
+    saved = {}
+    for name in weight_names:
+        path = Path(directory) / name
+        if path.is_file():
+            saved.update(loader(str(path)))
+    if not saved:
+        raise CheckpointError(
+            f"No {'adapter ' if method == 'lora' else ''}weight file found in "
+            f"{directory}")
+    if method == "lora":
+        non_adapter = sorted(key for key in saved if "lora_" not in key)
+        if non_adapter:
+            raise CheckpointError(
+                f"Adapter file in {directory} contains non-adapter tensors "
+                f"({non_adapter[:3]}); refusing to treat it as a LoRA artifact")
+        live = model.state_dict()
+        expected = {key for key in live if "lora_" in key}
+        if not expected:
+            raise CheckpointError(
+                "The live model has no adapter parameters; refusing to load a "
+                "LoRA artifact into a non-LoRA model")
+        missing = sorted(expected - set(saved))
+        if missing:
+            raise CheckpointError(
+                f"Adapter in {directory} does not cover the model's adapter "
+                f"parameters; missing {len(missing)} key(s), first "
+                f"{missing[0]}")
+    missing, unexpected = model.load_state_dict(saved, strict=False)
+    if method == "full":
+        if missing or unexpected:
+            raise CheckpointError(
+                f"Artifact {directory} does not match the model: "
+                f"missing={list(missing)[:3]}, unexpected={list(unexpected)[:3]}")
+    return {
+        "path": str(directory),
+        "method": method,
+        "tensors": len(saved),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -618,12 +750,14 @@ def list_checkpoints(run_dir, gate: str) -> list:
 def find_latest_checkpoint(run_dir, gate: str, identity_sha256: str, *,
                            model_id: str | None = None,
                            model_revision: str | None = None,
-                           adapter: str | None = None) -> tuple:
+                           adapter: str | None = None,
+                           method: str | None = None) -> tuple:
     """Newest valid checkpoint in this gate's namespace, or ``(None, {})``.
 
-    The newest checkpoint is authoritative: if it is incomplete, foreign or
-    from another gate, the call raises instead of silently resuming an older
-    one. Checkpoints of other gates are never visible here.
+    The newest checkpoint is authoritative: if it is incomplete, foreign, from
+    another gate or from another training method, the call raises instead of
+    silently resuming an older one. Checkpoints of other gates and of the other
+    training method are never visible here.
     """
     checkpoints = list_checkpoints(run_dir, gate)
     if not checkpoints:
@@ -631,5 +765,5 @@ def find_latest_checkpoint(run_dir, gate: str, identity_sha256: str, *,
     latest = checkpoints[-1]
     meta = verify_checkpoint(
         latest, identity_sha256, gate=gate, model_id=model_id,
-        model_revision=model_revision, adapter=adapter)
+        model_revision=model_revision, adapter=adapter, method=method)
     return latest, meta

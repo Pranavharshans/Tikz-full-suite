@@ -26,6 +26,8 @@ from .util import canonical_digest, is_pinned_revision, require_absolute
 
 SUPPORTED_ADAPTERS = ("qwen3.5", "minicpm5")
 SUPPORTED_LOADERS = ("unsloth-language-model", "unsloth-vision-model")
+TRAINING_METHODS = ("full", "lora")
+LORA_BIASES = ("none", "all", "lora_only")
 TRAINING_GATES = ("overfit-100", "smoke-1000", "full")
 GATE_OVERRIDE_KEYS = (
     "max_rows", "epochs", "save_steps", "eval_steps", "logging_steps",
@@ -38,7 +40,7 @@ MODEL_ID_RE = re.compile(r"[^/\s]+/[^/\s]+")
 
 TOP_LEVEL_KEYS = (
     "inherit", "tool_version", "stage", "seed", "model", "tokenizer", "data",
-    "training", "gates", "evaluation", "hardware", "environment",
+    "training", "lora", "gates", "evaluation", "hardware", "environment",
 )
 
 
@@ -188,6 +190,7 @@ class DataConfig:
 
 @dataclass
 class TrainingConfig:
+    method: str = "full"
     epochs: int = 1
     learning_rate: float = 1e-5
     lr_scheduler_type: str = "cosine"
@@ -209,6 +212,33 @@ class TrainingConfig:
     validate_batches: bool = True
     eval_max_rows: int = 500
     report_to: list = field(default_factory=list)
+
+    @property
+    def effective_batch_size(self) -> int:
+        return self.per_device_train_batch_size * self.gradient_accumulation_steps
+
+
+@dataclass
+class LoraConfig:
+    """Native PEFT LoRA settings (BF16 base weights, no quantization)."""
+
+    rank: int = 64
+    alpha: int = 64
+    dropout: float = 0.0
+    bias: str = "none"
+    target_modules: tuple = (
+        "q_proj", "k_proj", "v_proj", "o_proj",
+        "gate_proj", "up_proj", "down_proj",
+    )
+
+    def to_jsonable(self) -> dict:
+        return {
+            "rank": self.rank,
+            "alpha": self.alpha,
+            "dropout": self.dropout,
+            "bias": self.bias,
+            "target_modules": list(self.target_modules),
+        }
 
 
 @dataclass
@@ -298,6 +328,7 @@ class Stage1Config:
     evaluation: EvaluationConfig
     hardware: HardwareConfig
     environment: EnvironmentConfig
+    lora: LoraConfig | None = None
     config_path: Path | None = None
     source_sha256: str | None = None
 
@@ -310,6 +341,7 @@ class Stage1Config:
             "tokenizer": self.tokenizer.identity_payload(),
             "data": self.data.identity_payload(),
             "training": dataclasses.asdict(self.training),
+            "lora": self.lora.to_jsonable() if self.lora is not None else None,
             "evaluation": _evaluation_payload(self.evaluation),
             "environment": self.environment.identity_payload(),
         }
@@ -366,11 +398,30 @@ def parse_config(raw: dict, *, source: str = "<dict>") -> Stage1Config:
         _expect_mapping(raw.get("hardware", {}), f"{source}.hardware"), source)
     environment = _parse_environment(
         _expect_mapping(raw.get("environment", {}), f"{source}.environment"), source)
+    lora = _parse_lora(raw.get("lora"), source)
+
+    if training.method == "lora" and lora is None:
+        raise ConfigError(
+            f"{source}.lora: a LoRA configuration is required when "
+            "training.method is 'lora'")
+    if training.method == "full" and lora is not None:
+        raise ConfigError(
+            f"{source}.lora: a LoRA configuration is only valid with "
+            "training.method: lora; remove it or set training.method: lora")
+    expected_batch = 16
+    if training.effective_batch_size != expected_batch:
+        raise ConfigError(
+            f"{source}.training: effective batch size is "
+            f"per_device_train_batch_size * gradient_accumulation_steps = "
+            f"{training.effective_batch_size}, but this task requires "
+            f"{expected_batch} on one A40. Adjust the two values accordingly "
+            "(for example 2 x 8).")
 
     return Stage1Config(
         tool_version=tool_version, stage=stage, seed=seed, model=model,
         tokenizer=tokenizer, data=data, training=training, gates=gates,
-        evaluation=evaluation, hardware=hardware, environment=environment)
+        evaluation=evaluation, hardware=hardware, environment=environment,
+        lora=lora)
 
 
 def _parse_model(raw: dict, source: str) -> ModelConfig:
@@ -460,7 +511,8 @@ def _parse_data(raw: dict, source: str) -> DataConfig:
 
 def _parse_training(raw: dict, source: str) -> TrainingConfig:
     path = f"{source}.training"
-    allowed = ("epochs", "learning_rate", "lr_scheduler_type", "warmup_ratio",
+    allowed = ("method", "epochs", "learning_rate", "lr_scheduler_type",
+               "warmup_ratio",
                "max_grad_norm", "per_device_train_batch_size",
                "per_device_eval_batch_size", "gradient_accumulation_steps",
                "optim", "bf16", "gradient_checkpointing",
@@ -469,6 +521,11 @@ def _parse_training(raw: dict, source: str) -> TrainingConfig:
                "dataloader_num_workers", "max_steps", "validate_batches",
                "eval_max_rows", "report_to")
     _check_keys(raw, allowed, path)
+    method = _expect_str(raw.get("method", "full"), f"{path}.method")
+    if method not in TRAINING_METHODS:
+        raise ConfigError(
+            f"{path}.method: {method!r} is not supported; choose one of "
+            f"{list(TRAINING_METHODS)}")
     epochs = _expect_int(raw.get("epochs", 1), f"{path}.epochs", minimum=1)
     learning_rate = _expect_float(raw.get("learning_rate", 1e-5),
                                   f"{path}.learning_rate",
@@ -533,7 +590,8 @@ def _parse_training(raw: dict, source: str) -> TrainingConfig:
     if not isinstance(report_to, list) or any(not isinstance(item, str) for item in report_to):
         raise ConfigError(f"{path}.report_to: expected a list of strings")
     return TrainingConfig(
-        epochs=epochs, learning_rate=learning_rate, lr_scheduler_type=scheduler,
+        method=method, epochs=epochs, learning_rate=learning_rate,
+        lr_scheduler_type=scheduler,
         warmup_ratio=warmup, max_grad_norm=max_grad_norm,
         per_device_train_batch_size=train_batch,
         per_device_eval_batch_size=eval_batch,
@@ -545,6 +603,42 @@ def _parse_training(raw: dict, source: str) -> TrainingConfig:
         dataloader_num_workers=workers, max_steps=max_steps,
         validate_batches=validate_batches, eval_max_rows=eval_max_rows,
         report_to=list(report_to))
+
+
+def _parse_lora(raw, source: str):
+    """Parse the ``lora`` section; ``None`` means no LoRA configuration."""
+    path = f"{source}.lora"
+    if raw is None:
+        return None
+    raw = _expect_mapping(raw, path)
+    _check_keys(raw, ("rank", "alpha", "dropout", "bias", "target_modules"), path)
+    rank = _expect_int(raw.get("rank", 64), f"{path}.rank", minimum=1)
+    alpha = _expect_int(raw.get("alpha", 64), f"{path}.alpha", minimum=1)
+    dropout = _expect_float(raw.get("dropout", 0.0), f"{path}.dropout",
+                            minimum=0.0, maximum=0.5)
+    bias = _expect_str(raw.get("bias", "none"), f"{path}.bias")
+    if bias not in LORA_BIASES:
+        raise ConfigError(
+            f"{path}.bias: {bias!r} is not supported; choose one of "
+            f"{list(LORA_BIASES)}")
+    targets = raw.get("target_modules")
+    if targets is None:
+        targets = list(LoraConfig().target_modules)
+    if not isinstance(targets, (list, tuple)) or not targets:
+        raise ConfigError(
+            f"{path}.target_modules: expected a non-empty list of module names")
+    cleaned = []
+    for index, value in enumerate(targets):
+        if not isinstance(value, str) or not value.strip():
+            raise ConfigError(
+                f"{path}.target_modules[{index}]: expected a non-empty string")
+        cleaned.append(value.strip())
+    duplicates = sorted({name for name in cleaned if cleaned.count(name) > 1})
+    if duplicates:
+        raise ConfigError(
+            f"{path}.target_modules contains duplicate names: {duplicates}")
+    return LoraConfig(rank=rank, alpha=alpha, dropout=dropout, bias=bias,
+                      target_modules=tuple(cleaned))
 
 
 def _parse_gates(raw: dict, source: str) -> dict:

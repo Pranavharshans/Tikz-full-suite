@@ -1,0 +1,45 @@
+# BF16 LoRA configuration: Qwen/Qwen3.5-4B.
+#
+# This is LoRA, not QLoRA: the base checkpoint is loaded unquantized in BF16
+# (load_in_4bit/load_in_8bit stay false) and adapters are applied through
+# Unsloth's native PEFT integration. The full-parameter mode in
+# qwen3.5-4b-full.yaml is unchanged and the two modes have different run
+# identities, so they can never share or resume each other's checkpoints.
+inherit: common.yaml
+
+model:
+  id: Qwen/Qwen3.5-4B
+  # Resolved from the Hub on 2026-09-23; pin the exact commit, never a branch.
+  revision: 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a
+  adapter: qwen3.5
+  loader: unsloth-vision-model
+
+training:
+  method: lora
+  # LoRA uses a larger learning rate than full finetuning.
+  learning_rate: 1.0e-4
+
+lora:
+  rank: 64
+  alpha: 64
+  dropout: 0.0
+  bias: none
+  # Target names are verified against the loaded checkpoint before training.
+  # Qwen3.5-4B is a hybrid linear/full-attention model: these seven names exist
+  # on its full-attention blocks and in every MLP, so the preflight will attach
+  # adapters there and report the matched-module count per target. If a target
+  # does not exist in the loaded model the run fails with the available module
+  # names; if the linear-attention projections should also be adapted, add
+  # their exact names here after checking the preflight report.
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+environment:
+  lock_file: locks/qwen3.5-4b.lock
+  python_version: "3.12"

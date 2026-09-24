@@ -17,6 +17,7 @@ COMPARISON_SCHEMA_VERSION = "stage1-comparison-v1"
 COLUMNS = (
     ("label", "run"),
     ("model_id", "model"),
+    ("training_method", "method"),
     ("source_kind", "source"),
     ("gate", "gate"),
     ("supervised_tokens", "supervised tokens"),
@@ -59,9 +60,15 @@ def summarize_metrics(label: str, metrics: dict) -> dict:
     if examples is None:
         examples = metrics.get("examples")
     source_kind = artifact.get("kind") or metrics.get("source_kind")
+    training_method = (metrics.get("training_method")
+                       or (metrics.get("model_summary") or {}).get("training_method"))
+    if training_method is None:
+        # Evaluations record the method inside the verified artifact block.
+        training_method = artifact.get("training_method")
     return {
         "label": label,
         "model_id": metrics.get("model_id") or training.get("model_id"),
+        "training_method": training_method or ("base" if source_kind == "base" else None),
         "source_kind": source_kind,
         "gate": metrics.get("gate") or artifact.get("gate"),
         "supervised_tokens": supervised_tokens,
@@ -78,15 +85,65 @@ def summarize_metrics(label: str, metrics: dict) -> dict:
         + (memorization.get("near_matches") or 0) if memorization else None,
         "data_identity_sha256": metrics.get("data_identity_sha256"),
         "split": metrics.get("split"),
+        "max_seq_len": metrics.get("max_seq_len")
+        or (metrics.get("model_summary") or {}).get("max_seq_len"),
+        "evaluation_set_sha256": metrics.get("evaluation_set_sha256"),
     }
 
 
-def experiment_readiness(entries) -> dict:
+def comparison_problems(entries) -> list:
+    """Comparability rules for a comparison set (requirement: no mixing).
+
+    Candidates must agree on dataset identity, sequence limit and evaluation
+    set, and a comparison group must not mix full and LoRA candidates. Base
+    evaluations are compatible with either single training method.
+    """
+    problems = []
+    records = []
+    for label, metrics in entries:
+        method = (metrics.get("training_method")
+                  or (metrics.get("model_summary") or {}).get("training_method")
+                  or (metrics.get("artifact") or {}).get("training_method"))
+        records.append({
+            "label": label,
+            "method": method or ("base" if (metrics.get("artifact") or {}).get("kind") == "base"
+                                 or metrics.get("source_kind") == "base" else None),
+            "data_identity_sha256": metrics.get("data_identity_sha256"),
+            "max_seq_len": metrics.get("max_seq_len")
+            or (metrics.get("model_summary") or {}).get("max_seq_len"),
+            "evaluation_set_sha256": metrics.get("evaluation_set_sha256"),
+        })
+    for field_name, description in (
+            ("data_identity_sha256", "dataset identity"),
+            ("max_seq_len", "sequence limit"),
+            ("evaluation_set_sha256", "evaluation set")):
+        values = {record[field_name] for record in records if record[field_name]}
+        if len(values) > 1:
+            problems.append(
+                f"candidates disagree on {description}: "
+                + ", ".join(f"{record['label']}={record[field_name]}"
+                            for record in records if record[field_name]))
+    methods = {record["method"] for record in records if record["method"]}
+    if "full" in methods and "lora" in methods:
+        problems.append(
+            "the comparison mixes training methods (full and lora); compare "
+            "full with full or lora with lora, or pass --allow-non-comparable")
+    unknown = [record["label"] for record in records if not record["method"]]
+    if unknown:
+        problems.append(
+            f"candidates without a recorded training method: {unknown}")
+    return problems
+
+
+def experiment_readiness(entries, *, allow_non_comparable: bool = False) -> dict:
     """Require comparable base and trained evaluation artifacts.
 
     The experiment is only complete when at least one base-model evaluation and
-    one trained-artifact evaluation exist for the same data identity and split.
-    Compile improvement is deliberately not required.
+    one trained-artifact evaluation exist for the same data identity and split,
+    and the comparison set is comparable (same dataset identity, sequence limit
+    and evaluation set, without mixing full and LoRA candidates) unless
+    ``allow_non_comparable`` is set. Compile improvement is deliberately not
+    required.
     """
     base, trained = [], []
     for label, metrics in entries:
@@ -114,17 +171,22 @@ def experiment_readiness(entries) -> dict:
     if base and trained and not comparable:
         problems.append(
             "base and trained artifacts do not share a data identity and split")
-    return {"ready": not problems, "problems": problems,
+    comparability = comparison_problems(entries)
+    return {"ready": not problems and (allow_non_comparable or not comparability),
+            "problems": problems,
+            "comparability_problems": comparability,
+            "comparability_allowed": bool(allow_non_comparable),
             "comparable_pairs": comparable}
 
 
-def compare_metrics(entries) -> dict:
+def compare_metrics(entries, *, allow_non_comparable: bool = False) -> dict:
     rows = [summarize_metrics(label, metrics) for label, metrics in entries]
     return {
         "schema_version": COMPARISON_SCHEMA_VERSION,
         "created_at": utc_now_iso(),
         "rows": rows,
-        "experiment_readiness": experiment_readiness(entries),
+        "experiment_readiness": experiment_readiness(
+            entries, allow_non_comparable=allow_non_comparable),
     }
 
 
@@ -158,8 +220,22 @@ def render_comparison(comparison: dict) -> str:
             else "NOT READY"),
     ]
     readiness = comparison.get("experiment_readiness") or {}
+    lines += [
+        "",
+        "Experiment readiness: " + (
+            "READY (comparable base and trained artifacts present)"
+            if readiness.get("ready")
+            else "NOT READY"),
+        "Comparability: " + (
+            "OK" if not readiness.get("comparability_problems")
+            else "NOT COMPARABLE"),
+    ]
     for problem in readiness.get("problems", []):
         lines.append(f"- {problem}")
+    for problem in readiness.get("comparability_problems", []):
+        lines.append(f"- {problem}")
+    if readiness.get("comparability_allowed"):
+        lines.append("- non-comparable report explicitly allowed")
     for pair in readiness.get("comparable_pairs", []):
         lines.append(f"- comparable pair: {pair[0]} <-> {pair[1]}")
     lines += [

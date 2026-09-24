@@ -23,7 +23,8 @@ from pathlib import Path
 
 from . import checkpointing, data, identity
 from .errors import DataError, GateFailed
-from .util import dependency_versions, detect_repo_commit, utc_now_iso, write_json_atomic
+from .util import (canonical_digest, dependency_versions, detect_repo_commit,
+                   utc_now_iso, write_json_atomic)
 
 
 # ---------------------------------------------------------------------------
@@ -282,29 +283,15 @@ def validate_gate_intervals(gate, bounds: dict, *, has_eval: bool) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def load_artifact_weights(model, directory, *, loader=None) -> dict:
-    """Load an artifact's safetensors weights into the model, exactly.
+def load_artifact_weights(model, directory, *, method: str = "full",
+                          loader=None) -> dict:
+    """Load an artifact's weights into the model, exactly and method-aware.
 
-    ``loader`` is an injection seam for tests; production uses
-    ``safetensors.torch.load_file``.
+    Thin wrapper over :func:`checkpointing.load_artifact_weights` used by the
+    gate-time verification flow.
     """
-    if loader is None:
-        try:
-            from safetensors.torch import load_file as loader
-        except ImportError as exc:  # pragma: no cover - environment dependent
-            raise DataError(
-                "safetensors is required to load artifact weights") from exc
-    saved = {}
-    for path in sorted(Path(directory).glob("*.safetensors")):
-        saved.update(loader(str(path)))
-    if not saved:
-        raise DataError(f"No safetensors weights found in {directory}")
-    missing, unexpected = model.load_state_dict(saved, strict=False)
-    if missing or unexpected:
-        raise DataError(
-            f"Artifact {directory} does not match the model: "
-            f"missing={list(missing)[:3]}, unexpected={list(unexpected)[:3]}")
-    return {"path": str(directory), "tensors": len(saved)}
+    return checkpointing.load_artifact_weights(
+        model, directory, method=method, loader=loader)
 
 
 def _eval_forward_loss(model, batch_plan, torch, device="cuda"):
@@ -326,18 +313,21 @@ def _eval_forward_loss(model, batch_plan, torch, device="cuda"):
     return loss, tuple(outputs.logits.shape)
 
 
-def restore_final_weights(model, final_directory, *, batch_plan, torch,
-                          device="cuda", loader=None) -> dict:
+def restore_final_weights(model, final_directory, *, method: str,
+                          batch_plan, torch, device="cuda", loader=None) -> dict:
     """Reload the final artifact's weights after checkpoint verification.
 
     Checkpoint verification loads an older checkpoint into the live model;
-    this restores the final weights and proves the restore with a forward pass,
-    so generation and metrics describe the final model.
+    this restores the final weights (full model or adapter, matching the
+    training method) and proves the restore with a forward pass, so generation
+    and metrics describe the final model.
     """
-    restore = load_artifact_weights(model, final_directory, loader=loader)
+    restore = checkpointing.load_artifact_weights(
+        model, final_directory, method=method, loader=loader)
     loss, shape = _eval_forward_loss(model, batch_plan, torch, device)
     return {
         "restored_after_checkpoint_verification": True,
+        "restore_method": method,
         "restore_tensors": restore["tensors"],
         "restore_loss": loss,
         "restore_logits_shape": list(shape),
@@ -459,7 +449,11 @@ def build_tokenized_dataset(config, tokenizer, template, export_info, manifest,
 def make_callbacks(transformers, *, monitor: TrainingMonitor,
                    checkpointing_module, identity_sha256, gate_name: str,
                    model_id: str, model_revision: str, adapter: str,
-                   run_id: str | None, run_dir=None):
+                   run_id: str | None, run_dir=None,
+                   training_method: str = "full",
+                   base_model_id: str | None = None,
+                   base_model_revision: str | None = None,
+                   lora: dict | None = None):
     """Trainer callbacks: step commits, JSONL logging, checkpoint metadata."""
     log_path = None
     if run_dir is not None:
@@ -504,7 +498,10 @@ def make_callbacks(transformers, *, monitor: TrainingMonitor,
                     supervised_tokens_seen=monitor.committed_supervised_tokens,
                     epochs_completed=float(state.epoch or 0.0),
                     gate=gate_name, run_id=run_id, model_id=model_id,
-                    model_revision=model_revision, adapter=adapter)
+                    model_revision=model_revision, adapter=adapter,
+                    training_method=training_method,
+                    base_model_id=base_model_id,
+                    base_model_revision=base_model_revision, lora=lora)
 
     return [MonitorCallback(), CheckpointMetaCallback()]
 
@@ -587,11 +584,13 @@ def warmup_steps_for(max_steps: int, warmup_ratio: float) -> int:
 
 def verify_gate_checkpoint(checkpoint_dir, *, identity_sha256, gate, config,
                            model, torch, batch_plan, num_training_steps,
-                           num_warmup_steps, device="cuda") -> dict:
+                           num_warmup_steps, method: str = "full",
+                           device="cuda") -> dict:
     """Verify the latest same-gate checkpoint and that it can actually resume.
 
-    Performs, on the real artifact: metadata/completeness verification, a weight
-    reload into the live model with an eval-mode forward, and a restore of the
+    Performs, on the real artifact: metadata/completeness verification (full
+    model or PEFT adapter, matching the training method), a weight reload into
+    the live model with an eval-mode forward, and a restore of the
     optimizer/scheduler/trainer state into fresh objects using the production
     ``get_scheduler("cosine", ...)`` reconstruction.
 
@@ -602,8 +601,8 @@ def verify_gate_checkpoint(checkpoint_dir, *, identity_sha256, gate, config,
     meta = checkpointing.verify_checkpoint(
         checkpoint_dir, identity_sha256, gate=gate,
         model_id=config.model.id, model_revision=config.model.revision,
-        adapter=config.model.adapter)
-    weights = load_artifact_weights(model, checkpoint_dir)
+        adapter=config.model.adapter, method=method)
+    weights = load_artifact_weights(model, checkpoint_dir, method=method)
     reload_loss, logits_shape = _eval_forward_loss(model, batch_plan, torch, device)
     resume = checkpointing.verify_resume_state(
         checkpoint_dir, torch=torch, model=model,
@@ -614,6 +613,7 @@ def verify_gate_checkpoint(checkpoint_dir, *, identity_sha256, gate, config,
     return {
         "path": str(checkpoint_dir),
         "gate": gate,
+        "training_method": method,
         "global_step": meta["global_step"],
         "verified": True,
         "reload_verified": True,
@@ -807,15 +807,17 @@ def run_training(config, paths, gate_name: str, *, local_files_only: bool = Fals
     write_json_atomic(paths.run_dir / "resolved-config.json",
                       config.to_jsonable())
 
-    # Only this gate's namespace is visible; metadata must agree with the gate.
+    # Only this gate's namespace is visible; metadata must agree with the gate
+    # and with the training method (full and LoRA never share checkpoints).
     resume_path, resume_meta = checkpointing.find_latest_checkpoint(
         paths.run_dir, gate_name, run_identity["sha256"],
         model_id=config.model.id, model_revision=config.model.revision,
-        adapter=config.model.adapter)
+        adapter=config.model.adapter, method=config.training.method)
     if resume_path is not None:
-        say(f"resuming from {resume_path.name} (gate {gate_name})")
+        say(f"resuming from {resume_path.name} (gate {gate_name}, "
+            f"method {config.training.method})")
 
-    say("loading the model for full-parameter BF16 training")
+    say(f"loading the model for BF16 training (method={config.training.method})")
     model, tokenizer, load_report = adapters.load_model_and_tokenizer(
         config, local_files_only=local_files_only, cache_dir=cache_dir,
         for_training=True)
@@ -873,7 +875,10 @@ def run_training(config, paths, gate_name: str, *, local_files_only: bool = Fals
         identity_sha256=run_identity["sha256"], gate_name=gate_name,
         model_id=config.model.id, model_revision=config.model.revision,
         adapter=config.model.adapter, run_id=run_identity["sha256"][:16],
-        run_dir=paths.run_dir)
+        run_dir=paths.run_dir, training_method=config.training.method,
+        base_model_id=config.model.id,
+        base_model_revision=config.model.revision,
+        lora=config.lora.to_jsonable() if config.lora is not None else None)
     trainer_class = make_trainer_class(transformers, monitor)
     trainer_kwargs = {
         "model": model, "args": arguments, "train_dataset": train_dataset,
@@ -917,15 +922,22 @@ def run_training(config, paths, gate_name: str, *, local_files_only: bool = Fals
         epochs_completed=float(trainer.state.epoch or 0.0),
         gate=gate_name, run_id=run_identity["sha256"][:16],
         model_id=config.model.id, model_revision=config.model.revision,
-        adapter=config.model.adapter)
+        adapter=config.model.adapter,
+        training_method=config.training.method,
+        base_model_id=config.model.id,
+        base_model_revision=config.model.revision,
+        lora=config.lora.to_jsonable() if config.lora is not None else None)
     final_artifact = checkpointing.verify_final_artifact(
         final_directory, identity_sha256=run_identity["sha256"],
         model_id=config.model.id, model_revision=config.model.revision,
-        adapter=config.model.adapter, gate=gate_name)
+        adapter=config.model.adapter, gate=gate_name,
+        method=config.training.method)
     final_artifact = {
         "path": str(final_directory),
         "gate": final_artifact["gate"],
         "global_step": final_artifact["global_step"],
+        "training_method": config.training.method,
+        "kind": "lora_adapter" if config.training.method == "lora" else "model",
         "verified": True,
     }
 
@@ -955,13 +967,15 @@ def run_training(config, paths, gate_name: str, *, local_files_only: bool = Fals
             checkpoints[-1], identity_sha256=run_identity["sha256"],
             gate=gate_name, config=config, model=model, torch=torch,
             batch_plan=batch_plan, num_training_steps=trainer_max_steps,
-            num_warmup_steps=scheduler_warmup_steps)
+            num_warmup_steps=scheduler_warmup_steps,
+            method=config.training.method)
         # Checkpoint verification loads the checkpoint's weights into the live
         # model. Restore the final artifact weights and prove the restore with
         # a forward pass before anything else uses the model, so generation and
         # metrics describe the final model, not an older checkpoint.
         final_artifact.update(restore_final_weights(
-            model, final_directory, batch_plan=batch_plan, torch=torch))
+            model, final_directory, method=config.training.method,
+            batch_plan=batch_plan, torch=torch))
         say(f"restored final weights after checkpoint verification "
             f"(loss {final_artifact['restore_loss']:.6f})")
     else:
@@ -985,6 +999,28 @@ def run_training(config, paths, gate_name: str, *, local_files_only: bool = Fals
         "model_id": config.model.id,
         "model_revision": config.model.revision,
         "adapter": config.model.adapter,
+        "training_method": config.training.method,
+        "lora": config.lora.to_jsonable() if config.lora is not None else None,
+        "max_seq_len": config.data.max_seq_len,
+        "effective_batch_size": config.training.effective_batch_size,
+        "model_summary": {
+            "training_method": config.training.method,
+            "base_model_id": config.model.id,
+            "base_model_revision": config.model.revision,
+            "adapter": config.model.adapter,
+            "parameter_count": load_report.get("parameter_count"),
+            "trainable_parameter_count": load_report.get("trainable_parameter_count"),
+            "trainable_percentage": load_report.get("trainable_percentage"),
+            "quantization": load_report.get("quantization"),
+            "lora": load_report.get("lora"),
+            "target_modules": load_report.get("target_modules"),
+            "tokenizer_fingerprint_sha256": canonical_digest(
+                adapters.fingerprint_core(fingerprint)),
+            "data_identity_sha256": prepared["data_identity_sha256"],
+            "dataset_report_sha256": prepared["report_sha256"],
+            "max_seq_len": config.data.max_seq_len,
+            "effective_batch_size": config.training.effective_batch_size,
+        },
         "identity_sha256": run_identity["sha256"],
         "data_identity_sha256": prepared["data_identity_sha256"],
         "gate_settings": gate.to_jsonable(),

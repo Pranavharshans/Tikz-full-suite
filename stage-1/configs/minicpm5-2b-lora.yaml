@@ -1,0 +1,41 @@
+# BF16 LoRA configuration: openbmb/MiniCPM5-2B.
+#
+# This is LoRA, not QLoRA: the base checkpoint is loaded unquantized in BF16
+# (load_in_4bit/load_in_8bit stay false) and adapters are applied through
+# Unsloth's native PEFT integration. The full-parameter mode in
+# minicpm5-2b-full.yaml is unchanged and the two modes have different run
+# identities, so they can never share or resume each other's checkpoints.
+inherit: common.yaml
+
+model:
+  id: openbmb/MiniCPM5-2B
+  # Resolved from the Hub on 2026-09-23; pin the exact commit, never a branch.
+  revision: 12a3808a956f869c767195e9266b59c4d21d92e2
+  adapter: minicpm5
+  loader: unsloth-language-model
+
+training:
+  method: lora
+  # LoRA uses a larger learning rate than full finetuning.
+  learning_rate: 1.0e-4
+
+lora:
+  rank: 64
+  alpha: 64
+  dropout: 0.0
+  bias: none
+  # MiniCPM5-2B is a LlamaForCausalLM, so all seven projection names exist in
+  # every attention/MLP block. The preflight verifies each name against the
+  # loaded checkpoint and reports the matched-module count.
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+environment:
+  lock_file: locks/minicpm5-2b.lock
+  python_version: "3.12"

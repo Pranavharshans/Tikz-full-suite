@@ -78,6 +78,27 @@ class IdentityTests(unittest.TestCase):
         with self.assertRaises(Exception):
             build_identity(data_identity={"dataset_logical_sha256": "1" * 64})
 
+    def test_full_and_lora_identities_differ(self):
+        full = build_identity()
+        lora_config = support.make_config(
+            training={"method": "lora", "learning_rate": 1e-4}, lora={})
+        lora = build_identity(lora_config)
+        self.assertNotEqual(full["sha256"], lora["sha256"])
+        self.assertEqual(full["config"]["training"]["method"], "full")
+        self.assertIsNone(full["config"]["lora"])
+        self.assertEqual(lora["config"]["training"]["method"], "lora")
+        self.assertEqual(lora["config"]["lora"]["rank"], 64)
+
+    def test_run_record_refuses_cross_method_resume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run_dir = Path(directory)
+            identity.ensure_run_record(run_dir, build_identity())
+            lora_config = support.make_config(
+                training={"method": "lora", "learning_rate": 1e-4}, lora={})
+            with self.assertRaises(IdentityMismatch) as context:
+                identity.ensure_run_record(run_dir, build_identity(lora_config))
+            self.assertIn("training", str(context.exception))
+
     def test_dataset_report_hash_changes_identity(self):
         first = build_identity()
         second = build_identity(dataset_report_sha256="b" * 64)

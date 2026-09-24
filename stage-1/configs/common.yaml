@@ -47,6 +47,9 @@ data:
     test_fraction: 0.01
 
 training:
+  # Explicit training mode. "full" is the existing full-parameter BF16 SFT;
+  # "lora" is BF16 LoRA (never QLoRA: base weights stay unquantized).
+  method: full
   epochs: 1
   learning_rate: 1.0e-5     # conservative default
   lr_scheduler_type: cosine
@@ -55,6 +58,8 @@ training:
   per_device_train_batch_size: 2
   per_device_eval_batch_size: 2
   gradient_accumulation_steps: 8
+  # Effective batch size (train batch * accumulation) must stay 16: one A40,
+  # no multi-GPU. The config parser enforces this for both methods.
   optim: adamw_torch_fused  # fused AdamW where supported
   bf16: true                # full-parameter BF16 only; QLoRA is not supported
   gradient_checkpointing: true

@@ -53,7 +53,8 @@ class ImportSafetyTests(unittest.TestCase):
     def test_scripts_support_help_without_ml_libraries(self):
         scripts = STAGE1 / "scripts"
         for name in ("prepare_dataset.py", "preflight.py", "train.py",
-                     "evaluate.py", "compare_models.py", "make_slurm_script.py"):
+                     "evaluate.py", "compare_models.py", "merge_adapter.py",
+                     "make_slurm_script.py"):
             completed = subprocess.run(
                 [sys.executable, str(scripts / name), "--help"],
                 capture_output=True, text=True, timeout=120,

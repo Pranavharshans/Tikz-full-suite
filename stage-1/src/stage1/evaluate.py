@@ -110,6 +110,12 @@ def select_memorization_ids(manifest: dict, *, limit, seed: int,
                                  exclude=eligibility["quarantined"])
 
 
+def evaluation_set_hash(ids) -> str:
+    """Stable digest of the evaluated row ids, for comparison compatibility."""
+    from .util import canonical_digest
+    return canonical_digest(sorted(ids))
+
+
 def _summary(values) -> dict:
     if not values:
         return {"count": 0, "mean": None, "median": None, "p10": None, "max": None}

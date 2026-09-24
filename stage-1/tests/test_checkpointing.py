@@ -88,6 +88,119 @@ class GateNamespaceTests(unittest.TestCase):
             self.assertEqual(meta["gate"], gate)
 
 
+class MethodIsolationTests(unittest.TestCase):
+    """Full and LoRA artifacts must never share or resume each other."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.run_dir = Path(self.temporary.name)
+
+    def tearDown(self):
+        self.temporary.cleanup()
+
+    def make_artifact(self, method, *, gate="smoke-1000", step=10,
+                      kind="checkpoint", directory=None, **overrides):
+        values = {"kind": kind, "identity_sha256": IDENTITY, "gate": gate,
+                  "global_step": step, **MODEL, "training_method": method}
+        if method == "lora":
+            values.update(base_model_id=MODEL["model_id"],
+                          base_model_revision=MODEL["model_revision"])
+        values.update(overrides)
+        directory = directory or (self.gate_dir(method, gate, step, kind))
+        return support.write_artifact(directory, **values)
+
+    def gate_dir(self, method, gate, step, kind):
+        root = "checkpoints" if kind == "checkpoint" else "final"
+        name = f"checkpoint-{step}" if kind == "checkpoint" else method
+        return Path(self.run_dir) / root / gate / name
+
+    def test_full_artifact_is_refused_by_a_lora_run(self):
+        path = self.make_artifact("full")
+        with self.assertRaisesRegex(CheckpointError, "full.*run|belongs to a"):
+            checkpointing.verify_checkpoint(
+                path, IDENTITY, gate="smoke-1000", method="lora", **MODEL)
+
+    def test_lora_artifact_is_refused_by_a_full_run(self):
+        path = self.make_artifact("lora")
+        with self.assertRaisesRegex(CheckpointError, "lora.*run|belongs to a"):
+            checkpointing.verify_checkpoint(
+                path, IDENTITY, gate="smoke-1000", method="full", **MODEL)
+
+    def test_find_latest_checkpoint_is_method_scoped(self):
+        self.make_artifact("lora")
+        path, meta = checkpointing.find_latest_checkpoint(
+            self.run_dir, "smoke-1000", IDENTITY, method="lora", **MODEL)
+        self.assertEqual(path.name, "checkpoint-10")
+        self.assertEqual(meta["training_method"], "lora")
+        with self.assertRaises(CheckpointError):
+            checkpointing.find_latest_checkpoint(
+                self.run_dir, "smoke-1000", IDENTITY, method="full", **MODEL)
+
+    def test_lora_meta_requires_base_provenance(self):
+        with self.assertRaisesRegex(CheckpointError, "base model id and revision"):
+            checkpointing.write_artifact_meta(
+                Path(self.run_dir) / "naked-adapter", kind="final",
+                identity_sha256=IDENTITY, model_id=MODEL["model_id"],
+                model_revision=MODEL["model_revision"], adapter="minicpm5",
+                gate="smoke-1000", global_step=1, supervised_tokens_seen=0,
+                epochs_completed=1.0, training_method="lora")
+
+    def test_lora_checkpoint_requires_adapter_files(self):
+        path = self.make_artifact("lora")
+        # write_artifact marks it as lora and writes adapter files.
+        reason = checkpointing.incomplete_reason(path, method="lora")
+        self.assertIsNone(reason, reason)
+        self.assertIn("adapter_config.json",
+                      [item.name for item in path.iterdir()])
+        self.assertIn("adapter_model.safetensors",
+                      [item.name for item in path.iterdir()])
+        # A full-shaped directory is incomplete as a LoRA checkpoint.
+        full_shaped = Path(self.run_dir) / "full-shaped"
+        full_shaped.mkdir()
+        (full_shaped / "config.json").write_text("{}")
+        (full_shaped / "model.safetensors").write_bytes(b"w")
+        reason = checkpointing.incomplete_reason(full_shaped, method="lora")
+        self.assertIn("adapter_config.json", reason)
+
+    def test_lora_final_artifact_requires_adapter_files(self):
+        directory = checkpointing.final_dir(self.run_dir, "smoke-1000")
+        directory.mkdir(parents=True)
+        (directory / "tokenizer_config.json").write_text("{}")
+        checkpointing.write_final_meta(
+            directory, identity_sha256=IDENTITY, gate="smoke-1000",
+            global_step=1, supervised_tokens_seen=10, epochs_completed=1.0,
+            model_id=MODEL["model_id"], model_revision=MODEL["model_revision"],
+            adapter="minicpm5", training_method="lora",
+            base_model_id=MODEL["model_id"],
+            base_model_revision=MODEL["model_revision"])
+        with self.assertRaisesRegex(CheckpointError, "adapter_config.json"):
+            checkpointing.verify_final_artifact(
+                directory, identity_sha256=IDENTITY, gate="smoke-1000",
+                method="lora", **MODEL)
+        (directory / "adapter_config.json").write_text("{}")
+        (directory / "adapter_model.safetensors").write_bytes(b"a")
+        meta = checkpointing.verify_final_artifact(
+            directory, identity_sha256=IDENTITY, gate="smoke-1000",
+            method="lora", **MODEL)
+        self.assertEqual(meta["training_method"], "lora")
+        self.assertEqual(meta["base_model_id"], MODEL["model_id"])
+        self.assertEqual(meta["base_model_revision"], MODEL["model_revision"])
+
+    def test_evaluation_artifact_checks_method(self):
+        path = self.make_artifact("full")
+        with self.assertRaises(CheckpointError):
+            checkpointing.verify_evaluation_artifact(
+                path, identity_sha256=IDENTITY, gate="smoke-1000",
+                method="lora", **MODEL)
+
+    def test_lora_artifact_meta_matches_schema(self):
+        from stage1 import schema
+        path = self.make_artifact("lora")
+        meta = json.loads((path / checkpointing.CHECKPOINT_META_NAME).read_text())
+        schema.validate_artifact(meta, schema.load_schema("artifact.schema.json"),
+                                 "lora artifact meta")
+
+
 class ProvenanceTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()

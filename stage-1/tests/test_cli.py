@@ -12,7 +12,7 @@ STAGE1 = Path(__file__).resolve().parents[1]
 SCRIPTS = STAGE1 / "scripts"
 ENTRY_POINTS = (
     "prepare_dataset.py", "preflight.py", "train.py", "evaluate.py",
-    "compare_models.py", "make_slurm_script.py",
+    "compare_models.py", "merge_adapter.py", "make_slurm_script.py",
 )
 
 
@@ -128,11 +128,16 @@ class SlurmScriptTests(unittest.TestCase):
 
 
 class CompareModelsTests(unittest.TestCase):
-    def _write_metrics(self, path, kind, data_identity="1" * 64, split="test"):
+    def _write_metrics(self, path, kind, data_identity="1" * 64, split="test",
+                       training_method=None, evaluation_set="2" * 64,
+                       max_seq_len=4096):
         template = {
             "schema_version": "stage1-eval-v1",
             "artifact": {"kind": kind},
+            "training_method": training_method or ("base" if kind == "base" else "full"),
             "data_identity_sha256": data_identity,
+            "max_seq_len": max_seq_len,
+            "evaluation_set_sha256": evaluation_set,
             "split": split,
             "generation": {"examples": 10, "completed": 4, "truncated": 6,
                            "errors": 0, "empty": 1},
@@ -181,6 +186,28 @@ class CompareModelsTests(unittest.TestCase):
                 "--allow-incomplete")
             self.assertEqual(allowed.returncode, 0, allowed.stderr)
 
+    def test_mixed_method_comparison_is_refused_unless_allowed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            full = root / "full.json"
+            lora = root / "lora.json"
+            self._write_metrics(full, "final", training_method="full")
+            self._write_metrics(lora, "final", training_method="lora")
+            out = root / "comparison"
+            completed = run_script(
+                "compare_models.py", "--metrics", str(full), "--metrics", str(lora),
+                "--labels", "full", "lora", "--out", str(out))
+            self.assertEqual(completed.returncode, 1)
+            self.assertIn("mixes training methods", completed.stderr)
+            allowed = run_script(
+                "compare_models.py", "--metrics", str(full), "--metrics", str(lora),
+                "--labels", "full", "lora", "--out", str(out),
+                "--allow-non-comparable",
+                "--allow-incomplete")
+            self.assertEqual(allowed.returncode, 0, allowed.stderr)
+            markdown = (out / "comparison.md").read_text()
+            self.assertIn("NOT COMPARABLE", markdown)
+
     def test_label_count_must_match(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -191,6 +218,28 @@ class CompareModelsTests(unittest.TestCase):
                 "--labels", "a", "b", "--out", str(root / "out"))
             self.assertEqual(completed.returncode, 2)
             self.assertIn("must match", completed.stderr)
+
+
+class MergeCommandTests(unittest.TestCase):
+    def test_training_never_merges_adapters(self):
+        source = (STAGE1 / "src" / "stage1" / "train.py").read_text()
+        self.assertNotIn("merge_and_unload", source)
+        self.assertNotIn("merge_adapter", source)
+
+    def test_merge_cli_help(self):
+        completed = run_script("merge_adapter.py", "--help")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("never automatic", " ".join(completed.stdout.split()))
+
+    @support.requires_yaml
+    def test_merge_refuses_a_full_mode_config(self):
+        completed = run_script(
+            "merge_adapter.py",
+            "--config", str(STAGE1 / "configs" / "qwen3.5-4b-full.yaml"),
+            "--run-dir", "/tmp/run", "--adapter", "/tmp/adapter",
+            "--out", "/tmp/out")
+        self.assertEqual(completed.returncode, 2)
+        self.assertIn("requires training.method: lora", completed.stderr)
 
 
 class ExitCodeTests(unittest.TestCase):

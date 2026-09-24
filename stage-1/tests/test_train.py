@@ -13,7 +13,7 @@ from pathlib import Path
 from tests import support
 
 from stage1 import checkpointing, collator, train
-from stage1.errors import DataError
+from stage1.errors import CheckpointError, DataError
 
 HAS_DATASETS = importlib.util.find_spec("datasets") is not None
 
@@ -411,7 +411,11 @@ class FakeModel:
 
 
 class ArtifactWeightTests(unittest.TestCase):
-    """Regression: checkpoint verification must not leave older weights live."""
+    """Checkpoint verification must not leave older weights live.
+
+    Also covers the method-aware weight loading introduced for LoRA: adapters
+    load only adapter tensors, never base weights.
+    """
 
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -430,34 +434,67 @@ class ArtifactWeightTests(unittest.TestCase):
 
     def test_load_artifact_weights_loads_exactly(self):
         model = FakeModel()
-        report = train.load_artifact_weights(model, self.checkpoint,
-                                             loader=self.loader)
+        report = checkpointing.load_artifact_weights(
+            model, self.checkpoint, loader=self.loader)
         self.assertEqual(model.loaded, ["checkpoint-25"])
         self.assertEqual(report["tensors"], 1)
+        self.assertEqual(report["method"], "full")
 
     def test_load_artifact_weights_refuses_mismatch(self):
         class Mismatched(FakeModel):
             def load_state_dict(self, state, strict=False):
                 return ["missing.weight"], []
 
-        with self.assertRaisesRegex(DataError, "does not match the model"):
-            train.load_artifact_weights(Mismatched(), self.checkpoint,
-                                        loader=self.loader)
+        with self.assertRaisesRegex(CheckpointError, "does not match the model"):
+            checkpointing.load_artifact_weights(
+                Mismatched(), self.checkpoint, loader=self.loader)
 
     def test_load_artifact_weights_refuses_empty_directory(self):
         empty = self.root / "empty"
         empty.mkdir()
-        with self.assertRaisesRegex(DataError, "No safetensors weights"):
-            train.load_artifact_weights(FakeModel(), empty, loader=self.loader)
+        with self.assertRaisesRegex(CheckpointError, "No weight file"):
+            checkpointing.load_artifact_weights(FakeModel(), empty,
+                                                loader=self.loader)
+
+    def test_lora_weights_require_adapter_keys(self):
+        adapter = self.root / "adapter"
+        adapter.mkdir()
+        (adapter / "adapter_model.safetensors").write_bytes(b"adapter")
+
+        class AdapterModel(FakeModel):
+            def state_dict(self):
+                return {"base.weight": 1,
+                        "base.lora_A.default.weight": 2}
+
+        # Adapter file containing a base-model tensor is refused.
+        base_tensor_loader = lambda path: {"base.weight": 1}
+        with self.assertRaisesRegex(CheckpointError, "non-adapter tensors"):
+            checkpointing.load_artifact_weights(
+                AdapterModel(), adapter, method="lora",
+                loader=base_tensor_loader)
+        # Adapter file missing a live adapter parameter is refused.
+        partial_loader = lambda path: {"base.lora_B.default.weight": 2}
+        with self.assertRaisesRegex(CheckpointError, "does not cover"):
+            checkpointing.load_artifact_weights(
+                AdapterModel(), adapter, method="lora", loader=partial_loader)
+        # A complete adapter loads.
+        complete_loader = lambda path: {"base.lora_A.default.weight": 1,
+                                        "base.lora_B.default.weight": 2}
+        report = checkpointing.load_artifact_weights(
+            AdapterModel(), adapter, method="lora", loader=complete_loader)
+        self.assertEqual(report["method"], "lora")
+        self.assertEqual(report["tensors"], 2)
 
     def test_restore_final_weights_runs_after_checkpoint_weights(self):
         model = FakeModel(loss=0.125, shape=(2, 4))
-        train.load_artifact_weights(model, self.checkpoint, loader=self.loader)
+        checkpointing.load_artifact_weights(model, self.checkpoint,
+                                            loader=self.loader)
         report = train.restore_final_weights(
-            model, self.final, batch_plan=self.batch_plan, torch=FakeTorch,
-            loader=self.loader)
+            model, self.final, method="full", batch_plan=self.batch_plan,
+            torch=FakeTorch, loader=self.loader)
         self.assertEqual(model.loaded, ["checkpoint-25", "final"])
         self.assertTrue(report["restored_after_checkpoint_verification"])
+        self.assertEqual(report["restore_method"], "full")
         self.assertEqual(report["restore_loss"], 0.125)
         self.assertEqual(report["restore_logits_shape"], [2, 4])
 
@@ -465,8 +502,8 @@ class ArtifactWeightTests(unittest.TestCase):
         model = FakeModel(loss=float("nan"))
         with self.assertRaisesRegex(DataError, "non-finite loss"):
             train.restore_final_weights(
-                model, self.final, batch_plan=self.batch_plan, torch=FakeTorch,
-                loader=self.loader)
+                model, self.final, method="full", batch_plan=self.batch_plan,
+                torch=FakeTorch, loader=self.loader)
 
 
 def metrics_document(**overrides):

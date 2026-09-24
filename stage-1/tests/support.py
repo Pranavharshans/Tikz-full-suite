@@ -530,15 +530,38 @@ def write_artifact(directory, *, kind="checkpoint", identity_sha256="a" * 64,
                    gate="smoke-1000", model_id="test/Model-A",
                    model_revision="a" * 40, adapter="minicpm5",
                    global_step=10, supervised_tokens_seen=100,
-                   epochs_completed=0.5, complete=True, meta=True):
-    """Write a minimal checkpoint/final artifact directory for tests."""
+                   epochs_completed=0.5, complete=True, meta=True,
+                   training_method="full", base_model_id=None,
+                   base_model_revision=None, lora=None):
+    """Write a minimal checkpoint/final artifact directory for tests.
+
+    ``training_method="lora"`` writes native-PEFT-shaped files (adapter config
+    and adapter weights) and records base-model provenance, so full and LoRA
+    artifacts have genuinely different layouts.
+    """
     from stage1 import checkpointing
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    for name in ("config.json", "trainer_state.json", "optimizer.pt", "scheduler.pt"):
+    for name in ("trainer_state.json", "optimizer.pt", "scheduler.pt"):
         (directory / name).write_text("{}")
-    if complete:
-        (directory / "model.safetensors").write_bytes(b"weights")
+    if training_method == "lora":
+        if complete:
+            (directory / "adapter_config.json").write_text(json.dumps(
+                {"r": 64, "lora_alpha": 64, "lora_dropout": 0.0,
+                 "bias": "none",
+                 "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj",
+                                    "gate_proj", "up_proj", "down_proj"]}))
+            (directory / "adapter_model.safetensors").write_bytes(b"adapter")
+        base_model_id = base_model_id or model_id
+        base_model_revision = base_model_revision or model_revision
+        if lora is None:
+            lora = {"rank": 64, "alpha": 64, "dropout": 0.0, "bias": "none",
+                    "target_modules": ["q_proj", "k_proj", "v_proj", "o_proj",
+                                       "gate_proj", "up_proj", "down_proj"]}
+    else:
+        (directory / "config.json").write_text("{}")
+        if complete:
+            (directory / "model.safetensors").write_bytes(b"weights")
     if kind == "final":
         (directory / "tokenizer_config.json").write_text("{}")
     if meta:
@@ -547,7 +570,9 @@ def write_artifact(directory, *, kind="checkpoint", identity_sha256="a" * 64,
             model_id=model_id, model_revision=model_revision, adapter=adapter,
             gate=gate, global_step=global_step,
             supervised_tokens_seen=supervised_tokens_seen,
-            epochs_completed=epochs_completed, run_id="run1")
+            epochs_completed=epochs_completed, run_id="run1",
+            training_method=training_method, base_model_id=base_model_id,
+            base_model_revision=base_model_revision, lora=lora)
     return directory
 
 

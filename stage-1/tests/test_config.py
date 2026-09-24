@@ -230,6 +230,82 @@ class IdentityPayloadTests(unittest.TestCase):
             config.identity_payload()
 
 
+class LoraConfigTests(unittest.TestCase):
+    def test_method_defaults_to_full_and_rejects_lora_section(self):
+        config = support.make_config()
+        self.assertEqual(config.training.method, "full")
+        self.assertIsNone(config.lora)
+        with self.assertRaisesRegex(ConfigError, "only valid with"):
+            support.make_config(lora={"rank": 8})
+
+    def test_lora_method_requires_the_section(self):
+        with self.assertRaisesRegex(ConfigError, "LoRA configuration is required"):
+            support.make_config(training={"method": "lora"})
+
+    def test_unknown_method_is_rejected(self):
+        with self.assertRaisesRegex(ConfigError, "not supported"):
+            support.make_config(training={"method": "qlora"})
+
+    def test_lora_defaults_match_the_specification(self):
+        config = support.make_config(training={"method": "lora",
+                                               "learning_rate": 1e-4},
+                                     lora={})
+        self.assertEqual(config.lora.rank, 64)
+        self.assertEqual(config.lora.alpha, 64)
+        self.assertEqual(config.lora.dropout, 0.0)
+        self.assertEqual(config.lora.bias, "none")
+        self.assertEqual(list(config.lora.target_modules), [
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj"])
+        self.assertEqual(config.training.effective_batch_size, 16)
+
+    def test_lora_section_validation(self):
+        for overrides, pattern in (
+                ({"rank": 0}, "rank"),
+                ({"alpha": 0}, "alpha"),
+                ({"dropout": 0.9}, "dropout"),
+                ({"bias": "everything"}, "bias"),
+                ({"target_modules": []}, "target_modules"),
+                ({"target_modules": ["q_proj", "q_proj"]}, "duplicate"),
+                ({"target_modules": ["q_proj", ""]}, "non-empty string"),
+                ({"surprise": 1}, "unknown key")):
+            with self.subTest(overrides=overrides):
+                with self.assertRaises(ConfigError, msg=str(overrides)):
+                    support.make_config(training={"method": "lora"}, lora=overrides)
+
+    def test_effective_batch_must_be_sixteen(self):
+        with self.assertRaisesRegex(ConfigError, "effective batch size"):
+            support.make_config(training={"gradient_accumulation_steps": 4})
+        config = support.make_config(
+            training={"per_device_train_batch_size": 4,
+                      "gradient_accumulation_steps": 4})
+        self.assertEqual(config.training.effective_batch_size, 16)
+
+    def test_packing_still_rejected_in_lora_mode(self):
+        with self.assertRaisesRegex(ConfigError, "not supported"):
+            support.make_config(training={"method": "lora", "packing": True},
+                                lora={})
+
+    def test_lora_configuration_is_part_of_the_identity(self):
+        full = support.make_config().identity_payload()
+        lora = support.make_config(training={"method": "lora",
+                                             "learning_rate": 1e-4},
+                                   lora={}).identity_payload()
+        self.assertNotEqual(full, lora)
+        self.assertEqual(full["training"]["method"], "full")
+        self.assertIsNone(full["lora"])
+        self.assertEqual(lora["training"]["method"], "lora")
+        self.assertEqual(lora["lora"]["rank"], 64)
+        self.assertEqual(lora["lora"]["target_modules"][0], "q_proj")
+
+    def test_lora_identity_changes_with_adapter_settings(self):
+        first = support.make_config(training={"method": "lora"},
+                                    lora={"rank": 64}).identity_payload()
+        second = support.make_config(training={"method": "lora"},
+                                     lora={"rank": 32}).identity_payload()
+        self.assertNotEqual(first["lora"], second["lora"])
+
+
 class ShippedConfigTests(unittest.TestCase):
     @support.requires_yaml
     def test_common_yaml_alone_requires_a_model(self):
@@ -268,6 +344,42 @@ class ShippedConfigTests(unittest.TestCase):
             config = config_module.load_config(REPO_STAGE1 / "configs" / name)
             adapter = adapters.validate_config_against_adapter(config)
             self.assertLessEqual(config.data.max_seq_len, adapter.context_length)
+
+    @support.requires_yaml
+    def test_shipped_lora_configs_resolve(self):
+        expected = {
+            "qwen3.5-4b-lora.yaml": (
+                "Qwen/Qwen3.5-4B",
+                "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a", "qwen3.5",
+                "unsloth-vision-model"),
+            "minicpm5-2b-lora.yaml": (
+                "openbmb/MiniCPM5-2B",
+                "12a3808a956f869c767195e9266b59c4d21d92e2", "minicpm5",
+                "unsloth-language-model"),
+        }
+        for name, (model_id, revision, adapter_name, loader) in expected.items():
+            with self.subTest(config=name):
+                config = config_module.load_config(REPO_STAGE1 / "configs" / name)
+                self.assertEqual(config.training.method, "lora")
+                self.assertEqual(config.training.learning_rate, 1e-4)
+                self.assertEqual(config.model.id, model_id)
+                self.assertEqual(config.model.revision, revision)
+                self.assertEqual(config.model.adapter, adapter_name)
+                self.assertEqual(config.model.loader, loader)
+                self.assertEqual(config.training.effective_batch_size, 16)
+                self.assertEqual(config.lora.rank, 64)
+                self.assertEqual(config.lora.alpha, 64)
+                self.assertEqual(config.lora.dropout, 0.0)
+                self.assertEqual(config.lora.bias, "none")
+                self.assertEqual(len(config.lora.target_modules), 7)
+                self.assertIsNotNone(config.environment.lock_path)
+
+    @support.requires_yaml
+    def test_full_configs_still_use_full_method(self):
+        for name in ("qwen3.5-4b-full.yaml", "minicpm5-2b-full.yaml"):
+            config = config_module.load_config(REPO_STAGE1 / "configs" / name)
+            self.assertEqual(config.training.method, "full")
+            self.assertIsNone(config.lora)
 
     @support.requires_yaml
     def test_shipped_configs_share_identical_identity_shape(self):

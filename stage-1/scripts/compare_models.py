@@ -38,6 +38,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allow-incomplete", action="store_true",
                         help="exit 0 even when base/trained artifacts are not "
                              "yet comparable")
+    parser.add_argument("--allow-non-comparable", action="store_true",
+                        help="exit 0 even when candidates disagree on training "
+                             "method, dataset identity, sequence limit or "
+                             "evaluation set")
     return parser
 
 
@@ -59,18 +63,23 @@ def main(argv) -> int:
     entries = []
     for label, path in zip(args.labels, args.metrics):
         entries.append((label, report.load_metrics_file(_resolve_metrics(path))))
-    comparison = report.compare_metrics(entries)
+    comparison = report.compare_metrics(
+        entries, allow_non_comparable=args.allow_non_comparable)
     written = report.write_comparison(
         require_absolute(args.out, "--out"), comparison)
     print(report.render_comparison(comparison))
     print(f"comparison written to {written['json']} and {written['markdown']}")
     readiness = comparison["experiment_readiness"]
-    if not readiness["ready"]:
-        print("experiment is NOT READY: " + "; ".join(readiness["problems"]),
-              file=sys.stderr)
-        if not args.allow_incomplete:
-            return 1
-    return 0
+    exit_code = 0
+    if readiness["problems"] and not args.allow_incomplete:
+        exit_code = 1
+    if readiness["comparability_problems"] and not args.allow_non_comparable:
+        exit_code = 1
+    if exit_code:
+        print("comparison is NOT READY: " + "; ".join(
+            list(readiness["problems"])
+            + list(readiness["comparability_problems"])), file=sys.stderr)
+    return exit_code
 
 
 if __name__ == "__main__":

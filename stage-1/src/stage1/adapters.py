@@ -184,17 +184,122 @@ def _split_kwargs(function, kwargs: dict) -> tuple:
     return accepted, rejected
 
 
+def module_short_names(model) -> dict:
+    """Count module short names (last dotted component) in the loaded model."""
+    counts = {}
+    for name, _module in model.named_modules():
+        if not name:
+            continue
+        short = name.rsplit(".", 1)[-1]
+        counts[short] = counts.get(short, 0) + 1
+    return counts
+
+
+def validate_target_modules(available: dict, targets) -> dict:
+    """Verify every configured LoRA target exists in the loaded model.
+
+    ``available`` maps module short names to occurrence counts. Returns a
+    report with the matched count per target; raises with the available module
+    names when a target does not exist, so a typo or an architecture mismatch
+    can never be silently ignored.
+    """
+    missing = [name for name in targets if available.get(name, 0) <= 0]
+    if missing:
+        candidates = sorted(name for name in available
+                            if any(part in name for part in ("proj", "gate", "up", "down")))
+        raise DataError(
+            "LoRA target module(s) not found in the loaded model: "
+            f"{missing}. Available projection-like modules: {candidates[:40]}. "
+            "Fix lora.target_modules for this architecture; Stage 1 never "
+            "silently ignores a configured target.")
+    return {
+        "targets": list(targets),
+        "matched_modules": {name: int(available.get(name, 0)) for name in targets},
+        "total_matched_modules": sum(int(available.get(name, 0)) for name in targets),
+    }
+
+
+def verify_lora_trainables(named_parameters, lora_config) -> dict:
+    """Assert base parameters are frozen and only adapter parameters train.
+
+    ``named_parameters`` is any iterable of ``(name, parameter)`` pairs (for
+    example ``model.named_parameters()``); each parameter needs
+    ``requires_grad`` and ``numel()``.
+    """
+    total = 0
+    trainable = 0
+    base_trainable = []
+    adapter_trainable = []
+    adapter_targets = {}
+    for name, parameter in named_parameters:
+        count = int(parameter.numel())
+        total += count
+        if not parameter.requires_grad:
+            continue
+        trainable += count
+        if "lora_" in name:
+            adapter_trainable.append(name)
+            for target in lora_config.target_modules:
+                if f".{target}." in name or name.endswith(f".{target}"):
+                    adapter_targets[target] = adapter_targets.get(target, 0) + 1
+        elif lora_config.bias != "none" and name.endswith(".bias"):
+            # bias: all/lora_only legitimately train biases.
+            adapter_trainable.append(name)
+        else:
+            base_trainable.append(name)
+    if base_trainable:
+        raise DataError(
+            f"{len(base_trainable)} base parameter(s) are trainable in LoRA mode; "
+            f"only adapter parameters may train. First: {base_trainable[:3]}")
+    if not adapter_trainable:
+        raise DataError(
+            "No trainable adapter parameters were found after applying LoRA; "
+            "the adapter was not attached")
+    absent = [target for target in lora_config.target_modules
+              if adapter_targets.get(target, 0) == 0]
+    if absent and lora_config.bias == "none":
+        raise DataError(
+            f"Configured LoRA targets without trainable adapter parameters: "
+            f"{absent}; refusing to train a partially attached adapter")
+    percentage = (100.0 * trainable / total) if total else 0.0
+    return {
+        "total_parameters": total,
+        "trainable_parameters": trainable,
+        "trainable_percentage": round(percentage, 6),
+        "adapter_parameters": len(adapter_trainable),
+        "adapter_parameter_names_sample": sorted(adapter_trainable)[:5],
+        "adapter_targets": dict(sorted(adapter_targets.items())),
+        "base_parameters_trainable": 0,
+        "base_frozen": True,
+    }
+
+
+def _parameter_summary(model) -> dict:
+    total = sum(parameter.numel() for parameter in model.parameters())
+    trainable = sum(parameter.numel() for parameter in model.parameters()
+                    if parameter.requires_grad)
+    return {
+        "parameter_count": total,
+        "trainable_parameter_count": trainable,
+        "trainable_percentage": round(100.0 * trainable / total, 6) if total else 0.0,
+    }
+
+
 def load_model_and_tokenizer(config, *, local_files_only: bool = False,
                              cache_dir=None, for_training: bool = False,
                              for_inference: bool = False,
-                             source_override=None):
+                             source_override=None, method: str | None = None):
     """Load the exact checkpoint through Unsloth; never a silent fallback.
 
-    Returns ``(model, tokenizer, load_report)``. The report records which
-    loader and which full-finetuning path were used so the preflight evidence
-    and run metadata can state it explicitly.
+    ``method`` defaults to ``config.training.method``. ``"full"`` keeps the
+    existing full-parameter BF16 path; ``"lora"`` loads the same unquantized
+    BF16 base model and applies adapters through Unsloth's native PEFT
+    integration (``get_peft_model``). Returns ``(model, tokenizer, report)``.
     """
     validate_config_against_adapter(config)
+    method = method or config.training.method
+    if method not in ("full", "lora"):
+        raise DataError(f"Unknown training method {method!r}")
     try:
         import torch
     except ImportError as exc:  # pragma: no cover - environment dependent
@@ -239,18 +344,21 @@ def load_model_and_tokenizer(config, *, local_files_only: bool = False,
         from unsloth import FastLanguageModel as Loader
         loader_name = "FastLanguageModel"
 
-    full_finetuning_supported = "full_finetuning" in _callable_parameters(
-        Loader.from_pretrained)
-    if not full_finetuning_supported:
-        raise DataError(
-            f"Unsloth {loader_name}.from_pretrained in unsloth "
-            f"{getattr(unsloth, '__version__', 'unknown')} does not expose "
-            "full_finetuning; Stage 1 requires full-parameter training and "
-            "will not fall back to PEFT/QLoRA silently")
-    load_kwargs["full_finetuning"] = True
+    if method == "full":
+        full_finetuning_supported = "full_finetuning" in _callable_parameters(
+            Loader.from_pretrained)
+        if not full_finetuning_supported:
+            raise DataError(
+                f"Unsloth {loader_name}.from_pretrained in unsloth "
+                f"{getattr(unsloth, '__version__', 'unknown')} does not expose "
+                "full_finetuning; Stage 1 requires full-parameter training and "
+                "will not fall back to PEFT/QLoRA silently")
+        load_kwargs["full_finetuning"] = True
 
     accepted, rejected = _split_kwargs(Loader.from_pretrained, load_kwargs)
-    critical = {"revision", "local_files_only", "cache_dir", "full_finetuning"}
+    critical = {"revision", "local_files_only", "cache_dir"}
+    if method == "full":
+        critical.add("full_finetuning")
     dropped_critical = sorted(critical & set(rejected))
     if dropped_critical:
         raise DataError(
@@ -270,13 +378,43 @@ def load_model_and_tokenizer(config, *, local_files_only: bool = False,
     if embedding is not None and embedding.weight.dtype != torch.bfloat16:
         raise DataError(
             f"Model embedding dtype is {embedding_dtype}, expected bfloat16. "
-            "Stage 1 is full-parameter BF16 SFT; fix the environment instead of "
-            "training in another precision.")
+            "Stage 1 is BF16 training; fix the environment instead of training "
+            "in another precision.")
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     if tokenizer.pad_token_id is None:
         raise DataError(f"No pad token available for {config.model.id}")
 
+    report = {
+        "loader": loader_name,
+        "loader_module_version": getattr(unsloth, "__version__", "unknown"),
+        "training_method": method,
+        "full_finetuning": method == "full",
+        "quantization": "none",
+        "load_in_4bit": False,
+        "load_in_8bit": False,
+        "attn_implementation": attn or "backend-default",
+        "dtype": embedding_dtype,
+        "source": source,
+        "revision": config.model.revision if source_override is None else None,
+        "base_model_id": config.model.id,
+        "base_model_revision": config.model.revision,
+        "rejected_kwargs": sorted(rejected),
+    }
+
+    if method == "lora":
+        if config.lora is None:
+            raise DataError(
+                "training.method is 'lora' but no lora configuration is present")
+        target_report = validate_target_modules(
+            module_short_names(model), config.lora.target_modules)
+        model, lora_applied = _apply_lora(model, Loader, config, report)
+        report["lora"] = config.lora.to_jsonable()
+        report["lora_applied"] = lora_applied
+        report["target_modules"] = target_report
+        report.update(verify_lora_trainables(model.named_parameters(), config.lora))
+
+    training_patch_stage = None
     for_training_applied = False
     if for_training:
         for_training_fn = getattr(Loader, "for_training", None)
@@ -287,6 +425,7 @@ def load_model_and_tokenizer(config, *, local_files_only: bool = False,
                 "training-time patches")
         model = for_training_fn(model)
         for_training_applied = True
+        training_patch_stage = "after_adapter" if method == "lora" else "base_model"
 
     for_inference_applied = False
     if for_inference:
@@ -299,39 +438,123 @@ def load_model_and_tokenizer(config, *, local_files_only: bool = False,
         model = for_inference_fn(model)
         for_inference_applied = True
 
-    report = {
-        "loader": loader_name,
-        "loader_module_version": getattr(unsloth, "__version__", "unknown"),
-        "full_finetuning": True,
-        "for_training_applied": for_training_applied,
-        "for_inference_applied": for_inference_applied,
-        "attn_implementation": attn or "backend-default",
-        "dtype": embedding_dtype,
-        "source": source,
-        "revision": config.model.revision if source_override is None else None,
-        "parameter_count": sum(parameter.numel() for parameter in model.parameters()),
-        "trainable_parameter_count": sum(parameter.numel() for parameter in model.parameters()
-                                         if parameter.requires_grad),
-        "rejected_kwargs": sorted(rejected),
-    }
+    report.update(_parameter_summary(model))
+    report["for_training_applied"] = for_training_applied
+    report["for_training_patch_stage"] = training_patch_stage
+    report["for_inference_applied"] = for_inference_applied
     return model, tokenizer, report
 
 
-def load_model_for_evaluation(config, *, checkpoint_dir=None,
+def _apply_lora(model, Loader, config, report):
+    """Attach LoRA through Unsloth's native PEFT integration."""
+    get_peft_model = getattr(Loader, "get_peft_model", None)
+    if get_peft_model is None:
+        raise DataError(
+            f"Unsloth {report['loader']}.get_peft_model is not available in the "
+            "installed unsloth; Stage 1 uses the native PEFT integration and "
+            "will not build adapter layers manually")
+    lora = config.lora
+    requested = {
+        "r": lora.rank,
+        "lora_alpha": lora.alpha,
+        "lora_dropout": lora.dropout,
+        "bias": lora.bias,
+        "target_modules": list(lora.target_modules),
+        "random_state": config.seed,
+    }
+    if config.training.gradient_checkpointing:
+        requested["use_gradient_checkpointing"] = "unsloth"
+    accepted, rejected = _split_kwargs(get_peft_model, requested)
+    required = {"r", "lora_alpha", "lora_dropout", "bias", "target_modules"}
+    missing = sorted(required - set(accepted))
+    if missing:
+        raise DataError(
+            f"Unsloth {report['loader']}.get_peft_model does not accept "
+            f"{missing}; refusing to attach a partially configured adapter")
+    if config.training.gradient_checkpointing and "use_gradient_checkpointing" not in accepted:
+        raise DataError(
+            f"Unsloth {report['loader']}.get_peft_model does not accept "
+            "use_gradient_checkpointing but training.gradient_checkpointing is "
+            "true; refusing to train without gradient checkpointing")
+    try:
+        model = get_peft_model(model, **accepted)
+    except Exception as exc:
+        raise DataError(
+            f"Failed to attach LoRA adapters for {config.model.id} through "
+            f"Unsloth {report['loader']}.get_peft_model "
+            f"({type(exc).__name__}: {exc})") from exc
+    return model, {
+        "api": f"{report['loader']}.get_peft_model",
+        "requested_kwargs": sorted(accepted),
+        "dropped_kwargs": sorted(rejected),
+        "quantized": False,
+    }
+
+
+def attach_lora_adapter(model, adapter_dir):
+    """Attach a saved PEFT adapter to an already-loaded base model."""
+    try:
+        from peft import PeftModel
+    except ImportError as exc:  # pragma: no cover - environment dependent
+        raise DataError(
+            "peft is required to attach a saved LoRA adapter; install the "
+            "pinned environment from environment.lock_file") from exc
+    adapter_dir = Path(adapter_dir).resolve()
+    if not adapter_dir.is_dir():
+        raise DataError(f"Adapter directory does not exist: {adapter_dir}")
+    try:
+        return PeftModel.from_pretrained(model, str(adapter_dir))
+    except Exception as exc:
+        raise DataError(
+            f"Failed to attach the adapter at {adapter_dir} "
+            f"({type(exc).__name__}: {exc})") from exc
+
+
+def load_model_for_evaluation(config, *, checkpoint_dir=None, artifact_meta=None,
                               local_files_only: bool = False, cache_dir=None):
-    """Load either the pinned base checkpoint or a full-FT checkpoint directory."""
+    """Load the pinned base model, optionally with a saved Stage 1 artifact.
+
+    ``"full"`` artifacts are complete model directories. ``"lora"`` artifacts
+    are PEFT adapters: the exact pinned BF16 base model is loaded first and the
+    adapter is attached to it, so an adapter is never mistaken for a standalone
+    model. ``artifact_meta`` should be the verified metadata from
+    ``checkpointing.verify_evaluation_artifact``.
+    """
     if checkpoint_dir is None:
         model, tokenizer, report = load_model_and_tokenizer(
             config, local_files_only=local_files_only, cache_dir=cache_dir,
             for_inference=True)
         report["source_kind"] = "base"
         return model, tokenizer, report
+
     checkpoint_dir = Path(checkpoint_dir).resolve()
     if not checkpoint_dir.is_dir():
         raise DataError(f"Checkpoint directory does not exist: {checkpoint_dir}")
+    if artifact_meta is None:
+        from . import checkpointing
+        artifact_meta = checkpointing.read_artifact_meta(checkpoint_dir, required=True)
+    method = artifact_meta.get("training_method")
+    if method == "lora":
+        model, tokenizer, report = load_model_and_tokenizer(
+            config, local_files_only=local_files_only, cache_dir=cache_dir,
+            for_inference=True)
+        model = attach_lora_adapter(model, checkpoint_dir)
+        report.update({
+            "source_kind": "lora_adapter",
+            "checkpoint_dir": str(checkpoint_dir),
+            "adapter": str(checkpoint_dir),
+            "base_model_id": artifact_meta.get("base_model_id"),
+            "base_model_revision": artifact_meta.get("base_model_revision"),
+            **_parameter_summary(model),
+        })
+        return model, tokenizer, report
+    if method != "full":
+        raise DataError(
+            f"Artifact {checkpoint_dir} has training_method={method!r}; "
+            "refusing to guess how to load it")
     model, tokenizer, report = load_model_and_tokenizer(
         config, local_files_only=True, cache_dir=cache_dir, for_inference=True,
-        source_override=checkpoint_dir)
+        source_override=checkpoint_dir, method="full")
     report["source_kind"] = "checkpoint"
     report["checkpoint_dir"] = str(checkpoint_dir)
     return model, tokenizer, report

@@ -25,7 +25,11 @@ EVAL_METRICS = {
     "schema_version": "stage1-eval-v1",
     "name": "sft-test",
     "source_kind": "checkpoint",
+    "training_method": "full",
     "model_id": "openbmb/MiniCPM5-2B",
+    "data_identity_sha256": "1" * 64,
+    "max_seq_len": 4096,
+    "evaluation_set_sha256": "2" * 64,
     "generation": {"examples": 100, "completed": 80, "truncated": 20,
                    "errors": 0, "empty": 2},
     "compilation": {"attempted": 100, "success": 75, "success_rate": 0.75,
@@ -105,6 +109,50 @@ class ComparisonTests(unittest.TestCase):
         trained = dict(trained, data_identity_sha256="1" * 64, split="validation")
         readiness = report.experiment_readiness([("base", base), ("trained", trained)])
         self.assertFalse(readiness["ready"])
+
+    def test_comparability_refuses_mixed_training_methods(self):
+        base = dict(EVAL_METRICS, artifact={"kind": "base"},
+                    training_method="base")
+        full = dict(EVAL_METRICS, artifact={"kind": "final"},
+                    training_method="full")
+        lora = dict(EVAL_METRICS, artifact={"kind": "final"},
+                    training_method="lora")
+        problems = report.comparison_problems([("base", base), ("lora", lora)])
+        self.assertEqual(problems, [])
+        problems = report.comparison_problems([("full", full), ("lora", lora)])
+        self.assertTrue(any("mixes training methods" in item for item in problems))
+        readiness = report.experiment_readiness(
+            [("base", base), ("full", full), ("lora", lora)])
+        self.assertFalse(readiness["ready"])
+        # Non-comparable is allowed only for an otherwise complete set.
+        allowed = report.experiment_readiness(
+            [("base", base), ("full", full), ("lora", lora)],
+            allow_non_comparable=True)
+        self.assertTrue(allowed["ready"])
+        self.assertTrue(allowed["comparability_allowed"])
+
+    def test_comparability_refuses_different_sequence_limit_or_eval_set(self):
+        first = dict(EVAL_METRICS, artifact={"kind": "final"},
+                     evaluation_set_sha256="2" * 64, max_seq_len=4096)
+        second = dict(EVAL_METRICS, artifact={"kind": "final"},
+                      evaluation_set_sha256="3" * 64, max_seq_len=4096)
+        problems = report.comparison_problems([("a", first), ("b", second)])
+        self.assertTrue(any("evaluation set" in item for item in problems))
+        second = dict(EVAL_METRICS, artifact={"kind": "final"},
+                      evaluation_set_sha256="2" * 64, max_seq_len=8192)
+        problems = report.comparison_problems([("a", first), ("b", second)])
+        self.assertTrue(any("sequence limit" in item for item in problems))
+
+    def test_comparison_report_shows_method_and_comparability(self):
+        base = dict(EVAL_METRICS, artifact={"kind": "base"},
+                    training_method="base")
+        lora = dict(EVAL_METRICS, artifact={"kind": "final"},
+                    training_method="lora")
+        comparison = report.compare_metrics([("base", base), ("lora", lora)])
+        markdown = report.render_comparison(comparison)
+        self.assertIn("method", markdown)
+        self.assertIn("lora", markdown)
+        self.assertIn("Comparability: OK", markdown)
 
     def test_training_metrics_expose_exact_token_accounting(self):
         metrics = dict(TRAINING_METRICS)
