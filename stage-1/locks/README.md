@@ -18,10 +18,8 @@ Rules:
 - `# comments` are allowed. Do not edit a lock file casually: a lock change is
   an environment change and invalidates run identities, so it must be a
   reviewed commit.
-- The two model locks are intentionally separate files even where they carry
-  identical pins today. If MiniCPM5 later requires a newer Transformers than
-  Unsloth supports for Qwen3.5 (or the reverse), the environments diverge
-  without touching the trainer.
+- The two model locks are intentionally separate. MiniCPM uses Transformers
+  4.57.3 while Qwen uses 5.5.0; never collapse the environments.
 
 Why these versions:
 
@@ -34,10 +32,10 @@ Why these versions:
   (`Qwen3_5ForConditionalGeneration`); Unsloth ships a Qwen3.5 (4B) notebook,
   so the pinned Unsloth is expected to cover it. The preflight is the
   authority: it must load the exact checkpoint before any gate can run.
-- `openbmb/MiniCPM5-2B` is `LlamaForCausalLM` (Transformers 5.6.2 metadata,
-  stable architecture). It is expected to load under `transformers==5.5.0`;
-  if it does not, the MiniCPM5 lock may pin a different Transformers release
-  and the environment diverges (the trainer does not change).
+- `openbmb/MiniCPM5-2B` is `LlamaForCausalLM`. Upstream documents
+  `transformers>=5.6,<6` as the primary path and `transformers==4.57.3` as the
+  fallback. The MiniCPM lock uses that fallback because it is inside
+  Unsloth's supported range and avoids Transformers-v5 weight conversion.
 - Stage 1 does not support sequence packing, so no varlen attention backend is
   required and `flash-attn` is not pinned. The preflight still records which
   attention backends are importable.

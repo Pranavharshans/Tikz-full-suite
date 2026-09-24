@@ -117,7 +117,11 @@ class LockFileTests(unittest.TestCase):
             pins = util.parse_lock_file(path)
             self.assertIn("torch", pins)
             self.assertIn("transformers", pins)
-            self.assertLessEqual(pins["transformers"], "5.5.0")
+            expected_transformers = {
+                "qwen3.5-4b.lock": "5.5.0",
+                "minicpm5-2b.lock": "4.57.3",
+            }
+            self.assertEqual(pins["transformers"], expected_transformers[name])
             self.assertNotIn("python", pins)
             self.assertNotIn("flash-attn", pins)
 

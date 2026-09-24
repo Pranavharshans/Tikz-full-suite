@@ -5,7 +5,7 @@
 torch==2.12.1
 torchvision==0.27.1
 xformers==0.0.35
-transformers==5.5.0
+transformers==4.57.3
 trl==0.24.0
 datasets==4.3.0
 accelerate==1.15.0

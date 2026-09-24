@@ -70,11 +70,13 @@ python3.12 -m venv /shared/$USER/envs/minicpm5-2b
 /shared/$USER/envs/minicpm5-2b/bin/pip install -r stage-1/locks/minicpm5-2b.lock
 ```
 
-The locks are pinned to the newest coherent set inside Unsloth's constraints
-(`transformers<=5.5.0`, `trl<=0.24.0`, `torch<2.13.0`). See
-`locks/README.md`. The **preflight verifies the actual environment** (and that
-the running interpreter matches `.python-version`); it never trusts the lock.
-Run it inside the same environment that will train.
+The locks are model-specific coherent sets inside Unsloth's constraints
+(`transformers<=5.5.0`, `trl<=0.24.0`, `torch<2.13.0`). Qwen uses
+Transformers 5.5.0; MiniCPM uses its officially documented 4.57.3 fallback to
+avoid the incompatible Transformers-v5 path. See `locks/README.md`. The
+**preflight verifies the actual environment** (and that the running
+interpreter matches `.python-version`); it never trusts the lock. Run it
+inside the same environment that will train.
 
 ## 2. Prepare the dataset (once, shared by both models)
 
@@ -615,11 +617,11 @@ environment (see the run report).
   Unsloth's vision loader and train with full finetuning. If Unsloth cannot
   full-finetune it, the preflight fails loudly and the model cannot be used
   until the environment or loader changes (a reviewed config change).
-- **MiniCPM5-2B declares Transformers 5.6.2 metadata** while the Unsloth-pinned
-  environment provides 5.5.0. It is a stable `LlamaForCausalLM`, so this is
-  expected to work, but the tokenizer/load test and the preflight are the
-  authority. If it fails, split the lock (the configs already point at
-  separate lock files) and re-run preparation for that model.
+- **MiniCPM5-2B uses its official Transformers 4.57.3 fallback.** The primary
+  upstream recommendation is 5.6.x, but pinned Unsloth 2026.9.11 caps
+  Transformers at 5.5.0. MiniCPM's separate 4.57.3 environment stays inside
+  that cap and avoids the Transformers-v5 adapter conversion path. Qwen keeps
+  its independent 5.5.0 environment.
 - **No sequence packing**: long examples are padded (slower, but correct).
   Raising `data.max_seq_len` is the supported way to reduce quarantine.
 - TeX compilation requires a TeX installation with `standalone` and `tikz`
