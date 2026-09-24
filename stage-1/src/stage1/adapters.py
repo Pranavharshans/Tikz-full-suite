@@ -538,7 +538,7 @@ def load_base_model_and_tokenizer(config, **kwargs):
     return load_model_and_tokenizer(config, **kwargs)
 
 
-def attach_lora_adapter(model, adapter_dir):
+def attach_lora_adapter(model, adapter_dir, *, is_trainable: bool = False):
     """Attach a saved PEFT adapter to an already-loaded base model.
 
     Refuses a model that already carries an adapter, so a saved adapter is
@@ -565,7 +565,8 @@ def attach_lora_adapter(model, adapter_dir):
     if not adapter_dir.is_dir():
         raise DataError(f"Adapter directory does not exist: {adapter_dir}")
     try:
-        return PeftModel.from_pretrained(model, str(adapter_dir))
+        return PeftModel.from_pretrained(
+            model, str(adapter_dir), is_trainable=bool(is_trainable))
     except Exception as exc:
         raise DataError(
             f"Failed to attach the adapter at {adapter_dir} "

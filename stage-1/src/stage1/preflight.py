@@ -494,9 +494,9 @@ def check_one_step(ctx: PreflightContext) -> dict:
     ctx.scratch["peak_vram_bytes"] = peak_vram
     peak_detail = human_bytes(peak_vram) if peak_vram is not None else "unmeasured"
     return _pass(
-        f"loss {float(loss):.4f}, grad norm {grad_norm:.4f}, "
+        f"loss {float(loss.detach()):.4f}, grad norm {grad_norm:.4f}, "
         f"{elapsed:.2f}s, peak VRAM {peak_detail}",
-        loss=float(loss), eval_loss=eval_loss,
+        loss=float(loss.detach()), eval_loss=eval_loss,
         logits_shape=(list(logits_shape) if logits_shape is not None else None),
         logits_materialized=logits_shape is not None,
         grad_norm=grad_norm, seconds=round(elapsed, 4),
@@ -643,6 +643,7 @@ def check_model_reload(ctx: PreflightContext, *, base_loader=None,
     from . import adapters
     torch = _torch(ctx)
     base_loader = base_loader or adapters.load_base_model_and_tokenizer
+    production_attacher = adapter_attacher is None
     adapter_attacher = adapter_attacher or adapters.attach_lora_adapter
     device = ctx.scratch.get("device", "cuda")
     if ctx.model is None or ctx.tokenizer is None:
@@ -672,7 +673,14 @@ def check_model_reload(ctx: PreflightContext, *, base_loader=None,
                 model, tokenizer, report = base_loader(
                     ctx.config, local_files_only=ctx.local_files_only,
                     cache_dir=ctx.cache_dir, for_training=True)
-                model = adapter_attacher(model, directory)
+                if production_attacher:
+                    model = adapter_attacher(
+                        model, directory, is_trainable=True)
+                else:
+                    model = adapter_attacher(model, directory)
+                trainable_report = adapters.verify_lora_trainables(
+                    model.named_parameters(), ctx.config.lora)
+                report.update(trainable_report)
                 report["source_kind"] = "lora_adapter"
                 report["adapter_attached"] = "once"
                 report["adapter"] = str(directory)

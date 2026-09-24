@@ -8,6 +8,7 @@ and the adapter attachment refuses a second adapter. The pure helpers
 trips live in ``test_lora_integration.py``.
 """
 import sys
+import tempfile
 import types
 import unittest
 from unittest import mock
@@ -206,6 +207,24 @@ class BaseOnlyLoaderTests(unittest.TestCase):
         model.peft_config = {"default": object()}
         with self.assertRaisesRegex(DataError, "already carries a PEFT adapter"):
             adapters.attach_lora_adapter(model, "/tmp/does-not-matter")
+
+    def test_attach_can_request_a_trainable_saved_adapter(self):
+        calls = []
+
+        class FakePeftModel:
+            @classmethod
+            def from_pretrained(cls, model, directory, **kwargs):
+                calls.append((model, directory, kwargs))
+                return "attached"
+
+        peft = types.ModuleType("peft")
+        peft.PeftModel = FakePeftModel
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.dict(sys.modules, {"peft": peft}):
+                attached = adapters.attach_lora_adapter(
+                    FakeModel(), directory, is_trainable=True)
+        self.assertEqual(attached, "attached")
+        self.assertEqual(calls[0][2], {"is_trainable": True})
 
 
 class EvaluationBaseBranchTests(unittest.TestCase):
