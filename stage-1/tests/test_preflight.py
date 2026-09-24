@@ -4,6 +4,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tests import support
 
@@ -87,6 +88,24 @@ class OrchestrationTests(unittest.TestCase):
         report = preflight.run_preflight(context(), checks=(
             ("a", lambda ctx: ok(), ()),))
         self.assertFalse(report["started_training"])
+
+
+class DatasetIdentityTests(unittest.TestCase):
+    def test_cli_export_path_is_used_when_config_path_is_null(self):
+        ctx = context()
+        ctx.config.data.export_dir = None
+        ctx.export_dir = Path("/resolved/from-cli/export")
+        export = types.SimpleNamespace(
+            rows=98450, dataset_logical_sha256="1" * 64)
+
+        with mock.patch("stage1.data.verify_export", return_value=export) as verify:
+            result = preflight.check_dataset_identity(ctx)
+
+        self.assertEqual(result["status"], "pass")
+        verify.assert_called_once_with(
+            ctx.export_dir,
+            require_complete=ctx.config.data.require_complete_export,
+            quick=True)
 
     def test_specs_are_structurally_sound(self):
         names = [name for name, _, _ in preflight.CHECK_SPECS]

@@ -62,6 +62,7 @@ class PreflightContext:
     run_dir: Path
     identity: dict
     prepared: dict
+    export_dir: Path | None = None
     prepared_dir: Path | None = None
     tokenizer: object = None
     model: object = None
@@ -302,8 +303,11 @@ def check_dataset_identity(ctx: PreflightContext) -> dict:
     prepared = ctx.prepared
     if prepared["data_identity_sha256"] != ctx.identity["data"]["data_identity_sha256"]:
         return _fail("prepared data identity does not match the run identity")
+    export_dir = ctx.export_dir or ctx.config.data.export_dir
+    if export_dir is None:
+        return _fail("export_dir is not set; cannot verify dataset identity")
     export_info = data_module.verify_export(
-        ctx.config.data.export_dir, require_complete=ctx.config.data.require_complete_export,
+        export_dir, require_complete=ctx.config.data.require_complete_export,
         quick=True)
     if export_info.dataset_logical_sha256 != prepared["manifest"]["data_identity"][
             "dataset_logical_sha256"]:
@@ -366,9 +370,12 @@ def check_one_step(ctx: PreflightContext) -> dict:
     if ctx.model is None or ctx.tokenizer is None:
         return _fail("model or tokenizer not loaded")
     template = ctx.scratch.get("template")
+    export_dir = ctx.export_dir or ctx.config.data.export_dir
+    if export_dir is None:
+        return _fail("export_dir is not set; cannot load one-step rows")
     export_info = ctx.scratch.get("export_info") or data_module.verify_export(
-        ctx.config.data.export_dir,
-        require_complete=ctx.config.data.require_complete_export, quick=True)
+        export_dir, require_complete=ctx.config.data.require_complete_export,
+        quick=True)
     eligibility = ctx.scratch.get("eligibility")
     if eligibility is None:
         if ctx.prepared_dir is None:

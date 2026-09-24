@@ -81,7 +81,8 @@ def main(argv) -> int:
 
     context = preflight.PreflightContext(
         config=config, run_dir=paths.run_dir, identity=run_identity,
-        prepared=prepared, prepared_dir=paths.prepared_dir,
+        prepared=prepared, export_dir=paths.export_dir,
+        prepared_dir=paths.prepared_dir,
         tokenizer=tokenizer, local_files_only=args.local_files_only,
         cache_dir=args.cache_dir)
     context.scratch["template"] = template
