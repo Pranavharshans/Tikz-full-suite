@@ -85,6 +85,32 @@ def _source(config) -> str:
     return config.model.id
 
 
+def _cached_snapshot_source(config, *, cache_dir=None) -> str:
+    """Resolve the pinned Hub revision to an existing local snapshot.
+
+    Some Transformers/Unsloth combinations still issue a Hub metadata request
+    when given a repository id together with ``local_files_only=True``. Passing
+    the resolved snapshot directory makes the offline guarantee literal while
+    retaining the configured model id and revision in run identity.
+    """
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as exc:  # pragma: no cover - environment dependent
+        raise DataError(
+            "huggingface_hub is required to resolve a cached model snapshot") from exc
+    try:
+        return snapshot_download(
+            repo_id=config.model.id,
+            revision=config.model.revision,
+            cache_dir=str(cache_dir) if cache_dir else None,
+            local_files_only=True,
+        )
+    except Exception as exc:
+        raise DataError(
+            f"The pinned snapshot for {config.model.id}@{config.model.revision} "
+            f"is not complete in the local cache ({type(exc).__name__}: {exc})") from exc
+
+
 def _hub_kwargs(config, *, local_files_only: bool, cache_dir) -> dict:
     kwargs = {
         "trust_remote_code": config.model.trust_remote_code,
@@ -327,6 +353,9 @@ def load_model_and_tokenizer(config, *, local_files_only: bool = False,
     hub_kwargs = _hub_kwargs(config, local_files_only=local_files_only,
                              cache_dir=cache_dir)
     if source_override is not None:
+        hub_kwargs.pop("revision", None)
+    elif local_files_only and config.model.local_path is None:
+        source = _cached_snapshot_source(config, cache_dir=cache_dir)
         hub_kwargs.pop("revision", None)
 
     load_kwargs = dict(hub_kwargs)

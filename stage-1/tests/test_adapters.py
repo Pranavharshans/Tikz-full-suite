@@ -142,6 +142,32 @@ class BaseOnlyLoaderTests(unittest.TestCase):
         self.assertFalse(report["load_in_4bit"])
         self.assertFalse(report["load_in_8bit"])
 
+    def test_local_only_model_load_uses_resolved_snapshot_path(self):
+        hub = types.ModuleType("huggingface_hub")
+        calls = []
+
+        def snapshot_download(**kwargs):
+            calls.append(dict(kwargs))
+            return "/cache/pinned-snapshot"
+
+        hub.snapshot_download = snapshot_download
+        modules = dict(self.modules)
+        modules["huggingface_hub"] = hub
+        with mock.patch.dict(sys.modules, modules):
+            adapters.load_base_model_and_tokenizer(
+                self.config, local_files_only=True, cache_dir="/cache")
+
+        self.assertEqual(calls, [{
+            "repo_id": self.config.model.id,
+            "revision": self.config.model.revision,
+            "cache_dir": "/cache",
+            "local_files_only": True,
+        }])
+        load = self.loader.FastLanguageModel.load_calls[0]
+        self.assertEqual(load["model_name"], "/cache/pinned-snapshot")
+        self.assertNotIn("revision", load["kwargs"])
+        self.assertTrue(load["kwargs"]["local_files_only"])
+
     def test_lora_loader_creates_exactly_one_adapter(self):
         with mock.patch.dict(sys.modules, self.modules):
             model, tokenizer, report = adapters.load_model_and_tokenizer(
