@@ -52,3 +52,41 @@ Use the model-specific locked environment (`minicpm5-2b.lock` or
 full-parameter BF16 SFT and should only be scheduled after a separate memory
 probe on appropriate high-memory hardware; it never silently falls back to
 LoRA or quantization.
+
+## Validation status
+
+Last updated: 2026-09-25.
+
+| Model | Method | Gate | Hardware | Result | Evidence |
+| --- | --- | --- | --- | --- | --- |
+| `openbmb/MiniCPM5-2B` | LoRA BF16 | `overfit-100` | 1x NVIDIA A40 48 GB | **PASS** | Slurm exit `0:0`, 24m03s |
+| `openbmb/MiniCPM5-2B` | LoRA BF16 | `smoke-1000` | 1x NVIDIA A40 48 GB | **NEXT** | Must use a fresh run directory |
+| `openbmb/MiniCPM5-2B` | LoRA BF16 | `full` | 1x NVIDIA A40 48 GB | **BLOCKED** | Run only after the smoke gate passes |
+| `Qwen/Qwen3.5-4B` | LoRA BF16 | `overfit-100` | Not run | **PENDING** | Requires its own prepared tokenizer artifact and fresh run directory |
+| Both models | Full BF16 SFT | Any | Not run | **PENDING** | Requires a separate memory probe on suitable high-memory hardware |
+
+### MiniCPM overfit evidence
+
+Recorded evidence from `metrics.json`:
+
+- `passed: true`; every acceptance check passed.
+- 100 training examples, with the same 100 examples used for validation by
+  design for the memorization gate.
+- 21,493 prompt tokens and 60,059 supervised assistant tokens.
+- 1,153 overlength rows excluded using the prepared MiniCPM quarantine.
+- Evaluation loss: `0.0120343473` after 40 epochs.
+- Training runtime: `1,350.908` seconds; total Slurm elapsed time: `24m03s`.
+- Final LoRA adapter and tokenizer artifacts were complete.
+
+This validates the exact A40 model load, audited dataset adapter, MiniCPM chat
+template and tokenizer, assistant-only masking, forward/backward optimization,
+evaluation, and final adapter save path. It does not yet validate generalization
+or native checkpoint resume because this run started with no checkpoint.
+
+## Next gate
+
+Run `smoke-1000` from the base model in a fresh run directory. Do not initialize
+it from the overfit adapter. Accept it only when Slurm exits `0:0`,
+`metrics.json` reports `passed: true`, evaluation loss is finite, and the final
+adapter artifact is complete. After that, perform one native checkpoint-resume
+drill before authorizing the full 96K-example training run.
