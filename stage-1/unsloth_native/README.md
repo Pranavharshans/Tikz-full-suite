@@ -44,8 +44,11 @@ python stage-1/unsloth_native/train_qwen.py \
 ```
 
 `--resume auto` is the default and uses Trainer's newest native checkpoint in
-that run directory. Use `--resume none` for a deliberate clean start. Gates do
-not chain automatically; use a separate run directory for each gate/method.
+that run directory. An explicit checkpoint from another native run is accepted
+only when its recorded model, configuration, gate, dataset and tokenizer
+identity exactly match the new run. Use `--resume none` for a deliberate clean
+start. Gates do not chain automatically; use a separate run directory for each
+gate/method.
 
 Use the model-specific locked environment (`minicpm5-2b.lock` or
 `qwen3.5-4b.lock`). LoRA is the recommended A40 path. `--method full` requests

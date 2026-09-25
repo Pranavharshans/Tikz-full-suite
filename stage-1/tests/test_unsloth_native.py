@@ -96,13 +96,29 @@ class NativeIdentityTests(unittest.TestCase):
             runner._resume_checkpoint(Path("/tmp/run"), "/definitely/missing")
         self.assertIsNone(runner._resume_checkpoint(Path("/tmp/run"), "none"))
 
-    def test_resume_is_confined_to_the_identified_run(self):
+    def test_resume_refuses_a_foreign_identity(self):
         with tempfile.TemporaryDirectory() as directory:
             run = Path(directory) / "run"
-            foreign = Path(directory) / "foreign" / "checkpoint-1"
+            foreign_root = Path(directory) / "foreign"
+            foreign = foreign_root / "checkpoints" / "checkpoint-1"
             foreign.mkdir(parents=True)
-            with self.assertRaisesRegex(DataError, "must belong"):
-                runner._resume_checkpoint(run, str(foreign))
+            (foreign_root / "native-run.json").write_text(
+                json.dumps(dict(self.identity(), gate="full")))
+            with self.assertRaisesRegex(DataError, "identity does not match"):
+                runner._resume_checkpoint(
+                    run, str(foreign), identity=self.identity())
+
+    def test_resume_allows_a_matching_external_native_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory) / "resume-drill"
+            source = Path(directory) / "smoke"
+            checkpoint = source / "checkpoints" / "checkpoint-50"
+            checkpoint.mkdir(parents=True)
+            (source / "native-run.json").write_text(json.dumps(self.identity()))
+            self.assertEqual(
+                runner._resume_checkpoint(
+                    run, str(checkpoint), identity=self.identity()),
+                str(checkpoint.resolve()))
 
     def test_clean_start_refuses_existing_checkpoints(self):
         with tempfile.TemporaryDirectory() as directory:

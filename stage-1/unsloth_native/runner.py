@@ -86,7 +86,7 @@ def _sft_arguments(SFTConfig, config, gate, run_dir: Path, *, has_eval: bool):
     return SFTConfig(**values)
 
 
-def _resume_checkpoint(run_dir: Path, request: str | None):
+def _resume_checkpoint(run_dir: Path, request: str | None, *, identity=None):
     checkpoint_root = (run_dir / "checkpoints").resolve()
     existing = sorted(checkpoint_root.glob("checkpoint-*")) \
         if checkpoint_root.is_dir() else []
@@ -100,9 +100,30 @@ def _resume_checkpoint(run_dir: Path, request: str | None):
         path = Path(request).resolve()
         if not path.is_dir():
             raise DataError(f"Resume checkpoint does not exist: {path}")
+        if path.parent.name != "checkpoints" or not path.name.startswith("checkpoint-"):
+            raise DataError(f"Not a native Trainer checkpoint directory: {path}")
+        try:
+            int(path.name.removeprefix("checkpoint-"))
+        except ValueError as exc:
+            raise DataError(f"Invalid native checkpoint step in {path.name!r}") from exc
         if path.parent != checkpoint_root:
-            raise DataError(
-                f"Resume checkpoint must belong to this native run: {checkpoint_root}")
+            if identity is None:
+                raise DataError(
+                    "An external native checkpoint requires the current run identity")
+            source_identity_path = path.parent.parent / "native-run.json"
+            if not source_identity_path.is_file():
+                raise DataError(
+                    f"External checkpoint has no native run identity: {path}")
+            try:
+                source_identity = json.loads(source_identity_path.read_text())
+            except (OSError, json.JSONDecodeError) as exc:
+                raise DataError(
+                    f"Cannot read external checkpoint identity at "
+                    f"{source_identity_path}: {exc}") from exc
+            if source_identity != identity:
+                raise DataError(
+                    "External checkpoint identity does not match the current "
+                    "model, config, gate, dataset and tokenizer")
         return str(path)
     try:
         from transformers.trainer_utils import get_last_checkpoint
@@ -169,7 +190,8 @@ def run_native(model_key: str, *, config_path, expected_method: str, export, pre
     elif "tokenizer" in trainer_parameters:
         trainer_kwargs["tokenizer"] = tokenizer
     trainer = SFTTrainer(**trainer_kwargs)
-    checkpoint = _resume_checkpoint(paths.run_dir, resume)
+    checkpoint = _resume_checkpoint(
+        paths.run_dir, resume, identity=identity)
     progress(f"native training gate={gate.name}, resume={checkpoint or 'none'}")
     result = trainer.train(resume_from_checkpoint=checkpoint)
 
