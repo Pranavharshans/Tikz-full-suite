@@ -64,8 +64,8 @@ Last updated: 2026-09-25.
 | --- | --- | --- | --- | --- | --- |
 | `openbmb/MiniCPM5-2B` | LoRA BF16 | `overfit-100` | 1x NVIDIA A40 48 GB | **PASS** | Slurm exit `0:0`, 24m03s |
 | `openbmb/MiniCPM5-2B` | LoRA BF16 | `smoke-1000` | 1x NVIDIA A40 48 GB | **PASS** | Slurm exit `0:0`, 12m39s |
-| `openbmb/MiniCPM5-2B` | LoRA BF16 | native resume drill | 1x NVIDIA A40 48 GB | **NEXT** | Resume from a native smoke checkpoint |
-| `openbmb/MiniCPM5-2B` | LoRA BF16 | `full` | 1x NVIDIA A40 48 GB | **BLOCKED** | Run only after the resume drill passes |
+| `openbmb/MiniCPM5-2B` | LoRA BF16 | native resume drill | 1x NVIDIA A40 48 GB | **PASS** | Resumed step 50 and completed step 63 |
+| `openbmb/MiniCPM5-2B` | LoRA BF16 | `full` | 1x NVIDIA A40 48 GB | **NEXT** | Cleared for the full prepared train split |
 | `Qwen/Qwen3.5-4B` | LoRA BF16 | `overfit-100` | Not run | **PENDING** | Requires its own prepared tokenizer artifact and fresh run directory |
 | Both models | Full BF16 SFT | Any | Not run | **PENDING** | Requires a separate memory probe on suitable high-memory hardware |
 
@@ -105,8 +105,18 @@ first selected row and is not evidence of split overlap. Dataset construction
 separately checks that every emitted row ID exactly matches the selected IDs for
 the requested split.
 
+### MiniCPM resume evidence
+
+The native resume drill loaded the smoke run's step-50 checkpoint into a fresh,
+identity-matched run. It restored the native Trainer state, optimizer, scheduler
+and adapter, continued through step 63, reached epoch 1.0, evaluated all 500
+validation examples and wrote a complete final artifact. The training
+continuation took `82.2381` seconds. This also exercised the cached Arrow dataset
+reuse path used by repeated and resumed runs.
+
 ## Next gate
 
-Perform one bounded native checkpoint-resume drill and prove that optimizer,
-scheduler, trainer state and adapter weights continue from a native checkpoint.
-Do not start the full 96K-example training run until that drill passes.
+Run one epoch of MiniCPM LoRA SFT on the complete eligible prepared training
+split. Keep native checkpointing enabled and use `--resume auto` so a Slurm
+interruption can continue in the same run directory. Do not initialize this run
+from either the overfit or smoke adapter.
