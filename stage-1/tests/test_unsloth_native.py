@@ -42,6 +42,18 @@ class NativeCliTests(unittest.TestCase):
 
 
 class NativeIdentityTests(unittest.TestCase):
+    def test_raw_gate_overrides_are_resolved_to_typed_gate(self):
+        typed = types.SimpleNamespace(name="overfit-100", max_rows=100)
+        config = types.SimpleNamespace(
+            gates={"overfit-100": {"max_rows": 100}},
+            gate=lambda name: typed if name == "overfit-100" else None)
+        self.assertIs(runner._resolve_gate(config, "overfit-100"), typed)
+
+    def test_missing_gate_is_refused_before_resolution(self):
+        config = types.SimpleNamespace(gates={}, gate=lambda name: None)
+        with self.assertRaisesRegex(DataError, "has no gate"):
+            runner._resolve_gate(config, "overfit-100")
+
     def identity(self):
         config = types.SimpleNamespace(
             model=types.SimpleNamespace(id="test/model", revision="a" * 40,

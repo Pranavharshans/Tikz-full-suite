@@ -39,6 +39,13 @@ def adapters_fingerprint_core(fingerprint):
     return fingerprint_core(fingerprint)
 
 
+def _resolve_gate(config, gate_name: str):
+    """Resolve raw YAML gate overrides into the typed Stage 1 gate config."""
+    if gate_name not in config.gates:
+        raise DataError(f"Config has no gate {gate_name!r}")
+    return config.gate(gate_name)
+
+
 def _ensure_identity(run_dir: Path, identity: dict) -> None:
     path = run_dir / "native-run.json"
     if path.is_file():
@@ -125,9 +132,7 @@ def run_native(model_key: str, *, config_path, expected_method: str, export, pre
         raise DataError(
             f"--method {expected_method!r} does not match config training.method "
             f"{config.training.method!r}")
-    if gate_name not in config.gates:
-        raise DataError(f"Config has no gate {gate_name!r}")
-    gate = config.gates[gate_name]
+    gate = _resolve_gate(config, gate_name)
     paths = config_module.resolve_run_paths(
         config, export=export, prepared=prepared, run_dir=run_dir)
     paths.validate_inputs()
