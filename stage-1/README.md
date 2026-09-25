@@ -1,5 +1,10 @@
 # Stage 1: supervised fine-tuning
 
+> A smaller native Unsloth + TRL path is available in
+> [`unsloth_native/`](unsloth_native/README.md). It reuses this stage's audited
+> preparation and assistant-only labels while delegating checkpoints and resume
+> to `SFTTrainer`. The original governed trainer below remains available.
+
 BF16 supervised fine-tuning for text-to-TikZ generation, trained with Unsloth
 on one NVIDIA RTX PRO 6000 Blackwell (96 GB). Two models share one training
 implementation and differ only by configuration:
