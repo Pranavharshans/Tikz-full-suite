@@ -45,6 +45,62 @@ FAKE_TRANSFORMERS = types.SimpleNamespace(Trainer=FakeTrainerBase,
                                           TrainerCallback=FakeTrainerCallback)
 
 
+class CachedDatasetStatsTests(unittest.TestCase):
+    def test_reconstructs_assistant_only_counts_from_cached_columns(self):
+        dataset = {
+            "input_ids": [[1, 2, 3, 4], [5, 6, 7]],
+            "labels": [[-100, -100, 3, 4], [-100, 6, 7]],
+        }
+        self.assertEqual(train.tokenized_dataset_stats(dataset), {
+            "examples": 2,
+            "prompt_tokens": 3,
+            "supervised_tokens": 4,
+            "total_tokens": 7,
+        })
+
+    def test_refuses_cached_rows_with_misaligned_labels(self):
+        dataset = {"input_ids": [[1, 2]], "labels": [[-100]]}
+        with self.assertRaisesRegex(DataError, "input tokens.*labels"):
+            train.tokenized_dataset_stats(dataset)
+
+    def test_build_accepts_valid_cached_generator_result(self):
+        class CachedDataset:
+            columns = {
+                "row_id": ["row-a"],
+                "input_ids": [[10, 11, 12]],
+                "labels": [[-100, 11, 12]],
+            }
+
+            def __len__(self):
+                return 1
+
+            def __getitem__(self, key):
+                return self.columns[key]
+
+        fake_datasets = types.SimpleNamespace(
+            Dataset=types.SimpleNamespace(
+                from_generator=lambda *args, **kwargs: CachedDataset()),
+            Features=lambda value: value,
+            Sequence=lambda value: value,
+            Value=lambda value: value,
+        )
+        config = types.SimpleNamespace(
+            tokenizer=types.SimpleNamespace(chat_template_kwargs={}),
+            data=types.SimpleNamespace(max_seq_len=32))
+        export = types.SimpleNamespace(root="/export")
+        with mock.patch.dict(sys.modules, {"datasets": fake_datasets}), \
+                mock.patch.object(
+                    train.data, "select_split_ids", return_value=["row-a"]):
+            dataset, stats = train.build_tokenized_dataset(
+                config, object(), "template", export, {}, "train",
+                {"quarantined": []}, limit=1)
+        self.assertEqual(dataset["row_id"], ["row-a"])
+        self.assertTrue(stats["cache_reused"])
+        self.assertEqual(stats["examples"], 1)
+        self.assertEqual(stats["prompt_tokens"], 1)
+        self.assertEqual(stats["supervised_tokens"], 2)
+
+
 def monitor(**overrides):
     values = dict(planned_per_epoch=100, epochs=1,
                   gradient_accumulation_steps=2, check_gradients=True)

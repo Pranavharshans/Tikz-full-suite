@@ -425,7 +425,8 @@ def build_tokenized_dataset(config, tokenizer, template, export_info, manifest,
     if len(wanted) != len(ids):
         raise DataError("Eligible id selection contains duplicates")
     stats = {"examples": 0, "prompt_tokens": 0, "supervised_tokens": 0,
-             "total_tokens": 0, "streamed_rows": 0, "first_export_id": None}
+             "total_tokens": 0, "streamed_rows": 0, "first_export_id": None,
+             "cache_reused": False}
 
     def generate():
         for row in data.iter_rows(export_info, columns="text"):
@@ -459,6 +460,17 @@ def build_tokenized_dataset(config, tokenizer, template, export_info, manifest,
         "row_id": Value("string"),
     })
     dataset = Dataset.from_generator(generate, features=features)
+    emitted_ids = dataset["row_id"]
+    # datasets.Dataset.from_generator caches its Arrow result. On an exact
+    # repeat (notably a checkpoint-resume run), it can return that cached
+    # dataset without executing ``generate`` again, leaving the closure-based
+    # counters at zero. Validate the cached row IDs first, then reconstruct the
+    # token accounting from the immutable input_ids/labels columns.
+    if stats["examples"] == 0 and len(dataset) > 0:
+        check_emitted_ids(wanted, emitted_ids, quarantined)
+        cached = tokenized_dataset_stats(dataset)
+        stats.update(cached)
+        stats["cache_reused"] = True
     if stats["examples"] != len(ids):
         raise DataError(
             f"Tokenized {stats['examples']} rows but selected {len(ids)}; "
@@ -467,10 +479,34 @@ def build_tokenized_dataset(config, tokenizer, template, export_info, manifest,
             f"{stats['first_export_id']!r}, first selected id "
             f"{sorted(ids)[0]!r}); refusing to train on an incomplete dataset. "
             "The export does not match the prepared split manifest.")
-    check_emitted_ids(wanted, dataset["row_id"], quarantined)
+    check_emitted_ids(wanted, emitted_ids, quarantined)
     stats["eligible_selected"] = len(ids)
     stats["quarantined_excluded"] = len(quarantined)
     return dataset, stats
+
+
+def tokenized_dataset_stats(dataset) -> dict:
+    """Reconstruct assistant-only token counts from a cached Arrow dataset."""
+    input_ids = dataset["input_ids"]
+    labels = dataset["labels"]
+    if len(input_ids) != len(labels):
+        raise DataError(
+            "Cached tokenized dataset has different input and label counts")
+    total_tokens = 0
+    supervised_tokens = 0
+    for index, (tokens, row_labels) in enumerate(zip(input_ids, labels)):
+        if len(tokens) != len(row_labels):
+            raise DataError(
+                f"Cached tokenized row {index} has {len(tokens)} input tokens "
+                f"but {len(row_labels)} labels")
+        total_tokens += len(tokens)
+        supervised_tokens += sum(label != -100 for label in row_labels)
+    return {
+        "examples": len(input_ids),
+        "prompt_tokens": total_tokens - supervised_tokens,
+        "supervised_tokens": supervised_tokens,
+        "total_tokens": total_tokens,
+    }
 
 
 # ---------------------------------------------------------------------------
