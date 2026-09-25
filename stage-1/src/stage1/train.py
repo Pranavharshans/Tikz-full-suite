@@ -425,10 +425,13 @@ def build_tokenized_dataset(config, tokenizer, template, export_info, manifest,
     if len(wanted) != len(ids):
         raise DataError("Eligible id selection contains duplicates")
     stats = {"examples": 0, "prompt_tokens": 0, "supervised_tokens": 0,
-             "total_tokens": 0}
+             "total_tokens": 0, "streamed_rows": 0, "first_export_id": None}
 
     def generate():
         for row in data.iter_rows(export_info, columns="text"):
+            stats["streamed_rows"] += 1
+            if stats["first_export_id"] is None:
+                stats["first_export_id"] = row["id"]
             if row["id"] not in wanted:
                 continue
             example = format_example(
@@ -459,7 +462,11 @@ def build_tokenized_dataset(config, tokenizer, template, export_info, manifest,
     if stats["examples"] != len(ids):
         raise DataError(
             f"Tokenized {stats['examples']} rows but selected {len(ids)}; "
-            "refusing to train on an incomplete dataset")
+            f"streamed {stats['streamed_rows']} export row(s) from "
+            f"{export_info.root} (first export id "
+            f"{stats['first_export_id']!r}, first selected id "
+            f"{sorted(ids)[0]!r}); refusing to train on an incomplete dataset. "
+            "The export does not match the prepared split manifest.")
     check_emitted_ids(wanted, dataset["row_id"], quarantined)
     stats["eligible_selected"] = len(ids)
     stats["quarantined_excluded"] = len(quarantined)
@@ -789,6 +796,24 @@ def gate_outcome(gate, metrics: dict) -> tuple:
 # ---------------------------------------------------------------------------
 
 
+def check_export_identity(export_info, prepared) -> None:
+    """Refuse an export that does not match the prepared split manifest.
+
+    The export path is not part of the run identity (only the prepared
+    manifest's data identity is), so a rerun pointed at a different export
+    would otherwise pass ``verify_export`` — which only checks the export
+    against its own checksums — and fail much later during tokenization with a
+    confusing "Tokenized 0 rows".
+    """
+    expected = prepared["manifest"]["data_identity"]["dataset_logical_sha256"]
+    if export_info.dataset_logical_sha256 != expected:
+        raise DataError(
+            f"Export {export_info.root} has dataset_logical_sha256 "
+            f"{export_info.dataset_logical_sha256}, but the prepared manifest "
+            f"was built from {expected}. Pass the export this prepared "
+            "directory was prepared from (--export).")
+
+
 def run_training(config, paths, gate_name: str, *, local_files_only: bool = False,
                  cache_dir=None, allow_rerun: bool = False, progress=None) -> dict:
     """Execute one gate. Refuses identity mismatches and missing prerequisites."""
@@ -810,13 +835,14 @@ def run_training(config, paths, gate_name: str, *, local_files_only: bool = Fals
     from . import adapters, collator, formatting
 
     gate = config.gate(gate_name)
-    say(f"gate {gate_name}: verifying prepared data")
+    say(f"gate {gate_name}: export {paths.export_dir}, prepared {paths.prepared_dir}")
     prepared = data.verify_prepared(paths.prepared_dir,
                                     adapter_slug=config.model.adapter)
     eligibility = data.load_eligibility(paths.prepared_dir, config.model.adapter)
     export_info = data.verify_export(
         paths.export_dir, require_complete=config.data.require_complete_export,
         quick=False)
+    check_export_identity(export_info, prepared)
 
     say("loading tokenizer and checking its fingerprint")
     tokenizer = adapters.load_tokenizer(

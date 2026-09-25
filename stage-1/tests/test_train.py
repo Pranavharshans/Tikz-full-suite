@@ -337,6 +337,24 @@ class EmissionGuardTests(unittest.TestCase):
             train.check_emitted_ids({"a"}, ["a"], {"a"})
 
 
+class ExportIdentityTests(unittest.TestCase):
+    """Training refuses an export that does not match the prepared manifest."""
+
+    def prepared(self, logical):
+        return {"manifest": {"data_identity": {"dataset_logical_sha256": logical}}}
+
+    def test_matching_export_is_accepted(self):
+        export = types.SimpleNamespace(
+            root="/exports/right", dataset_logical_sha256="a" * 64)
+        train.check_export_identity(export, self.prepared("a" * 64))
+
+    def test_mismatched_export_is_refused_with_both_hashes(self):
+        export = types.SimpleNamespace(
+            root="/exports/wrong", dataset_logical_sha256="b" * 64)
+        with self.assertRaisesRegex(DataError, "was built from"):
+            train.check_export_identity(export, self.prepared("a" * 64))
+
+
 class ScheduleBoundsTests(unittest.TestCase):
     def bounds(self, **overrides):
         values = dict(examples=1000, per_device_batch_size=2,
