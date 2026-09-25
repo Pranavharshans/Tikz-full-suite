@@ -60,8 +60,9 @@ Last updated: 2026-09-25.
 | Model | Method | Gate | Hardware | Result | Evidence |
 | --- | --- | --- | --- | --- | --- |
 | `openbmb/MiniCPM5-2B` | LoRA BF16 | `overfit-100` | 1x NVIDIA A40 48 GB | **PASS** | Slurm exit `0:0`, 24m03s |
-| `openbmb/MiniCPM5-2B` | LoRA BF16 | `smoke-1000` | 1x NVIDIA A40 48 GB | **NEXT** | Must use a fresh run directory |
-| `openbmb/MiniCPM5-2B` | LoRA BF16 | `full` | 1x NVIDIA A40 48 GB | **BLOCKED** | Run only after the smoke gate passes |
+| `openbmb/MiniCPM5-2B` | LoRA BF16 | `smoke-1000` | 1x NVIDIA A40 48 GB | **PASS** | Slurm exit `0:0`, 12m39s |
+| `openbmb/MiniCPM5-2B` | LoRA BF16 | native resume drill | 1x NVIDIA A40 48 GB | **NEXT** | Resume from a native smoke checkpoint |
+| `openbmb/MiniCPM5-2B` | LoRA BF16 | `full` | 1x NVIDIA A40 48 GB | **BLOCKED** | Run only after the resume drill passes |
 | `Qwen/Qwen3.5-4B` | LoRA BF16 | `overfit-100` | Not run | **PENDING** | Requires its own prepared tokenizer artifact and fresh run directory |
 | Both models | Full BF16 SFT | Any | Not run | **PENDING** | Requires a separate memory probe on suitable high-memory hardware |
 
@@ -83,10 +84,26 @@ template and tokenizer, assistant-only masking, forward/backward optimization,
 evaluation, and final adapter save path. It does not yet validate generalization
 or native checkpoint resume because this run started with no checkpoint.
 
+### MiniCPM smoke evidence
+
+The independent `smoke-1000` gate also completed successfully:
+
+- `passed: true`; every smoke acceptance check passed.
+- 1,000 training examples and 500 held-out validation examples.
+- 586,270 supervised training tokens and 315,045 supervised validation tokens.
+- Final evaluation loss: `0.7318511605` after one epoch.
+- Training runtime: `463.0896` seconds; total Slurm elapsed time: `12m39s`.
+- Native checkpoints were written at steps 25, 50 and 63.
+- The final LoRA adapter and tokenizer artifacts were complete.
+
+The `first_export_id` statistic is the first row encountered while streaming the
+whole export, so it is expected to match between dataset builds. It is not the
+first selected row and is not evidence of split overlap. Dataset construction
+separately checks that every emitted row ID exactly matches the selected IDs for
+the requested split.
+
 ## Next gate
 
-Run `smoke-1000` from the base model in a fresh run directory. Do not initialize
-it from the overfit adapter. Accept it only when Slurm exits `0:0`,
-`metrics.json` reports `passed: true`, evaluation loss is finite, and the final
-adapter artifact is complete. After that, perform one native checkpoint-resume
-drill before authorizing the full 96K-example training run.
+Perform one bounded native checkpoint-resume drill and prove that optimizer,
+scheduler, trainer state and adapter weights continue from a native checkpoint.
+Do not start the full 96K-example training run until that drill passes.
