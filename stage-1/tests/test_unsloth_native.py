@@ -42,6 +42,13 @@ class NativeCliTests(unittest.TestCase):
 
 
 class NativeIdentityTests(unittest.TestCase):
+    def test_full_epoch_acceptance_requires_the_configured_epoch(self):
+        gate = types.SimpleNamespace(epochs=1.0)
+        self.assertFalse(runner._epoch_completed(
+            types.SimpleNamespace(epoch=0.999), gate))
+        self.assertTrue(runner._epoch_completed(
+            types.SimpleNamespace(epoch=1.0), gate))
+
     def test_raw_gate_overrides_are_resolved_to_typed_gate(self):
         typed = types.SimpleNamespace(name="overfit-100", max_rows=100)
         config = types.SimpleNamespace(

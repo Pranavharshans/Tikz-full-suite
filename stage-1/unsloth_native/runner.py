@@ -46,6 +46,12 @@ def _resolve_gate(config, gate_name: str):
     return config.gate(gate_name)
 
 
+def _epoch_completed(state, gate) -> bool:
+    epoch = getattr(state, "epoch", None)
+    return (epoch is not None and math.isfinite(float(epoch))
+            and float(epoch) + 1e-6 >= float(gate.epochs))
+
+
 def _ensure_identity(run_dir: Path, identity: dict) -> None:
     path = run_dir / "native-run.json"
     if path.is_file():
@@ -228,6 +234,9 @@ def run_native(model_key: str, *, config_path, expected_method: str, export, pre
         reduction_ok = (gate.min_loss_reduction is not None and reduction is not None
                         and reduction >= gate.min_loss_reduction)
         acceptance["overfit_loss_target"] = threshold_ok or reduction_ok
+    if gate.name == "full":
+        acceptance["full_epoch_completed"] = _epoch_completed(
+            trainer.state, gate)
     passed = all(acceptance.values())
     metrics = {
         "schema_version": NATIVE_SCHEMA_VERSION,
