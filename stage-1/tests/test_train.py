@@ -355,6 +355,49 @@ class ExportIdentityTests(unittest.TestCase):
             train.check_export_identity(export, self.prepared("a" * 64))
 
 
+class GateCheckpointVerifyTests(unittest.TestCase):
+    """Gate verification accepts Unsloth's lazy logits (shape=None)."""
+
+    class LazyLogitsModel:
+        def __init__(self, shape=None):
+            self.shape = shape
+
+        def eval(self):
+            return self
+
+        def __call__(self, **batch):
+            return types.SimpleNamespace(
+                loss=0.5, logits=types.SimpleNamespace(shape=(
+                    (lambda: None) if self.shape is None else self.shape)))
+
+    def verify(self, model):
+        from unittest import mock
+        batch_plan = collator.pad_batch(
+            [{"input_ids": [1, 2, 3], "labels": [-100, 2, 3]}], pad_token_id=0)
+        with mock.patch.object(train.checkpointing, "verify_checkpoint",
+                               return_value={"global_step": 7}), \
+                mock.patch.object(train, "load_artifact_weights",
+                                  return_value={"tensors": 3}), \
+                mock.patch.object(train.checkpointing, "verify_resume_state",
+                                  return_value={"verified": True}):
+            return train.verify_gate_checkpoint(
+                Path("/tmp/does-not-matter"), identity_sha256="a" * 64,
+                gate="overfit-100", config=support.make_config(), model=model,
+                torch=FakeTorch, batch_plan=batch_plan, num_training_steps=10,
+                num_warmup_steps=2, method="lora", device="cpu")
+
+    def test_lazy_logits_are_recorded_as_not_materialized(self):
+        report = self.verify(self.LazyLogitsModel())
+        self.assertIsNone(report["logits_shape"])
+        self.assertFalse(report["logits_materialized"])
+        self.assertTrue(report["reload_verified"])
+
+    def test_materialized_logits_shape_is_recorded(self):
+        report = self.verify(self.LazyLogitsModel(shape=(2, 4)))
+        self.assertEqual(report["logits_shape"], [2, 4])
+        self.assertTrue(report["logits_materialized"])
+
+
 class ScheduleBoundsTests(unittest.TestCase):
     def bounds(self, **overrides):
         values = dict(examples=1000, per_device_batch_size=2,
