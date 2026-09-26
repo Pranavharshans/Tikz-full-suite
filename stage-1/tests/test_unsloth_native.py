@@ -26,6 +26,19 @@ class NativeRegistryTests(unittest.TestCase):
         with self.assertRaisesRegex(DataError, "Unknown native model"):
             models.get_spec("missing")
 
+    def test_text_tokenizer_accepts_a_tokenizer_directly(self):
+        tokenizer = types.SimpleNamespace(__len__=lambda self: 42)
+        self.assertIs(models._text_tokenizer(tokenizer), tokenizer)
+
+    def test_text_tokenizer_unwraps_a_vision_processor(self):
+        tokenizer = object()
+        processor = types.SimpleNamespace(tokenizer=tokenizer)
+        self.assertIs(models._text_tokenizer(processor), tokenizer)
+
+    def test_text_tokenizer_refuses_an_unknown_loader_result(self):
+        with self.assertRaisesRegex(DataError, "neither a tokenizer nor a processor"):
+            models._text_tokenizer(object())
+
 
 class NativeCliTests(unittest.TestCase):
     def test_model_cli_defaults_to_lora_and_native_resume(self):

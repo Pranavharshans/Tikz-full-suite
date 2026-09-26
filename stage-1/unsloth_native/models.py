@@ -76,6 +76,24 @@ def _source(config, *, local_files_only: bool, cache_dir):
     return snapshot, False
 
 
+def _text_tokenizer(tokenizer_or_processor):
+    """Return the tokenizer used by the native text-only training path.
+
+    FastVisionModel returns a multimodal processor for Qwen vision checkpoints,
+    whereas FastLanguageModel returns a tokenizer directly.  Stage 1 trains
+    pretokenized text only, so all identity, collation, and Trainer operations
+    must consistently use the processor's underlying tokenizer.
+    """
+    tokenizer = getattr(tokenizer_or_processor, "tokenizer", None)
+    if tokenizer is not None:
+        return tokenizer
+    if not hasattr(tokenizer_or_processor, "__len__"):
+        raise DataError(
+            "Native model loader returned neither a tokenizer nor a processor "
+            "with a tokenizer")
+    return tokenizer_or_processor
+
+
 def load_native_model(spec: NativeModelSpec, config, prepared_model: dict, *,
                       local_files_only: bool, cache_dir=None):
     """Load the exact base and apply either native LoRA or full SFT mode."""
@@ -107,11 +125,13 @@ def load_native_model(spec: NativeModelSpec, config, prepared_model: dict, *,
     if config.training.method == "full":
         load_kwargs["full_finetuning"] = True
     try:
-        model, tokenizer = Loader.from_pretrained(**load_kwargs)
+        model, tokenizer_or_processor = Loader.from_pretrained(**load_kwargs)
     except Exception as exc:
         raise DataError(
             f"Native {spec.loader_name} load failed for {config.model.id}@"
             f"{config.model.revision}: {type(exc).__name__}: {exc}") from exc
+
+    tokenizer = _text_tokenizer(tokenizer_or_processor)
 
     if config.tokenizer.pad_token:
         tokenizer.pad_token = config.tokenizer.pad_token
