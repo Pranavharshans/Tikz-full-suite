@@ -55,6 +55,61 @@ class NativeCliTests(unittest.TestCase):
 
 
 class NativeIdentityTests(unittest.TestCase):
+    def test_sft_arguments_allows_transformers_five_without_overwrite_flag(self):
+        captured = {}
+
+        def fake_sft_config(output_dir, do_train, do_eval, eval_strategy,
+                            eval_steps, save_strategy, save_steps,
+                            save_total_limit, logging_steps, logging_first_step,
+                            learning_rate, lr_scheduler_type, warmup_ratio,
+                            max_grad_norm, num_train_epochs, max_steps,
+                            per_device_train_batch_size,
+                            per_device_eval_batch_size,
+                            gradient_accumulation_steps, optim, bf16,
+                            bf16_full_eval, gradient_checkpointing,
+                            gradient_checkpointing_kwargs, seed, data_seed,
+                            report_to, run_name,
+                            include_num_input_tokens_seen,
+                            dataloader_num_workers, remove_unused_columns,
+                            label_names, packing, dataset_kwargs, max_length,
+                            assistant_only_loss):
+            captured.update(locals())
+            return captured
+
+        config = types.SimpleNamespace(
+            model=types.SimpleNamespace(adapter="qwen3.5"),
+            data=types.SimpleNamespace(max_seq_len=8192),
+        )
+        gate = types.SimpleNamespace(name="overfit-100")
+        values = {
+            "output_dir": "/old", "overwrite_output_dir": False,
+            "do_train": True, "do_eval": True, "eval_strategy": "steps",
+            "eval_steps": 5, "save_strategy": "steps", "save_steps": 5,
+            "save_total_limit": 2, "logging_steps": 1,
+            "logging_first_step": True, "learning_rate": 1e-4,
+            "lr_scheduler_type": "cosine", "warmup_ratio": 0.03,
+            "max_grad_norm": 1.0, "num_train_epochs": 1,
+            "max_steps": -1, "per_device_train_batch_size": 2,
+            "per_device_eval_batch_size": 2,
+            "gradient_accumulation_steps": 8, "optim": "adamw_torch_fused",
+            "bf16": True, "bf16_full_eval": True,
+            "gradient_checkpointing": True,
+            "gradient_checkpointing_kwargs": {"use_reentrant": False},
+            "seed": 3407, "data_seed": 3407, "report_to": [],
+            "run_name": "native", "include_num_input_tokens_seen": True,
+            "dataloader_num_workers": 0, "remove_unused_columns": False,
+            "label_names": ["labels"],
+        }
+        original = runner.config_module.training_arguments_kwargs
+        runner.config_module.training_arguments_kwargs = lambda *a, **k: dict(values)
+        try:
+            result = runner._sft_arguments(
+                fake_sft_config, config, gate, Path("/run"), has_eval=True)
+        finally:
+            runner.config_module.training_arguments_kwargs = original
+        self.assertNotIn("overwrite_output_dir", result)
+        self.assertEqual(result["output_dir"], "/run/checkpoints")
+
     def test_full_epoch_acceptance_requires_the_configured_epoch(self):
         gate = types.SimpleNamespace(epochs=1.0)
         self.assertFalse(runner._epoch_completed(

@@ -84,6 +84,14 @@ def _sft_arguments(SFTConfig, config, gate, run_dir: Path, *, has_eval: bool):
     values[length_key] = config.data.max_seq_len
     if "assistant_only_loss" in parameters:
         values["assistant_only_loss"] = False
+    # Transformers 5 removed overwrite_output_dir.  Stage 1 already enforces
+    # run identity and explicit native resume before Trainer construction, so
+    # dropping the old false-valued safeguard preserves the same behavior.
+    if "overwrite_output_dir" not in parameters:
+        if values.get("overwrite_output_dir") is not False:
+            raise DataError(
+                "Installed TRL SFTConfig cannot enforce overwrite_output_dir")
+        values.pop("overwrite_output_dir", None)
     unsupported = sorted(set(values) - set(parameters))
     for key in unsupported:
         # Refuse version drift instead of silently losing an optimization,
