@@ -12,3 +12,7 @@ configuration, launcher, and tokenizer handling are documented in the
 
 The Ling integration has passed code and tokenizer validation. Its GPU gates
 and full training run are still pending.
+
+To train Ling, first prepare a Ling-specific tokenizer dataset, then complete
+the `overfit-100` and `smoke-1000` GPU gates described in the
+[September 27 integration record](stage-1/results/2026-09-27-ling3-tiny-integration.md).
