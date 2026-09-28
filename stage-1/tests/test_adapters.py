@@ -37,6 +37,38 @@ TARGETS = ("q_proj", "k_proj", "v_proj", "o_proj",
            "gate_proj", "up_proj", "down_proj")
 
 
+class TokenizerLoadingTests(unittest.TestCase):
+    def test_offline_hub_tokenizer_uses_resolved_snapshot_path(self):
+        calls = []
+        tokenizer = types.SimpleNamespace(
+            pad_token_id=7, pad_token=None, name_or_path="/cached/snapshot")
+
+        class AutoTokenizer:
+            @staticmethod
+            def from_pretrained(source, **kwargs):
+                calls.append((source, kwargs))
+                return tokenizer
+
+        config = support.make_config(model={
+            "id": "owner/model",
+            "revision": "a" * 40,
+            "local_path": None,
+        })
+        with mock.patch.dict(sys.modules, {
+                "transformers": types.SimpleNamespace(AutoTokenizer=AutoTokenizer)}), \
+                mock.patch.object(
+                    adapters, "_cached_snapshot_source",
+                    return_value="/cached/snapshot"):
+            result = adapters.load_tokenizer(
+                config, local_files_only=True, cache_dir="/cache")
+
+        self.assertIs(result, tokenizer)
+        self.assertEqual(calls[0][0], "/cached/snapshot")
+        self.assertNotIn("revision", calls[0][1])
+        self.assertTrue(calls[0][1]["local_files_only"])
+        self.assertEqual(tokenizer.name_or_path, "owner/model")
+
+
 class FakeModel:
     """A tiny stand-in with the attributes the loaders and checks use."""
 

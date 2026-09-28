@@ -138,10 +138,17 @@ def load_tokenizer(config, *, local_files_only: bool = False, cache_dir=None):
         raise DataError(
             "transformers is required to load a tokenizer; install the pinned "
             "environment from environment.lock_file") from exc
+    source = _source(config)
+    hub_kwargs = _hub_kwargs(
+        config, local_files_only=local_files_only, cache_dir=cache_dir)
+    if local_files_only and config.model.local_path is None:
+        # Some tokenizer implementations still request Hub metadata when
+        # given owner/repository with local_files_only=True. Resolve the exact
+        # pinned snapshot first so offline mode is literal.
+        source = _cached_snapshot_source(config, cache_dir=cache_dir)
+        hub_kwargs.pop("revision", None)
     try:
-        tokenizer = AutoTokenizer.from_pretrained(
-            _source(config), **_hub_kwargs(config, local_files_only=local_files_only,
-                                          cache_dir=cache_dir))
+        tokenizer = AutoTokenizer.from_pretrained(source, **hub_kwargs)
     except Exception as exc:
         raise DataError(
             f"Failed to load the tokenizer for {config.model.id}@"
@@ -154,6 +161,9 @@ def load_tokenizer(config, *, local_files_only: bool = False, cache_dir=None):
         raise DataError(
             f"The tokenizer for {config.model.id} has no pad token; set "
             "tokenizer.pad_token in the config explicitly")
+    if config.model.local_path is None:
+        # Cache paths are implementation details, not tokenizer identity.
+        tokenizer.name_or_path = config.model.id
     return tokenizer
 
 
