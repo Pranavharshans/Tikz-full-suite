@@ -4,10 +4,15 @@
 > [`unsloth_native/`](unsloth_native/README.md). It reuses this stage's audited
 > preparation and assistant-only labels while delegating checkpoints and resume
 > to `SFTTrainer`. The original governed trainer below remains available.
+> `inclusionAI/Ling-3.0-tiny` uses the same audited data/gate machinery through
+> the separate [`ling_native/`](ling_native/README.md) Transformers/PEFT
+> backend because its custom BailingMoeV3 architecture has no validated
+> Unsloth path here. Its GPU gates are still pending.
 
-BF16 supervised fine-tuning for text-to-TikZ generation, trained with Unsloth
-on one NVIDIA RTX PRO 6000 Blackwell (96 GB). Two models share one training
-implementation and differ only by configuration:
+BF16 supervised fine-tuning for text-to-TikZ generation. Qwen and MiniCPM use
+the validated native Unsloth path; Ling uses the isolated Transformers/PEFT
+path while sharing the audited dataset, loss masking, gates, identity and
+checkpoint rules:
 
 | Config | Model | Adapter |
 | --- | --- | --- |
@@ -17,13 +22,14 @@ implementation and differ only by configuration:
 | `configs/minicpm5-2b-lora.yaml` | same model, BF16 LoRA (A40 profile) | `minicpm5` |
 | `configs/qwen3.5-4b-lora-rtx.yaml` | same model, BF16 LoRA (RTX PRO 6000 profile) | `qwen3.5` |
 | `configs/minicpm5-2b-lora-rtx.yaml` | same model, BF16 LoRA (RTX PRO 6000 profile) | `minicpm5` |
+| `configs/ling3-tiny-lora.yaml` | `inclusionAI/Ling-3.0-tiny` @ `9a98e35f…`, BF16 LoRA | `ling3` (custom KDA/MLA sparse MoE; Transformers/PEFT) |
 
 Training mode is explicit and first-class:
 
 ```yaml
 training:
   method: full   # full-parameter BF16 SFT (default), or
-  method: lora   # BF16 LoRA through Unsloth's native PEFT integration
+  method: lora   # BF16 LoRA through the model's configured native backend
 ```
 
 LoRA is **not** QLoRA: the base checkpoint is always loaded unquantized in
@@ -32,8 +38,8 @@ is unchanged. The two methods have different run identities, checkpoint
 layouts and final artifacts, so they can never share or resume each other's
 work.
 
-The first comparable experiment is **text-only for both models**: no images
-are supplied to either model. `png_image` from the export is retained for
+The comparable experiments are **text-only for every model**: no images are
+supplied during training. `png_image` from the export is retained for
 evaluation (rendered-image similarity) only.
 
 Stage 1 does **not** support sequence packing. Batches are right-padded only;
@@ -60,7 +66,7 @@ cleaning export and writes only inside `--prepared` and `--run-dir`.
 
 ## 1. Environments
 
-Each model gets its own environment installed from its lock file, so the two
+Each model gets its own environment installed from its lock file, so they
 can diverge if the models ever need different Transformers releases. The
 interpreter pin lives in `.python-version` (3.12); the lock files are plain
 pip requirements files and contain no interpreter pin.
@@ -69,21 +75,27 @@ pip requirements files and contain no interpreter pin.
 # Create the virtual environments with the pinned interpreter (3.12), e.g.:
 python3.12 -m venv /shared/$USER/envs/qwen3.5-4b
 python3.12 -m venv /shared/$USER/envs/minicpm5-2b
+python3.12 -m venv /shared/$USER/envs/ling3-tiny
 
 # Then install the locked requirements into each environment:
 /shared/$USER/envs/qwen3.5-4b/bin/pip install -r stage-1/locks/qwen3.5-4b.lock
 /shared/$USER/envs/minicpm5-2b/bin/pip install -r stage-1/locks/minicpm5-2b.lock
+/shared/$USER/envs/ling3-tiny/bin/pip install -r stage-1/locks/ling3-tiny.lock
 ```
 
 The locks are model-specific coherent sets inside Unsloth's constraints
 (`transformers<=5.5.0`, `trl<=0.24.0`, `torch<2.13.0`). Qwen uses
 Transformers 5.5.0; MiniCPM uses its officially documented 4.57.3 fallback to
 avoid the incompatible Transformers-v5 path. See `locks/README.md`. The
-**preflight verifies the actual environment** (and that the running
+Ling environment uses Transformers/PEFT plus `fla-core` and does not install
+Unsloth. See the dated [Ling integration record](results/2026-09-27-ling3-tiny-integration.md).
+For the original Qwen/MiniCPM governed path, the **preflight verifies the actual environment** (and that the running
 interpreter matches `.python-version`); it never trusts the lock. Run it
-inside the same environment that will train.
+inside the same environment that will train. Ling instead fails closed during
+its first bounded native gate if its lock, model load, tokenizer identity,
+LoRA targets, frozen-base contract or training lifecycle is invalid.
 
-## 2. Prepare the dataset (once, shared by both models)
+## 2. Prepare the dataset
 
 Input is the audited Parquet export from the cleaning pipeline. Stage 1
 re-verifies it: metadata cross-checks, per-shard file and logical checksums
@@ -96,6 +108,16 @@ python3 stage-1/scripts/prepare_dataset.py \
   --config stage-1/configs/minicpm5-2b-full.yaml \
   --export /shared/$USER/tikz-production/export \
   --prepared /shared/$USER/tikz-stage1/prepared
+```
+
+Ling must use a fresh prepared directory because it has a different native
+template and tokenizer fingerprint:
+
+```bash
+python3 stage-1/scripts/prepare_dataset.py \
+  --config stage-1/configs/ling3-tiny-lora.yaml \
+  --export /shared/$USER/tikz-production/export \
+  --prepared /shared/$USER/tikz-stage1/prepared-ling3
 ```
 
 Use `--dry-run` to validate configurations only (reads nothing, writes
