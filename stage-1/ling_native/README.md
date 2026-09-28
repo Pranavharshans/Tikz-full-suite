@@ -52,7 +52,8 @@ python stage-1/ling_native/train_ling.py \
 - its native template fingerprint is
   `eb6226c94ae38058f875d159f86a206b3a165828c0e7d6bda664ae14667f798a`;
 - `enable_thinking: false` emits `detailed thinking off` and an empty thinking
-  block, the rendered prompt is an exact prefix of the full conversation, and
+  block, the assistant boundary is proven either by an exact prompt prefix or
+  by an exact literal-sentinel render of the same assistant turn, and
   assistant-only boundary masking succeeds;
 - the complete Stage 1 unit suite passes with the Ling YAML enabled.
 

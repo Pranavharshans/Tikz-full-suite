@@ -67,13 +67,43 @@ class MaskTests(unittest.TestCase):
         flags = [call["add_generation_prompt"] for call in self.tokenizer.template_calls]
         self.assertEqual(flags, [True, False])
 
+    def test_assistant_turn_sentinel_handles_a_different_generation_preamble(self):
+        class ThinkingTokenizer(support.FakeTokenizer):
+            def apply_chat_template(self, messages, **kwargs):
+                text = super().apply_chat_template(messages, **kwargs)
+                if kwargs.get("add_generation_prompt"):
+                    return text.replace(
+                        "<think>\n\n</think>\n\n", "<think></think>", 1)
+                return text
+
+        tokenizer = ThinkingTokenizer()
+        template = formatting.resolve_chat_template(
+            tokenizer, config_module.TokenizerConfig())
+        example = formatting.format_example(
+            tokenizer, row_id="row-1", instruction=INSTRUCTION, tikz=TIKZ,
+            template=template, kwargs={"enable_thinking": False})
+
+        self.assertGreater(example.prompt_tokens, 0)
+        self.assertGreater(example.supervised_tokens, 0)
+        self.assertEqual(
+            [call["add_generation_prompt"] for call in tokenizer.template_calls],
+            [True, False, False])
+
 
 class FailureTests(unittest.TestCase):
     def test_prefix_mismatch_is_refused(self):
-        tokenizer = support.FakeTokenizer(prefix_breaker=True)
+        class ContentDependentTokenizer(support.FakeTokenizer):
+            def apply_chat_template(self, messages, **kwargs):
+                text = super().apply_chat_template(messages, **kwargs)
+                if (messages and messages[-1]["role"] == "assistant" and
+                        messages[-1]["content"] == TIKZ):
+                    return text.replace("</think>", "</think >", 1)
+                return text
+
+        tokenizer = ContentDependentTokenizer()
         template = formatting.resolve_chat_template(
             tokenizer, config_module.TokenizerConfig())
-        with self.assertRaisesRegex(FormattingError, "not a prefix"):
+        with self.assertRaisesRegex(FormattingError, "scaffolding changes"):
             formatting.format_example(
                 tokenizer, row_id="row-1", instruction=INSTRUCTION, tikz=TIKZ,
                 template=template, kwargs={})
