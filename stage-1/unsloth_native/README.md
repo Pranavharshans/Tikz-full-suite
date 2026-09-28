@@ -58,15 +58,15 @@ LoRA or quantization.
 
 ## Validation status
 
-Last updated: 2026-09-25.
+Last updated: 2026-09-28.
 
 | Model | Method | Gate | Hardware | Result | Evidence |
 | --- | --- | --- | --- | --- | --- |
 | `openbmb/MiniCPM5-2B` | LoRA BF16 | `overfit-100` | 1x NVIDIA A40 48 GB | **PASS** | Slurm exit `0:0`, 24m03s |
 | `openbmb/MiniCPM5-2B` | LoRA BF16 | `smoke-1000` | 1x NVIDIA A40 48 GB | **PASS** | Slurm exit `0:0`, 12m39s |
 | `openbmb/MiniCPM5-2B` | LoRA BF16 | native resume drill | 1x NVIDIA A40 48 GB | **PASS** | Resumed step 50 and completed step 63 |
-| `openbmb/MiniCPM5-2B` | LoRA BF16 | `full` | 1x NVIDIA A40 48 GB | **NEXT** | Cleared for the full prepared train split |
-| `Qwen/Qwen3.5-4B` | LoRA BF16 | `overfit-100` | Not run | **PENDING** | Requires its own prepared tokenizer artifact and fresh run directory |
+| `openbmb/MiniCPM5-2B` | LoRA BF16 | `full` | 1x NVIDIA A40 48 GB | **PASS** | [Dated full-run report](../results/2026-09-27-minicpm5-2b-tikz-lora.md) |
+| `Qwen/Qwen3.5-4B` | LoRA BF16 | `full` | 1x NVIDIA RTX PRO 6000 Blackwell | **PASS** | [Dated full-run report](../results/2026-09-28-qwen3.5-4b-tikz-lora.md) |
 | Both models | Full BF16 SFT | Any | Not run | **PENDING** | Requires a separate memory probe on suitable high-memory hardware |
 
 ### MiniCPM overfit evidence
