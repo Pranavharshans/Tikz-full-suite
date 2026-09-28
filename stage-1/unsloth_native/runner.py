@@ -150,15 +150,18 @@ def run_native(model_key: str, *, config_path, expected_method: str, export, pre
                gate_name: str, resume: str | None, local_files_only: bool,
                cache_dir=None, progress=print):
     """Run one explicitly selected native gate; never advances automatically."""
-    # Import Unsloth before Transformers/TRL so its patches are installed.
+    # Unsloth models require import-before-Transformers.  The Ling backend is
+    # deliberately plain Transformers/PEFT because Unsloth has no validated
+    # BailingMoeV3 integration.
+    spec = get_spec(model_key)
     try:
-        import unsloth  # noqa: F401
+        if spec.backend == "unsloth":
+            import unsloth  # noqa: F401
         import torch
         from trl import SFTConfig, SFTTrainer
     except ImportError as exc:  # pragma: no cover - GPU environment only
         raise DataError("The pinned Unsloth/TRL training environment is required") from exc
 
-    spec = get_spec(model_key)
     config = config_module.load_config(config_path)
     if config.model.adapter != spec.adapter:
         raise DataError(

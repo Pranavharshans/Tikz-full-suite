@@ -62,6 +62,20 @@ class ImportSafetyTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0,
                              f"{name}: {completed.stderr}")
 
+    def test_native_launchers_support_help_without_ml_libraries(self):
+        launchers = (
+            STAGE1 / "unsloth_native" / "train_minicpm.py",
+            STAGE1 / "unsloth_native" / "train_qwen.py",
+            STAGE1 / "ling_native" / "train_ling.py",
+        )
+        for launcher in launchers:
+            completed = subprocess.run(
+                [sys.executable, str(launcher), "--help"],
+                capture_output=True, text=True, timeout=120,
+                env={"PATH": "/usr/bin:/bin", "HOME": "/tmp"})
+            self.assertEqual(completed.returncode, 0,
+                             f"{launcher.name}: {completed.stderr}")
+
 
 if __name__ == "__main__":
     unittest.main()

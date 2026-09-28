@@ -1,0 +1,21 @@
+# Candidate pinned GPU environment for inclusionAI/Ling-3.0-tiny BF16 LoRA.
+# This lock is committed for reproducible installation but remains UNVALIDATED
+# until the exact RTX PRO 6000 preflight/overfit gate passes.
+torch==2.12.1
+torchvision==0.27.1
+transformers==4.57.3
+trl==0.24.0
+datasets==4.3.0
+accelerate==1.15.0
+peft==0.21.0
+huggingface_hub==0.36.0
+tokenizers==0.22.2
+safetensors==0.8.0
+sentencepiece==0.2.2
+fla-core==0.5.2
+einops==0.8.1
+numpy==2.5.3
+pyyaml==6.0.3
+pyarrow==25.0.1
+pillow==12.3.0
+

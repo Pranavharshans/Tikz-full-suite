@@ -67,6 +67,20 @@ class ParsingTests(unittest.TestCase):
                          "verbatim-chatml.jinja")
         self.assertTrue(config.tokenizer.chat_template_file.is_file())
 
+    @support.requires_yaml
+    def test_ling_config_uses_native_template_and_transformers_loader(self):
+        config = config_module.load_config(
+            REPO_STAGE1 / "configs/ling3-tiny-lora.yaml")
+        self.assertEqual(config.model.adapter, "ling3")
+        self.assertEqual(config.model.loader, "transformers-causal-lm")
+        self.assertTrue(config.model.trust_remote_code)
+        self.assertIsNone(config.tokenizer.chat_template_file)
+        self.assertEqual(config.tokenizer.chat_template_kwargs,
+                         {"enable_thinking": False})
+        self.assertNotIn("gate_proj", config.lora.target_modules)
+        self.assertEqual(config_module.SUPPORTED_ADAPTERS,
+                         ("qwen3.5", "minicpm5", "ling3"))
+
     def test_split_fractions_must_sum_below_one(self):
         with self.assertRaisesRegex(ConfigError, "must be < 1"):
             support.make_config(data={"splits": {"validation_fraction": 0.5,

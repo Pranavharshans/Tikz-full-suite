@@ -2,7 +2,7 @@
 
 Everything data-driven lives in configuration; this module only holds the
 built-in adapter facts that cannot be expressed as plain data (context length,
-which Unsloth loader to use, capability detection) plus the two loading entry
+backend loader selection, capability detection) plus the loading entry
 points used by preparation, preflight, training and evaluation.
 
 Compatibility is never assumed: the preflight must load the exact checkpoint
@@ -58,6 +58,14 @@ ADAPTERS = {
         default_attn_implementation=None,
         template_kwargs={"enable_thinking": False},
         notes="Text-only LlamaForCausalLM; the text-only comparison baseline.",
+    ),
+    "ling3": ModelAdapter(
+        name="ling3",
+        context_length=131072,
+        default_attn_implementation=None,
+        template_kwargs={"enable_thinking": False},
+        notes=("Custom BailingMoeV3ForCausalLM hybrid KDA/MLA sparse-MoE; "
+               "loaded through Transformers/PEFT, not Unsloth."),
     ),
 }
 

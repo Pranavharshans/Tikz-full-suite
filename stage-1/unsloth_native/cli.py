@@ -14,8 +14,10 @@ from .runner import run_native
 def parser(model_key: str) -> argparse.ArgumentParser:
     spec = get_spec(model_key)
     result = argparse.ArgumentParser(
-        description=f"Native Unsloth + TRL SFT for {model_key}")
-    result.add_argument("--method", choices=("lora", "full"), default="lora")
+        description=f"Audited native TRL SFT for {model_key}")
+    methods = tuple(spec.configs)
+    result.add_argument("--method", choices=methods,
+                        default="lora" if "lora" in methods else methods[0])
     result.add_argument("--config", default=None,
                         help="optional config override; method must still match")
     result.add_argument("--export", required=True)

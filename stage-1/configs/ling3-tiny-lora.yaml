@@ -1,0 +1,60 @@
+# BF16 LoRA configuration for inclusionAI/Ling-3.0-tiny.
+#
+# Ling is a custom BailingMoeV3 hybrid KDA/MLA sparse-MoE model. It is loaded
+# through Transformers + PEFT with trust_remote_code; it does not use Unsloth.
+# The training data contains direct TikZ answers rather than reasoning traces,
+# so its native template is invoked with thinking disabled.
+inherit: common.yaml
+
+model:
+  id: inclusionAI/Ling-3.0-tiny
+  # Hub main resolved on 2026-09-28. Never replace with a branch name.
+  revision: 9a98e35fe1c9ee255f78dd64771c7ae15a799481
+  adapter: ling3
+  loader: transformers-causal-lm
+  trust_remote_code: true
+
+tokenizer:
+  # Use the checkpoint's Bailing V3 template and control tokens. The common
+  # verbatim ChatML template is Qwen/MiniCPM-specific and is not valid here.
+  chat_template_file: null
+  chat_template_kwargs:
+    enable_thinking: false
+
+training:
+  method: lora
+  learning_rate: 1.0e-4
+
+lora:
+  rank: 64
+  alpha: 64
+  dropout: 0.0
+  bias: none
+  # Attention-only targets verified from the pinned custom model source.
+  # Deliberately exclude gate_proj/up_proj/down_proj: those suffixes occur in
+  # every one of the 128 routed experts in nearly every layer and would make
+  # this adapter unexpectedly enormous. KDA and MLA use different projections,
+  # so both sets are listed and every target is required to match.
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - f_proj
+    - b_proj
+    - g_proj
+    - o_proj
+    - q_a_proj
+    - q_b_proj
+    - kv_a_proj_with_mqa
+    - kv_b_proj
+    - dense
+
+environment:
+  lock_file: locks/ling3-tiny.lock
+  python_version: "3.12"
+
+hardware:
+  # This is a conservative first-validation target, not a throughput claim.
+  # The exact model must pass the bounded GPU gates before any full run.
+  profile: rtxpro6000-lora
+

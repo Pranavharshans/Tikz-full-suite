@@ -1,4 +1,4 @@
-# Native Unsloth Stage 1
+# Native Stage 1 training
 
 This is the small, native training path: Unsloth loads and patches the exact
 model, TRL `SFTTrainer` owns optimization/checkpoints/resume, and the existing
@@ -15,7 +15,9 @@ assistant-only labels.
 - `train_minicpm.py` / `train_qwen.py`: intentionally thin entry points.
 
 To add a model, add a `NativeModelSpec` and its Stage 1 YAML configs. Add a thin
-launcher only when a dedicated command is useful; do not copy the runner.
+launcher only when a dedicated command is useful; do not copy the runner. The
+Ling integration uses the same runner through `../ling_native`, but selects the
+isolated Transformers/PEFT backend rather than importing Unsloth.
 
 ## MiniCPM LoRA overfit gate
 
@@ -67,7 +69,8 @@ Last updated: 2026-09-28.
 | `openbmb/MiniCPM5-2B` | LoRA BF16 | native resume drill | 1x NVIDIA A40 48 GB | **PASS** | Resumed step 50 and completed step 63 |
 | `openbmb/MiniCPM5-2B` | LoRA BF16 | `full` | 1x NVIDIA A40 48 GB | **PASS** | [Dated full-run report](../results/2026-09-27-minicpm5-2b-tikz-lora.md) |
 | `Qwen/Qwen3.5-4B` | LoRA BF16 | `full` | 1x NVIDIA RTX PRO 6000 Blackwell | **PASS** | [Dated full-run report](../results/2026-09-28-qwen3.5-4b-tikz-lora.md) |
-| Both models | Full BF16 SFT | Any | Not run | **PENDING** | Requires a separate memory probe on suitable high-memory hardware |
+| MiniCPM and Qwen | Full BF16 SFT | Any | Not run | **PENDING** | Requires a separate memory probe on suitable high-memory hardware |
+| `inclusionAI/Ling-3.0-tiny` | LoRA BF16 | Any | Not run | **CODE READY / GPU UNVERIFIED** | [Integration and required gates](../ling_native/README.md) |
 
 ### MiniCPM overfit evidence
 

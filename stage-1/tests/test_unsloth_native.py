@@ -15,12 +15,33 @@ class NativeRegistryTests(unittest.TestCase):
                          "FastLanguageModel")
         self.assertEqual(models.get_spec("qwen3.5-4b").loader_name,
                          "FastVisionModel")
+        ling = models.get_spec("ling3-tiny")
+        self.assertEqual(ling.loader_name, "AutoModelForCausalLM")
+        self.assertEqual(ling.backend, "transformers-peft")
 
     def test_every_method_config_exists(self):
         for spec in models.MODEL_SPECS.values():
-            for method in ("lora", "full"):
+            for method in spec.configs:
                 with self.subTest(model=spec.key, method=method):
                     self.assertTrue(spec.config_path(method).is_file())
+
+    def test_ling_refuses_unvalidated_full_sft(self):
+        with self.assertRaisesRegex(DataError, "does not support method"):
+            models.get_spec("ling3-tiny").config_path("full")
+
+    def test_lora_target_inventory_requires_every_suffix(self):
+        Linear = type("Linear", (), {})
+        Other = type("Other", (), {})
+        model = types.SimpleNamespace(named_modules=lambda: iter([
+            ("model.layers.0.self_attn.q_proj", Linear()),
+            ("model.layers.0.self_attn.o_proj", Linear()),
+            ("model.norm", Other()),
+        ]))
+        matched = models._matched_lora_modules(model, ("q_proj", "o_proj"))
+        self.assertEqual(matched["q_proj"],
+                         ["model.layers.0.self_attn.q_proj"])
+        with self.assertRaisesRegex(DataError, "missing_proj"):
+            models._matched_lora_modules(model, ("q_proj", "missing_proj"))
 
     def test_unknown_model_is_refused(self):
         with self.assertRaisesRegex(DataError, "Unknown native model"):
@@ -52,6 +73,17 @@ class NativeCliTests(unittest.TestCase):
         spec = models.get_spec("qwen3.5-4b")
         self.assertEqual(spec.config_path("full").name,
                          "qwen3.5-4b-full.yaml")
+
+    def test_ling_cli_selects_transformers_peft_config(self):
+        spec = models.get_spec("ling3-tiny")
+        self.assertEqual(spec.config_path("lora").name,
+                         "ling3-tiny-lora.yaml")
+        with self.assertRaises(SystemExit):
+            cli.parser("ling3-tiny").parse_args([
+                "--method", "full", "--export", "/export",
+                "--prepared", "/prepared", "--run-dir", "/run",
+                "--gate", "overfit-100",
+            ])
 
 
 class NativeIdentityTests(unittest.TestCase):

@@ -25,8 +25,11 @@ from pathlib import Path
 from .errors import ConfigError
 from .util import canonical_digest, is_pinned_revision, require_absolute
 
-SUPPORTED_ADAPTERS = ("qwen3.5", "minicpm5")
-SUPPORTED_LOADERS = ("unsloth-language-model", "unsloth-vision-model")
+SUPPORTED_ADAPTERS = ("qwen3.5", "minicpm5", "ling3")
+SUPPORTED_LOADERS = (
+    "unsloth-language-model", "unsloth-vision-model",
+    "transformers-causal-lm",
+)
 TRAINING_METHODS = ("full", "lora")
 LORA_BIASES = ("none", "all", "lora_only")
 TRAINING_GATES = ("overfit-100", "smoke-1000", "full")

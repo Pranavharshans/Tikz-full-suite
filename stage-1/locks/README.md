@@ -18,7 +18,7 @@ Rules:
 - `# comments` are allowed. Do not edit a lock file casually: a lock change is
   an environment change and invalidates run identities, so it must be a
   reviewed commit.
-- The two model locks are intentionally separate. MiniCPM uses Transformers
+- The model locks are intentionally separate. MiniCPM uses Transformers
   4.57.3 while Qwen uses 5.5.0; never collapse the environments.
 
 Why these versions:
@@ -38,6 +38,10 @@ Why these versions:
   Unsloth's supported range and avoids Transformers-v5 weight conversion. It
   pins `huggingface_hub==0.36.0` to satisfy Transformers 4.57.3's `<1.0`
   requirement.
+- `Ling-3.0-tiny` is a custom remote-code `BailingMoeV3ForCausalLM` model and
+  additionally needs `fla-core`. Its lock intentionally excludes Unsloth and
+  is a candidate environment until the exact GPU gates pass; do not copy pins
+  from the Qwen or MiniCPM environments into it opportunistically.
 - Stage 1 does not support sequence packing, so no varlen attention backend is
   required and `flash-attn` is not pinned. The preflight still records which
   attention backends are importable.
