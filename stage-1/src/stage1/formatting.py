@@ -5,11 +5,13 @@ Masking strategy (no heuristics):
 
 1. Render the prompt (user turn + generation prompt) and the full conversation
    (user turn + assistant target) with the same template and options.
-2. Prefer the generation prompt as the exact assistant boundary. If a native
-   template renders a different assistant preamble once an assistant turn is
-   present, render a structurally identical conversation with a unique literal
-   sentinel as its assistant content and prove that the surrounding template
-   text is identical before using the sentinel position as the boundary.
+2. Prefer the generation prompt as the exact assistant boundary. For a
+   thinking-disabled template that tries to parse ``<think>`` text embedded in
+   assistant content, provide an explicit empty ``reasoning_content`` field and
+   require that rendering to preserve the generation prompt as its prefix.
+   Otherwise, prepend a unique literal sentinel to the *actual* assistant
+   target and render again. Removing that sentinel must reproduce the original
+   full rendering byte-for-byte; its proven insertion position is the boundary.
 3. Tokenize the full text once with ``return_offsets_mapping=True`` and find
    the first token that starts at or after the assistant text boundary.
 4. Every token before that boundary gets label ``-100``; every token at or
@@ -102,13 +104,32 @@ def render_pair(tokenizer, *, instruction: str, tikz: str, template: ChatTemplat
     if not prompt_text:
         raise FormattingError("Chat template rendered an empty prompt")
     if not full_text.startswith(prompt_text):
+        if kwargs.get("enable_thinking") is False:
+            explicit_messages = prompt_messages + [{
+                "role": "assistant",
+                "content": tikz,
+                # Non-empty before the template's strip operation, empty in
+                # the rendered reasoning block. This prevents native templates
+                # from parsing literal <think> snippets inside TikZ source.
+                "reasoning_content": "\n",
+            }]
+            explicit_full = _apply(
+                tokenizer, explicit_messages, template, kwargs,
+                add_generation_prompt=False)
+            if explicit_full.startswith(prompt_text):
+                full_text = explicit_full
+        if full_text.startswith(prompt_text):
+            if len(full_text) == len(prompt_text):
+                raise FormattingError(
+                    "Chat template rendered an empty assistant target")
+            return prompt_text, full_text
         sentinel = "__STAGE1_LITERAL_ASSISTANT_BOUNDARY_7E3C9A1D__"
         if sentinel in instruction or sentinel in tikz or sentinel in template.text:
             raise FormattingError(
                 "The assistant-boundary sentinel collides with example or template text")
         sentinel_text = _apply(
             tokenizer,
-            prompt_messages + [{"role": "assistant", "content": sentinel}],
+            prompt_messages + [{"role": "assistant", "content": sentinel + tikz}],
             template, kwargs, add_generation_prompt=False)
         if sentinel_text.count(sentinel) != 1:
             raise FormattingError(
@@ -116,19 +137,14 @@ def render_pair(tokenizer, *, instruction: str, tikz: str, template: ChatTemplat
                 "and the template did not preserve the assistant-boundary sentinel "
                 "exactly once")
         boundary = sentinel_text.index(sentinel)
-        prefix = sentinel_text[:boundary]
-        suffix = sentinel_text[boundary + len(sentinel):]
-        if not full_text.startswith(prefix) or not full_text.endswith(suffix):
+        without_sentinel = (
+            sentinel_text[:boundary] + sentinel_text[boundary + len(sentinel):])
+        if without_sentinel != full_text:
             raise FormattingError(
                 "The rendered prompt is not a prefix of the full conversation, "
-                "and assistant-turn scaffolding changes with assistant content; "
-                "the supervised boundary cannot be proven exactly")
-        target_end = len(full_text) - len(suffix) if suffix else len(full_text)
-        if full_text[boundary:target_end] != tikz:
-            raise FormattingError(
-                "The chat template transformed assistant content; the supervised "
-                "boundary cannot be proven from the literal target")
-        prompt_text = prefix
+                "and prepending then removing the assistant-boundary sentinel "
+                "does not reproduce the full rendering exactly")
+        prompt_text = full_text[:boundary]
     if len(full_text) == len(prompt_text):
         raise FormattingError("Chat template rendered an empty assistant target")
     return prompt_text, full_text

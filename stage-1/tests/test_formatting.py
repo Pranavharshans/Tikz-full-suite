@@ -87,7 +87,55 @@ class MaskTests(unittest.TestCase):
         self.assertGreater(example.supervised_tokens, 0)
         self.assertEqual(
             [call["add_generation_prompt"] for call in tokenizer.template_calls],
-            [True, False, False])
+            [True, False, False, False])
+
+    def test_thinking_disabled_preserves_literal_think_text_in_target(self):
+        class LingStyleTokenizer(support.FakeTokenizer):
+            def apply_chat_template(self, messages, tokenize=False,
+                                    add_generation_prompt=False,
+                                    chat_template=None, **kwargs):
+                self.template_calls.append({
+                    "messages": list(messages),
+                    "add_generation_prompt": add_generation_prompt,
+                    "kwargs": dict(kwargs),
+                    "chat_template": chat_template,
+                })
+                text = "<role>SYSTEM</role>detailed thinking off<|role_end|>"
+                for message in messages:
+                    if message["role"] == "user":
+                        text += "<role>HUMAN</role>" + message["content"]
+                        text += "<|role_end|>"
+                    elif message["role"] == "assistant":
+                        content = message["content"]
+                        reasoning = message.get("reasoning_content", "")
+                        if reasoning != "":
+                            text += "<role>ASSISTANT</role>\n<think>"
+                            text += reasoning.strip("\n") + "</think>" + content
+                        elif "</think>" in content:
+                            parsed = content.split("</think>")[0]
+                            parsed = parsed.rstrip("\n").split("<think>")[-1]
+                            content = content.split("</think>")[-1].lstrip("\n")
+                            text += "<role>ASSISTANT</role>\n<think>"
+                            text += parsed.strip("\n") + "</think>" + content
+                        else:
+                            text += "<role>ASSISTANT</role>\n<think></think>" + content
+                        text += "<|role_end|>"
+                if add_generation_prompt:
+                    text += "<role>ASSISTANT</role>\n<think></think>"
+                return text
+
+        target = "\\node {<think>literal diagram text</think><answer>x</answer>};"
+        tokenizer = LingStyleTokenizer()
+        template = formatting.resolve_chat_template(
+            tokenizer, config_module.TokenizerConfig())
+        prompt, full = formatting.render_pair(
+            tokenizer, instruction=INSTRUCTION, tikz=target,
+            template=template, kwargs={"enable_thinking": False})
+
+        self.assertTrue(full.startswith(prompt))
+        self.assertEqual(full[len(prompt):], target + "<|role_end|>")
+        explicit_message = tokenizer.template_calls[2]["messages"][-1]
+        self.assertEqual(explicit_message["reasoning_content"], "\n")
 
 
 class FailureTests(unittest.TestCase):
@@ -103,7 +151,7 @@ class FailureTests(unittest.TestCase):
         tokenizer = ContentDependentTokenizer()
         template = formatting.resolve_chat_template(
             tokenizer, config_module.TokenizerConfig())
-        with self.assertRaisesRegex(FormattingError, "scaffolding changes"):
+        with self.assertRaisesRegex(FormattingError, "does not reproduce"):
             formatting.format_example(
                 tokenizer, row_id="row-1", instruction=INSTRUCTION, tikz=TIKZ,
                 template=template, kwargs={})
