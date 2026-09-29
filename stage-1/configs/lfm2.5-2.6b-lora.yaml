@@ -2,7 +2,7 @@
 #
 # Stage 1 uses the model's ChatML control tokens with a verbatim assistant
 # target and no open <think> block. The base checkpoint stays unquantized;
-# Stage 1's separate "full" gate means one full-data epoch, still using LoRA.
+# Stage 1's LFM "full" gate means two full-data epochs, still using LoRA.
 inherit: common.yaml
 
 model:
@@ -22,6 +22,13 @@ tokenizer:
 training:
   method: lora
   learning_rate: 1.0e-4
+
+# The completed smoke gate continued improving through epoch 1
+# (eval loss 0.8115 at epoch 0.4, 0.7845 at 0.8, and 0.7829 at 1.0).
+# Schedule two epochs from the start so cosine decay spans both passes.
+gates:
+  full:
+    epochs: 2
 
 lora:
   rank: 64

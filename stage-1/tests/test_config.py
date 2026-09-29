@@ -499,6 +499,7 @@ class ShippedConfigTests(unittest.TestCase):
         self.assertEqual(config.training.effective_batch_size, 16)
         self.assertEqual(config.lora.rank, 64)
         self.assertEqual(config.lora.alpha, 64)
+        self.assertEqual(config.gate("full").epochs, 2)
         self.assertEqual(
             tuple(config.lora.target_modules),
             ("q_proj", "k_proj", "v_proj", "out_proj", "w1", "w2",
