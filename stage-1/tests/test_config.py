@@ -79,7 +79,7 @@ class ParsingTests(unittest.TestCase):
                          {"enable_thinking": False})
         self.assertNotIn("gate_proj", config.lora.target_modules)
         self.assertEqual(config_module.SUPPORTED_ADAPTERS,
-                         ("qwen3.5", "minicpm5", "ling3"))
+                         ("qwen3.5", "minicpm5", "ling3", "lfm25-2.6b"))
 
     def test_split_fractions_must_sum_below_one(self):
         with self.assertRaisesRegex(ConfigError, "must be < 1"):
@@ -483,6 +483,28 @@ class ShippedConfigTests(unittest.TestCase):
                 self.assertEqual(config.lora.bias, "none")
                 self.assertEqual(len(config.lora.target_modules), 7)
                 self.assertIsNotNone(config.environment.lock_path)
+
+    @support.requires_yaml
+    def test_lfm_lora_config_resolves_with_documented_targets(self):
+        config = config_module.load_config(
+            REPO_STAGE1 / "configs" / "lfm2.5-2.6b-lora.yaml")
+        self.assertEqual(config.training.method, "lora")
+        self.assertEqual(config.model.id, "LiquidAI/LFM2.5-2.6B")
+        self.assertEqual(
+            config.model.revision,
+            "654f9463ce32b05d0429d76fe1f580b27d4c1ac0")
+        self.assertEqual(config.model.adapter, "lfm25-2.6b")
+        self.assertEqual(config.model.loader, "unsloth-language-model")
+        self.assertEqual(config.hardware.profile, "rtxpro6000-lora")
+        self.assertEqual(config.training.effective_batch_size, 16)
+        self.assertEqual(config.lora.rank, 64)
+        self.assertEqual(config.lora.alpha, 64)
+        self.assertEqual(
+            tuple(config.lora.target_modules),
+            ("q_proj", "k_proj", "v_proj", "out_proj", "in_proj",
+             "w1", "w2", "w3"))
+        self.assertEqual(config.environment.lock_path.name,
+                         "lfm2.5-2.6b.lock")
 
     @support.requires_yaml
     def test_full_configs_still_use_full_method(self):

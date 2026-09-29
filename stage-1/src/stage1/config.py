@@ -25,7 +25,7 @@ from pathlib import Path
 from .errors import ConfigError
 from .util import canonical_digest, is_pinned_revision, require_absolute
 
-SUPPORTED_ADAPTERS = ("qwen3.5", "minicpm5", "ling3")
+SUPPORTED_ADAPTERS = ("qwen3.5", "minicpm5", "ling3", "lfm25-2.6b")
 SUPPORTED_LOADERS = (
     "unsloth-language-model", "unsloth-vision-model",
     "transformers-causal-lm",
@@ -445,7 +445,7 @@ def parse_config(raw: dict, *, source: str = "<dict>") -> Stage1Config:
             f"{source}.training: effective batch size is "
             f"per_device_train_batch_size * gradient_accumulation_steps = "
             f"{training.effective_batch_size}, but this task requires "
-            f"{expected_batch} on one A40. Adjust the two values accordingly "
+            f"{expected_batch} on one GPU. Adjust the two values accordingly "
             "(for example 2 x 8).")
 
     return Stage1Config(

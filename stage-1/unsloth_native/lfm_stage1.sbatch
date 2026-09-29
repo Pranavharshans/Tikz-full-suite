@@ -35,7 +35,13 @@ case "$PREPARED" in /*) ;; *) echo "PREPARED must be an absolute path" >&2; exit
 case "$RUN_DIR" in /*) ;; *) echo "RUN_DIR must be an absolute path" >&2; exit 2 ;; esac
 if [[ -n "$CACHE_DIR" ]]; then
   case "$CACHE_DIR" in /*) ;; *) echo "CACHE_DIR must be an absolute path" >&2; exit 2 ;; esac
+  export HF_HOME="$CACHE_DIR"
+  export HF_HUB_OFFLINE=1
+  export TRANSFORMERS_OFFLINE=1
+  export HF_HUB_DISABLE_XET=1
 fi
+export TOKENIZERS_PARALLELISM=false
+export PYTHONUNBUFFERED=1
 if [[ ! -x "$PYTHON" ]]; then
   echo "Python executable is missing or not executable: $PYTHON" >&2
   exit 2
@@ -54,7 +60,7 @@ ARGS=(
   --resume "$RESUME"
 )
 if [[ -n "$CACHE_DIR" ]]; then
-  ARGS+=(--cache-dir "$CACHE_DIR")
+  ARGS+=(--cache-dir "$CACHE_DIR" --local-files-only)
 fi
 
 echo "== LFM2.5 Stage 1 gate: $GATE; resume: $RESUME =="

@@ -15,6 +15,11 @@ class NativeRegistryTests(unittest.TestCase):
                          "FastLanguageModel")
         self.assertEqual(models.get_spec("qwen3.5-4b").loader_name,
                          "FastVisionModel")
+        lfm = models.get_spec("lfm2.5-2.6b")
+        self.assertEqual(lfm.loader_name, "FastLanguageModel")
+        self.assertEqual(lfm.adapter, "lfm25-2.6b")
+        self.assertEqual(lfm.config_path("lora").name,
+                         "lfm2.5-2.6b-lora.yaml")
         ling = models.get_spec("ling3-tiny")
         self.assertEqual(ling.loader_name, "AutoModelForCausalLM")
         self.assertEqual(ling.backend, "transformers-peft")
@@ -84,6 +89,16 @@ class NativeCliTests(unittest.TestCase):
                 "--prepared", "/prepared", "--run-dir", "/run",
                 "--gate", "overfit-100",
             ])
+
+    def test_lfm_cli_selects_only_lora_config(self):
+        spec = models.get_spec("lfm2.5-2.6b")
+        self.assertEqual(spec.config_path("lora").name,
+                         "lfm2.5-2.6b-lora.yaml")
+        args = cli.parser("lfm2.5-2.6b").parse_args([
+            "--export", "/export", "--prepared", "/prepared",
+            "--run-dir", "/run", "--gate", "overfit-100",
+        ])
+        self.assertEqual(args.method, "lora")
 
 
 class NativeIdentityTests(unittest.TestCase):
