@@ -16,3 +16,8 @@ and full training run are still pending.
 To train Ling, first prepare a Ling-specific tokenizer dataset, then complete
 the `overfit-100` and `smoke-1000` GPU gates described in the
 [September 27 integration record](stage-1/results/2026-09-27-ling3-tiny-integration.md).
+
+On **September 29, 2026**, Stage 1 added a standalone Unsloth/TRL LoRA path for
+[`LiquidAI/LFM2.5-2.6B`](stage-1/results/2026-09-29-lfm2.5-2.6b-integration.md).
+The overfit, smoke, resume and full-data Slurm gates are documented, but the
+model-specific GPU run has not started.

@@ -1,0 +1,50 @@
+# BF16 LoRA configuration for LiquidAI/LFM2.5-2.6B.
+#
+# Stage 1 uses the model's ChatML control tokens with a verbatim assistant
+# target and no open <think> block. The base checkpoint stays unquantized;
+# Stage 1's separate "full" gate means one full-data epoch, still using LoRA.
+inherit: common.yaml
+
+model:
+  id: LiquidAI/LFM2.5-2.6B
+  # Current Hub main resolved on 2026-09-29. Keep the exact commit pinned.
+  revision: 654f9463ce32b05d0429d76fe1f580b27d4c1ac0
+  adapter: lfm25-2.6b
+  loader: unsloth-language-model
+
+tokenizer:
+  # LFM2.5 starts its native conversation format with BOS. Keep its ChatML
+  # markers while suppressing the default open <think> generation prefix.
+  chat_template_file: templates/lfm25-verbatim-chatml.jinja
+  chat_template_kwargs:
+    enable_thinking: false
+
+training:
+  method: lora
+  learning_rate: 1.0e-4
+
+lora:
+  rank: 64
+  alpha: 64
+  dropout: 0.0
+  bias: none
+  # LiquidAI/Unsloth's LFM2.5 LoRA recipe names these attention and MLP
+  # projections. The native loader checks every suffix on the pinned model.
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - out_proj
+    - in_proj
+    - w1
+    - w2
+    - w3
+
+environment:
+  lock_file: locks/lfm2.5-2.6b.lock
+  python_version: "3.12"
+
+hardware:
+  # First GPU validation target; the 96 GiB RTX PRO 6000 leaves headroom for
+  # the 8,192-token ceiling, activations and evaluation batches.
+  profile: rtxpro6000-lora

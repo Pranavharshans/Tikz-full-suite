@@ -8,6 +8,8 @@
 > the separate [`ling_native/`](ling_native/README.md) Transformers/PEFT
 > backend because its custom BailingMoeV3 architecture has no validated
 > Unsloth path here. Its GPU gates are still pending.
+> `LiquidAI/LFM2.5-2.6B` uses the standalone native Unsloth/TRL path with a
+> model-specific verbatim ChatML template; its GPU gates are pending.
 
 BF16 supervised fine-tuning for text-to-TikZ generation. Qwen and MiniCPM use
 the validated native Unsloth path; Ling uses the isolated Transformers/PEFT
@@ -16,6 +18,7 @@ checkpoint rules:
 
 | Config | Model | Adapter |
 | --- | --- | --- |
+| `configs/lfm2.5-2.6b-lora.yaml` | `LiquidAI/LFM2.5-2.6B` @ `654f9463…`, BF16 LoRA | `lfm25-2.6b` (hybrid short-convolution/GQA; native Unsloth) |
 | `configs/qwen3.5-4b-full.yaml` | `Qwen/Qwen3.5-4B` @ `851bf6e8…` | `qwen3.5` (multimodal checkpoint, trained text-only) |
 | `configs/minicpm5-2b-full.yaml` | `openbmb/MiniCPM5-2B` @ `12a3808a…` | `minicpm5` (text-only Llama, the comparison baseline) |
 | `configs/qwen3.5-4b-lora.yaml` | same model, BF16 LoRA (A40 profile) | `qwen3.5` |
@@ -75,11 +78,13 @@ pip requirements files and contain no interpreter pin.
 # Create the virtual environments with the pinned interpreter (3.12), e.g.:
 python3.12 -m venv /shared/$USER/envs/qwen3.5-4b
 python3.12 -m venv /shared/$USER/envs/minicpm5-2b
+python3.12 -m venv /shared/$USER/envs/lfm2.5-2.6b
 python3.12 -m venv /shared/$USER/envs/ling3-tiny
 
 # Then install the locked requirements into each environment:
 /shared/$USER/envs/qwen3.5-4b/bin/pip install -r stage-1/locks/qwen3.5-4b.lock
 /shared/$USER/envs/minicpm5-2b/bin/pip install -r stage-1/locks/minicpm5-2b.lock
+/shared/$USER/envs/lfm2.5-2.6b/bin/pip install -r stage-1/locks/lfm2.5-2.6b.lock
 /shared/$USER/envs/ling3-tiny/bin/pip install -r stage-1/locks/ling3-tiny.lock
 ```
 

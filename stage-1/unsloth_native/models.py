@@ -46,6 +46,12 @@ MODEL_SPECS = {
             "full": "configs/qwen3.5-4b-full.yaml",
         },
     ),
+    "lfm2.5-2.6b": NativeModelSpec(
+        key="lfm2.5-2.6b",
+        adapter="lfm25-2.6b",
+        loader_name="FastLanguageModel",
+        configs={"lora": "configs/lfm2.5-2.6b-lora.yaml"},
+    ),
     "ling3-tiny": NativeModelSpec(
         key="ling3-tiny",
         adapter="ling3",
@@ -264,6 +270,8 @@ def load_native_model(spec: NativeModelSpec, config, prepared_model: dict, *,
         lora = config.lora
         if lora is None:
             raise DataError("LoRA method selected without a LoRA configuration")
+        adapters.validate_target_modules(
+            adapters.module_short_names(model), lora.target_modules)
         model = Loader.get_peft_model(
             model,
             r=lora.rank,
@@ -275,6 +283,7 @@ def load_native_model(spec: NativeModelSpec, config, prepared_model: dict, *,
                 "unsloth" if config.training.gradient_checkpointing else False),
             random_state=config.seed,
         )
+        adapters.verify_lora_trainables(model.named_parameters(), lora)
     for_training = getattr(Loader, "for_training", None)
     if callable(for_training):
         parameters = inspect.signature(for_training).parameters
