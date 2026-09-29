@@ -42,6 +42,10 @@ Why these versions:
   path and LFM attention/MLP LoRA targets. Its lock stays separate and uses
   the Transformers 5.5.0 / Unsloth 2026.9.11 set; the exact pinned model still
   must pass the overfit GPU gate before smoke or full training.
+- `LiquidAI/LFM2.5-8B-A1B` is a reasoning-tuned `Lfm2MoeForCausalLM` with
+  8.3B total and 1.5B active parameters. Its separate candidate lock uses the
+  same bounded Unsloth stack, but exact sparse-expert adapter attachment and
+  checkpoint restoration remain unverified until the RTX PRO 6000 gates pass.
 - `Ling-3.0-tiny` is a custom remote-code `BailingMoeV3ForCausalLM` model and
   additionally needs `fla-core`. Its lock intentionally excludes Unsloth and
   is a candidate environment until the exact GPU gates pass; do not copy pins

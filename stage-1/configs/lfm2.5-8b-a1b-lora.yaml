@@ -1,0 +1,45 @@
+# BF16 LoRA configuration for LiquidAI/LFM2.5-8B-A1B.
+#
+# This reasoning-tuned sparse-MoE checkpoint uses LFM ChatML boundaries. Stage
+# 1 supervises direct TikZ assistant outputs without synthesizing hidden
+# reasoning. The exact Unsloth/PEFT expert attachment remains GPU-gated.
+inherit: common.yaml
+
+model:
+  id: LiquidAI/LFM2.5-8B-A1B
+  revision: 5dd22602c2e9f6a097b1de4c4efe0658b605015c
+  adapter: lfm25-8b-a1b
+  loader: unsloth-language-model
+
+tokenizer:
+  chat_template_file: templates/lfm25-verbatim-chatml.jinja
+  chat_template_kwargs:
+    enable_thinking: false
+
+training:
+  method: lora
+  learning_rate: 1.0e-4
+
+lora:
+  rank: 64
+  alpha: 64
+  dropout: 0.0
+  bias: none
+  # Dense attention/MLP leaves are explicit. Current Unsloth detects the MoE
+  # expert parameter layout from the MLP targets; the strict post-attachment
+  # check refuses a run if any configured family receives no trainable LoRA.
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - out_proj
+    - w1
+    - w2
+    - w3
+
+environment:
+  lock_file: locks/lfm2.5-8b-a1b.lock
+  python_version: "3.12"
+
+hardware:
+  profile: rtxpro6000-lora

@@ -19,5 +19,6 @@ the `overfit-100` and `smoke-1000` GPU gates described in the
 
 On **September 29, 2026**, Stage 1 added a standalone Unsloth/TRL LoRA path for
 [`LiquidAI/LFM2.5-2.6B`](stage-1/results/2026-09-29-lfm2.5-2.6b-integration.md).
-The overfit, smoke, resume and full-data Slurm gates are documented, but the
-model-specific GPU run has not started.
+Its overfit, resume, and smoke gates passed on RTX PRO 6000. The same native
+framework now also includes an isolated, GPU-unverified sparse-MoE path for
+[`LiquidAI/LFM2.5-8B-A1B`](stage-1/results/2026-09-29-lfm2.5-8b-a1b-integration.md).

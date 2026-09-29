@@ -9,7 +9,9 @@
 > backend because its custom BailingMoeV3 architecture has no validated
 > Unsloth path here. Its GPU gates are still pending.
 > `LiquidAI/LFM2.5-2.6B` uses the standalone native Unsloth/TRL path with a
-> model-specific verbatim ChatML template; its GPU gates are pending.
+> model-specific verbatim ChatML template; its bounded gates passed on RTX PRO
+> 6000. `LiquidAI/LFM2.5-8B-A1B` has a separate sparse-MoE native path whose
+> exact expert attachment and GPU gates remain unverified.
 
 BF16 supervised fine-tuning for text-to-TikZ generation. Qwen and MiniCPM use
 the validated native Unsloth path; Ling uses the isolated Transformers/PEFT
@@ -19,6 +21,7 @@ checkpoint rules:
 | Config | Model | Adapter |
 | --- | --- | --- |
 | `configs/lfm2.5-2.6b-lora.yaml` | `LiquidAI/LFM2.5-2.6B` @ `654f9463…`, BF16 LoRA | `lfm25-2.6b` (hybrid short-convolution/GQA; native Unsloth) |
+| `configs/lfm2.5-8b-a1b-lora.yaml` | `LiquidAI/LFM2.5-8B-A1B` @ `5dd22602…`, BF16 LoRA | `lfm25-8b-a1b` (hybrid sparse MoE; native Unsloth) |
 | `configs/qwen3.5-4b-full.yaml` | `Qwen/Qwen3.5-4B` @ `851bf6e8…` | `qwen3.5` (multimodal checkpoint, trained text-only) |
 | `configs/minicpm5-2b-full.yaml` | `openbmb/MiniCPM5-2B` @ `12a3808a…` | `minicpm5` (text-only Llama, the comparison baseline) |
 | `configs/qwen3.5-4b-lora.yaml` | same model, BF16 LoRA (A40 profile) | `qwen3.5` |
