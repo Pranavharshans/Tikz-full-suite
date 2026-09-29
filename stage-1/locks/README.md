@@ -38,6 +38,10 @@ Why these versions:
   Unsloth's supported range and avoids Transformers-v5 weight conversion. It
   pins `huggingface_hub==0.36.0` to satisfy Transformers 4.57.3's `<1.0`
   requirement.
+- `LiquidAI/LFM2.5-2.6B` uses Unsloth's documented `FastLanguageModel` SFT
+  path and LFM attention/MLP LoRA targets. Its lock stays separate and uses
+  the Transformers 5.5.0 / Unsloth 2026.9.11 set; the exact pinned model still
+  must pass the overfit GPU gate before smoke or full training.
 - `Ling-3.0-tiny` is a custom remote-code `BailingMoeV3ForCausalLM` model and
   additionally needs `fla-core`. Its lock intentionally excludes Unsloth and
   is a candidate environment until the exact GPU gates pass; do not copy pins

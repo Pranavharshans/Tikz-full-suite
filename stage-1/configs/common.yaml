@@ -15,7 +15,7 @@ seed: 20260923
 model:
   id: null              # required in the model config, e.g. Qwen/Qwen3.5-4B
   revision: null        # required: exact 40-hex Hub commit SHA
-  adapter: null         # required: built-in adapter name (qwen3.5, minicpm5)
+  adapter: null         # required: built-in adapter name (qwen3.5, minicpm5, lfm25-2.6b)
   # unsloth-language-model | unsloth-vision-model
   loader: unsloth-language-model
   local_path: null      # optional absolute local snapshot directory

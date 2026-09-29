@@ -67,6 +67,14 @@ ADAPTERS = {
         notes=("Custom BailingMoeV3ForCausalLM hybrid KDA/MLA sparse-MoE; "
                "loaded through Transformers/PEFT, not Unsloth."),
     ),
+    "lfm25-2.6b": ModelAdapter(
+        name="lfm25-2.6b",
+        context_length=131072,
+        default_attn_implementation=None,
+        template_kwargs={"enable_thinking": False},
+        notes=("LiquidAI LFM2.5 hybrid short-convolution/GQA causal LM; "
+               "loaded through Unsloth FastLanguageModel for text-only SFT."),
+    ),
 }
 
 
