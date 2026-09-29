@@ -21,7 +21,8 @@ class NativeRegistryTests(unittest.TestCase):
         self.assertEqual(lfm.config_path("lora").name,
                          "lfm2.5-2.6b-lora.yaml")
         lfm_moe = models.get_spec("lfm2.5-8b-a1b")
-        self.assertEqual(lfm_moe.loader_name, "FastLanguageModel")
+        self.assertEqual(lfm_moe.loader_name, "FastModel")
+        self.assertTrue(lfm_moe.require_moe_expert_lora)
         self.assertEqual(lfm_moe.adapter, "lfm25-8b-a1b")
         self.assertEqual(lfm_moe.config_path("lora").name,
                          "lfm2.5-8b-a1b-lora.yaml")
@@ -52,6 +53,26 @@ class NativeRegistryTests(unittest.TestCase):
                          ["model.layers.0.self_attn.q_proj"])
         with self.assertRaisesRegex(DataError, "missing_proj"):
             models._matched_lora_modules(model, ("q_proj", "missing_proj"))
+
+    def test_sparse_moe_requires_trainable_expert_lora_parameters(self):
+        parameter = lambda trainable: types.SimpleNamespace(
+            requires_grad=trainable)
+        report = models._verify_moe_expert_lora(iter([
+            ("model.layers.2.experts.w1.lora_A.default.weight",
+             parameter(True)),
+            ("model.layers.2.experts.w1.lora_B.default.weight",
+             parameter(True)),
+            ("model.layers.2.self_attn.q_proj.lora_A.default.weight",
+             parameter(True)),
+        ]))
+        self.assertEqual(report["expert_adapter_parameters"], 2)
+
+        with self.assertRaisesRegex(DataError, "no trainable routed-expert"):
+            models._verify_moe_expert_lora(iter([
+                ("model.layers.2.self_attn.q_proj.lora_A.default.weight",
+                 parameter(True)),
+                ("model.layers.2.experts.w1.weight", parameter(False)),
+            ]))
 
     def test_unknown_model_is_refused(self):
         with self.assertRaisesRegex(DataError, "Unknown native model"):

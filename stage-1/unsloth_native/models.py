@@ -17,6 +17,7 @@ class NativeModelSpec:
     configs: dict[str, str]
     backend: str = "unsloth"
     text_only: bool = True
+    require_moe_expert_lora: bool = False
 
     def config_path(self, method: str) -> Path:
         try:
@@ -55,8 +56,12 @@ MODEL_SPECS = {
     "lfm2.5-8b-a1b": NativeModelSpec(
         key="lfm2.5-8b-a1b",
         adapter="lfm25-8b-a1b",
-        loader_name="FastLanguageModel",
+        # FastModel owns Unsloth's modern MoE target-parameter discovery.
+        # FastLanguageModel only adapted the dense Linear leaves in the
+        # 2026.9.11 runtime and silently omitted the fused routed experts.
+        loader_name="FastModel",
         configs={"lora": "configs/lfm2.5-8b-a1b-lora.yaml"},
+        require_moe_expert_lora=True,
     ),
     "ling3-tiny": NativeModelSpec(
         key="ling3-tiny",
@@ -154,6 +159,23 @@ def _matched_lora_modules(model, targets) -> dict[str, list[str]]:
             f"LoRA target module(s) {missing} do not exist in the loaded model; "
             f"available Linear suffixes are {available}")
     return result
+
+
+def _verify_moe_expert_lora(named_parameters) -> dict:
+    """Prove that a sparse-MoE adapter includes routed expert parameters."""
+    expert_parameters = []
+    for name, parameter in named_parameters:
+        lowered = name.lower()
+        if parameter.requires_grad and "lora_" in lowered and "expert" in lowered:
+            expert_parameters.append(name)
+    if not expert_parameters:
+        raise DataError(
+            "Sparse-MoE LoRA attached no trainable routed-expert parameters; "
+            "refusing an attention/shared-MLP-only adapter")
+    return {
+        "expert_adapter_parameters": len(expert_parameters),
+        "expert_adapter_parameter_names_sample": sorted(expert_parameters)[:5],
+    }
 
 
 def _load_transformers_peft_model(spec, config, prepared_model, *,
@@ -290,6 +312,8 @@ def load_native_model(spec: NativeModelSpec, config, prepared_model: dict, *,
             random_state=config.seed,
         )
         adapters.verify_lora_trainables(model.named_parameters(), lora)
+        if spec.require_moe_expert_lora:
+            _verify_moe_expert_lora(model.named_parameters())
     for_training = getattr(Loader, "for_training", None)
     if callable(for_training):
         parameters = inspect.signature(for_training).parameters
