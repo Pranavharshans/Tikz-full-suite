@@ -52,6 +52,12 @@ MODEL_SPECS = {
         loader_name="FastLanguageModel",
         configs={"lora": "configs/lfm2.5-2.6b-lora.yaml"},
     ),
+    "lfm2.5-8b-a1b": NativeModelSpec(
+        key="lfm2.5-8b-a1b",
+        adapter="lfm25-8b-a1b",
+        loader_name="FastLanguageModel",
+        configs={"lora": "configs/lfm2.5-8b-a1b-lora.yaml"},
+    ),
     "ling3-tiny": NativeModelSpec(
         key="ling3-tiny",
         adapter="ling3",

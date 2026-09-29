@@ -75,6 +75,15 @@ ADAPTERS = {
         notes=("LiquidAI LFM2.5 hybrid short-convolution/GQA causal LM; "
                "loaded through Unsloth FastLanguageModel for text-only SFT."),
     ),
+    "lfm25-8b-a1b": ModelAdapter(
+        name="lfm25-8b-a1b",
+        context_length=128000,
+        default_attn_implementation=None,
+        template_kwargs={"enable_thinking": False},
+        notes=("LiquidAI LFM2.5 sparse-MoE hybrid with 8.3B total and 1.5B "
+               "active parameters; loaded through Unsloth FastLanguageModel "
+               "for text-only LoRA SFT."),
+    ),
 }
 
 

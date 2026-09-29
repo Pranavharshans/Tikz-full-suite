@@ -20,6 +20,11 @@ class NativeRegistryTests(unittest.TestCase):
         self.assertEqual(lfm.adapter, "lfm25-2.6b")
         self.assertEqual(lfm.config_path("lora").name,
                          "lfm2.5-2.6b-lora.yaml")
+        lfm_moe = models.get_spec("lfm2.5-8b-a1b")
+        self.assertEqual(lfm_moe.loader_name, "FastLanguageModel")
+        self.assertEqual(lfm_moe.adapter, "lfm25-8b-a1b")
+        self.assertEqual(lfm_moe.config_path("lora").name,
+                         "lfm2.5-8b-a1b-lora.yaml")
         ling = models.get_spec("ling3-tiny")
         self.assertEqual(ling.loader_name, "AutoModelForCausalLM")
         self.assertEqual(ling.backend, "transformers-peft")
@@ -95,6 +100,16 @@ class NativeCliTests(unittest.TestCase):
         self.assertEqual(spec.config_path("lora").name,
                          "lfm2.5-2.6b-lora.yaml")
         args = cli.parser("lfm2.5-2.6b").parse_args([
+            "--export", "/export", "--prepared", "/prepared",
+            "--run-dir", "/run", "--gate", "overfit-100",
+        ])
+        self.assertEqual(args.method, "lora")
+
+    def test_lfm_moe_cli_selects_standalone_lora_config(self):
+        spec = models.get_spec("lfm2.5-8b-a1b")
+        self.assertEqual(spec.config_path("lora").name,
+                         "lfm2.5-8b-a1b-lora.yaml")
+        args = cli.parser("lfm2.5-8b-a1b").parse_args([
             "--export", "/export", "--prepared", "/prepared",
             "--run-dir", "/run", "--gate", "overfit-100",
         ])

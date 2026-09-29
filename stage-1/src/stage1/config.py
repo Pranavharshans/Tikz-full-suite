@@ -25,7 +25,9 @@ from pathlib import Path
 from .errors import ConfigError
 from .util import canonical_digest, is_pinned_revision, require_absolute
 
-SUPPORTED_ADAPTERS = ("qwen3.5", "minicpm5", "ling3", "lfm25-2.6b")
+SUPPORTED_ADAPTERS = (
+    "qwen3.5", "minicpm5", "ling3", "lfm25-2.6b", "lfm25-8b-a1b",
+)
 SUPPORTED_LOADERS = (
     "unsloth-language-model", "unsloth-vision-model",
     "transformers-causal-lm",

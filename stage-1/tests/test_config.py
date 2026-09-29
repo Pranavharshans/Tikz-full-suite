@@ -79,7 +79,8 @@ class ParsingTests(unittest.TestCase):
                          {"enable_thinking": False})
         self.assertNotIn("gate_proj", config.lora.target_modules)
         self.assertEqual(config_module.SUPPORTED_ADAPTERS,
-                         ("qwen3.5", "minicpm5", "ling3", "lfm25-2.6b"))
+                         ("qwen3.5", "minicpm5", "ling3", "lfm25-2.6b",
+                          "lfm25-8b-a1b"))
 
     def test_split_fractions_must_sum_below_one(self):
         with self.assertRaisesRegex(ConfigError, "must be < 1"):
@@ -499,12 +500,34 @@ class ShippedConfigTests(unittest.TestCase):
         self.assertEqual(config.training.effective_batch_size, 16)
         self.assertEqual(config.lora.rank, 64)
         self.assertEqual(config.lora.alpha, 64)
+        self.assertEqual(config.gate("full").epochs, 2)
         self.assertEqual(
             tuple(config.lora.target_modules),
             ("q_proj", "k_proj", "v_proj", "out_proj", "w1", "w2",
              "w3"))
         self.assertEqual(config.environment.lock_path.name,
                          "lfm2.5-2.6b.lock")
+
+    @support.requires_yaml
+    def test_lfm_moe_lora_config_is_isolated_and_pinned(self):
+        config = config_module.load_config(
+            REPO_STAGE1 / "configs" / "lfm2.5-8b-a1b-lora.yaml")
+        self.assertEqual(config.training.method, "lora")
+        self.assertEqual(config.model.id, "LiquidAI/LFM2.5-8B-A1B")
+        self.assertEqual(
+            config.model.revision,
+            "5dd22602c2e9f6a097b1de4c4efe0658b605015c")
+        self.assertEqual(config.model.adapter, "lfm25-8b-a1b")
+        self.assertEqual(config.model.loader, "unsloth-language-model")
+        self.assertEqual(config.hardware.profile, "rtxpro6000-lora")
+        self.assertEqual(config.training.effective_batch_size, 16)
+        self.assertEqual(config.gate("full").epochs, 1)
+        self.assertEqual(
+            tuple(config.lora.target_modules),
+            ("q_proj", "k_proj", "v_proj", "out_proj", "w1", "w2",
+             "w3"))
+        self.assertEqual(config.environment.lock_path.name,
+                         "lfm2.5-8b-a1b.lock")
 
     @support.requires_yaml
     def test_full_configs_still_use_full_method(self):

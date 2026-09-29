@@ -111,7 +111,8 @@ sbatch --time=04:00:00 stage-1/unsloth_native/lfm_stage1.sbatch \
   "$LFM_PYTHON" "$LFM_EXPORT" "$LFM_PREPARED" \
   "$LFM_RUNS/smoke-1000" smoke-1000 none "$LFM_CACHE"
 
-# After smoke passes, run one full-data epoch of LoRA SFT in a fresh directory.
+# After smoke passes, run the LFM config's two full-data epochs of LoRA SFT
+# in a fresh directory. The cosine schedule spans both epochs.
 sbatch --time=12:00:00 stage-1/unsloth_native/lfm_stage1.sbatch \
   "$LFM_PYTHON" "$LFM_EXPORT" "$LFM_PREPARED" \
   "$LFM_RUNS/full" full none "$LFM_CACHE"
@@ -119,9 +120,9 @@ sbatch --time=12:00:00 stage-1/unsloth_native/lfm_stage1.sbatch \
 
 If smoke or full is interrupted, resubmit that same gate and same run
 directory with `auto`. A finished gate writes `metrics.json`; keep its evidence
-and start the next gate separately. In this native path, `full` means one
-epoch over the complete eligible split while still using LoRA, not full-
-parameter fine-tuning. Start with `overfit-100`; no later gate is automatic.
+and start the next gate separately. For LFM, `full` means two epochs over the
+complete eligible split while still using LoRA, not full-parameter fine-tuning.
+Start with `overfit-100`; no later gate is automatic.
 
 `--resume auto` is the default and uses Trainer's newest native checkpoint in
 that run directory. An explicit checkpoint from another native run is accepted
@@ -129,6 +130,40 @@ only when its recorded model, configuration, gate, dataset and tokenizer
 identity exactly match the new run. Use `--resume none` for a deliberate clean
 start. Gates do not chain automatically; use a separate run directory for each
 gate/method.
+
+## LFM2.5-8B-A1B sparse-MoE gates
+
+The 8B-A1B integration is isolated from the dense 2.6B LFM path. It uses
+adapter slug `lfm25-8b-a1b` and has its own environment, prepared dataset,
+standalone launcher, Slurm wrapper, and run directories. Do not reuse the
+2.6B prepared directory.
+
+```bash
+python3.12 -m venv /shared/$USER/envs/lfm2.5-8b-a1b
+/shared/$USER/envs/lfm2.5-8b-a1b/bin/pip install \
+  -r stage-1/locks/lfm2.5-8b-a1b.lock
+
+/shared/$USER/envs/lfm2.5-8b-a1b/bin/python \
+  stage-1/scripts/prepare_dataset.py \
+  --config stage-1/configs/lfm2.5-8b-a1b-lora.yaml \
+  --export /absolute/export \
+  --prepared /absolute/prepared-lfm25-8b-a1b \
+  --cache-dir /absolute/huggingface-cache
+
+sbatch --time=00:30:00 \
+  stage-1/unsloth_native/lfm8b_a1b_stage1.sbatch \
+  /shared/$USER/envs/lfm2.5-8b-a1b/bin/python \
+  /absolute/export \
+  /absolute/prepared-lfm25-8b-a1b \
+  /absolute/runs/lfm25-8b-a1b/overfit-100 \
+  overfit-100 none /absolute/huggingface-cache
+```
+
+The first GPU gate must prove that the pinned stack loads
+`Lfm2MoeForCausalLM`, attaches trainable adapters to the requested dense and
+expert families, fits the RTX PRO 6000, and saves a resumable adapter. Do not
+schedule smoke or full training if any target is filtered or any expert
+adapter is missing.
 
 Use the model-specific locked environment (`minicpm5-2b.lock` or
 `qwen3.5-4b.lock`). LoRA is the recommended A40 path. `--method full` requests
@@ -141,13 +176,14 @@ LoRA or quantization.
 Last updated: 2026-09-29.
 
 | Model | Method | Gate | Hardware | Result | Evidence |
-| --- | --- | --- | --- | --- | --- |
 | `openbmb/MiniCPM5-2B` | LoRA BF16 | `overfit-100` | 1x NVIDIA A40 48 GB | **PASS** | Slurm exit `0:0`, 24m03s |
 | `openbmb/MiniCPM5-2B` | LoRA BF16 | `smoke-1000` | 1x NVIDIA A40 48 GB | **PASS** | Slurm exit `0:0`, 12m39s |
 | `openbmb/MiniCPM5-2B` | LoRA BF16 | native resume drill | 1x NVIDIA A40 48 GB | **PASS** | Resumed step 50 and completed step 63 |
 | `openbmb/MiniCPM5-2B` | LoRA BF16 | `full` | 1x NVIDIA A40 48 GB | **PASS** | [Dated full-run report](../results/2026-09-27-minicpm5-2b-tikz-lora.md) |
 | `Qwen/Qwen3.5-4B` | LoRA BF16 | `full` | 1x NVIDIA RTX PRO 6000 Blackwell | **PASS** | [Dated full-run report](../results/2026-09-28-qwen3.5-4b-tikz-lora.md) |
-| `LiquidAI/LFM2.5-2.6B` | LoRA BF16 | `overfit-100` | 1x NVIDIA RTX PRO 6000 Blackwell | **RUNNING / PARTIAL GPU VALIDATION** | Model load, adapter attachment, and finite optimizer steps verified; completion pending. See the [integration record](../results/2026-09-29-lfm2.5-2.6b-integration.md). |
+| `LiquidAI/LFM2.5-2.6B` | LoRA BF16 | `overfit-100` | 1x NVIDIA RTX PRO 6000 Blackwell | **PASS** | Eval loss `0.01573`; 280/280 steps; Slurm job `4401546`. See the [integration record](../results/2026-09-29-lfm2.5-2.6b-integration.md). |
+| `LiquidAI/LFM2.5-2.6B` | LoRA BF16 | `smoke-1000` | 1x NVIDIA RTX PRO 6000 Blackwell | **PASS** | Eval loss improved to `0.7829`; 63/63 steps and final artifact completed. |
+| `LiquidAI/LFM2.5-8B-A1B` | LoRA BF16 | Any | 1x NVIDIA RTX PRO 6000 Blackwell | **IMPLEMENTED / GPU UNVERIFIED** | [Integration record](../results/2026-09-29-lfm2.5-8b-a1b-integration.md) |
 | MiniCPM and Qwen | Full BF16 SFT | Any | Not run | **PENDING** | Requires a separate memory probe on suitable high-memory hardware |
 | `inclusionAI/Ling-3.0-tiny` | LoRA BF16 | Any | Not run | **CODE READY / GPU UNVERIFIED** | [Integration and required gates](../ling_native/README.md) |
 
