@@ -28,14 +28,14 @@ lora:
   alpha: 64
   dropout: 0.0
   bias: none
-  # LiquidAI/Unsloth's LFM2.5 LoRA recipe names these attention and MLP
-  # projections. The native loader checks every suffix on the pinned model.
+  # Unsloth 2026.9.11 filters explicit targets through its attention/MLP
+  # families. LFM's short-convolution in_proj exists, but is filtered out and
+  # receives no adapter, so keep the seven targets this runtime attaches.
   target_modules:
     - q_proj
     - k_proj
     - v_proj
     - out_proj
-    - in_proj
     - w1
     - w2
     - w3
