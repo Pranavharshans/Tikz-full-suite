@@ -15,6 +15,11 @@ class NativeRegistryTests(unittest.TestCase):
                          "FastLanguageModel")
         self.assertEqual(models.get_spec("qwen3.5-4b").loader_name,
                          "FastVisionModel")
+        qwen9b = models.get_spec("qwen3.5-9b")
+        self.assertEqual(qwen9b.loader_name, "FastVisionModel")
+        self.assertEqual(qwen9b.adapter, "qwen3.5")
+        self.assertEqual(qwen9b.config_path("lora").name,
+                         "qwen3.5-9b-lora.yaml")
         lfm = models.get_spec("lfm2.5-2.6b")
         self.assertEqual(lfm.loader_name, "FastLanguageModel")
         self.assertEqual(lfm.adapter, "lfm25-2.6b")

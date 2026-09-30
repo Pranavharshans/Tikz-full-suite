@@ -22,3 +22,9 @@ On **September 29, 2026**, Stage 1 added a standalone Unsloth/TRL LoRA path for
 Its overfit, resume, and smoke gates passed on RTX PRO 6000. The same native
 framework now also includes an isolated, GPU-unverified sparse-MoE path for
 [`LiquidAI/LFM2.5-8B-A1B`](stage-1/results/2026-09-29-lfm2.5-8b-a1b-integration.md).
+
+Gemma 4 12B now has a standalone text-only BF16 LoRA launcher at
+[`stage-1/unsloth_native/train_gemma12b.py`](stage-1/unsloth_native/train_gemma12b.py),
+with its own pinned configuration, candidate environment and Slurm wrapper.
+See the [native training instructions](stage-1/unsloth_native/README.md#gemma-4-12b-standalone-lora).
+GPU loading, staged training gates and resume validation remain pending.

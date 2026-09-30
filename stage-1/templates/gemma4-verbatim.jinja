@@ -1,0 +1,16 @@
+{# Single-turn text-only Gemma 4 template. Preserve literal TikZ content.
+   Match native turn markers and thinking-disabled generation prefix; unlike
+   the upstream template, never strip channel-looking text from targets. #}
+{{- bos_token -}}
+{%- for message in messages %}
+    {%- if message['role'] == 'assistant' %}
+        {{- '<|turn>model\n<|channel>thought\n<channel|>' -}}
+    {%- else %}
+        {{- '<|turn>' + message['role'] + '\n' -}}
+    {%- endif %}
+    {{- message['content'] -}}
+    {{- '<turn|>\n' -}}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|turn>model\n<|channel>thought\n<channel|>' -}}
+{%- endif %}

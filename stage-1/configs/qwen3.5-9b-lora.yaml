@@ -1,0 +1,60 @@
+# BF16 LoRA configuration for the post-trained Qwen/Qwen3.5-9B checkpoint.
+# This deliberately reuses the validated Qwen3.5-4B software lock while
+# keeping model, prepared-data and run identities completely separate.
+inherit: common.yaml
+
+model:
+  id: Qwen/Qwen3.5-9B
+  # Resolved from the public Hub API on 2026-09-30.
+  revision: c202236235762e1c871ad0ccb60c8ee5ba337b9a
+  adapter: qwen3.5
+  loader: unsloth-vision-model
+
+training:
+  method: lora
+  epochs: 2
+  learning_rate: 1.0e-4
+  # Keep the smaller micro-batch for this variable-length, right-padded
+  # dataset. The measured 1,000-row smoke runtime was 469.2 s at 2x8 versus
+  # 616.4 s at 4x4 because the larger micro-batches performed more padding
+  # work. Both shapes have the same effective batch of 16 and validation loss.
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 8
+  # Two epochs produce about 60 checkpoints at the audited dataset size.
+  # Keeping 40 preserves the epoch-one candidate while retaining frequent
+  # restart points for short Slurm backfill allocations.
+  save_total_limit: 40
+
+lora:
+  rank: 64
+  alpha: 64
+  dropout: 0.0
+  bias: none
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+environment:
+  # The 4B environment is intentionally reused; the exact dependency set is
+  # already validated for the Qwen3.5 FastVisionModel path.
+  lock_file: locks/qwen3.5-4b.lock
+  python_version: "3.12"
+
+hardware:
+  profile: rtxpro6000-lora
+
+gates:
+  full:
+    max_rows: null
+    epochs: 2
+    save_steps: 200
+    eval_steps: 200
+    logging_steps: 10
+    generation_samples: 4
+    check_gradients: false

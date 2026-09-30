@@ -238,3 +238,50 @@ Run one epoch of MiniCPM LoRA SFT on the complete eligible prepared training
 split. Keep native checkpointing enabled and use `--resume auto` so a Slurm
 interruption can continue in the same run directory. Do not initialize this run
 from either the overfit or smoke adapter.
+
+## Gemma 4 12B standalone LoRA
+
+`train_gemma12b.py` selects `unsloth/gemma-4-12b-it` at
+`55cdba0740a9765956f49501f689a66b098feda3`, the instruction-tuned Unified
+checkpoint. It loads BF16 weights through `FastVisionModel`; Stage 1 inputs
+are text only, and vision/audio adapter attachment is disabled. The pinned
+verbatim template uses Gemma turn markers and an empty thought prefix with
+thinking disabled, preserving literal TikZ labels and whitespace.
+
+Use a separate Python 3.12 Linux/NVIDIA environment and run
+`bash stage-1/unsloth_native/install_gemma12b.sh`. The base lock pins
+Transformers 5.17.0 and Unsloth Zoo 2026.9.8. Unsloth 2026.9.12 still declares
+`transformers<=5.5.0`, before Gemma Unified support; the installer first installs
+Unsloth with its dependencies, then applies the newer base lock and retains
+the exact Unsloth wheel with `--no-deps`. `pip check`
+will report this known metadata conflict. This override must pass the GPU
+load/forward/backward gates before training is approved. This is a
+candidate environment: CPU config/formatting checks do not prove CUDA loading,
+LoRA attachment, memory fit, or training. Start with `overfit-100`, require
+`metrics.json` to report `passed: true`, then run `smoke-1000` and its resume
+drill before the `full` dataset gate. Full means the full dataset with LoRA;
+full-parameter SFT is not enabled for this model.
+
+```bash
+python stage-1/scripts/prepare_dataset.py \
+  --config stage-1/configs/gemma4-12b-lora.yaml \
+  --export /absolute/export \
+  --prepared /absolute/prepared-gemma4-12b \
+  --cache-dir /absolute/huggingface-cache
+
+python stage-1/unsloth_native/train_gemma12b.py \
+  --gate overfit-100 \
+  --export /absolute/export \
+  --prepared /absolute/prepared-gemma4-12b \
+  --run-dir /absolute/runs/gemma4-12b/overfit-100 \
+  --resume auto \
+  --cache-dir /absolute/huggingface-cache \
+  --local-files-only
+```
+
+After downloading the pinned snapshot and preparing Gemma-specific data,
+`gemma12b_stage1.sbatch` accepts the same positional arguments as the other
+native wrappers: `PYTHON EXPORT PREPARED RUN_DIR GATE RESUME [CACHE_DIR]`.
+It targets one RTX PRO 6000. No Gemma GPU or Slurm job has been run as part of
+this integration. Upstream sources: [model](https://huggingface.co/unsloth/gemma-4-12b-it),
+[Unsloth guide](https://unsloth.ai/docs/models/gemma-4).

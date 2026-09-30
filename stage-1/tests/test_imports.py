@@ -66,6 +66,7 @@ class ImportSafetyTests(unittest.TestCase):
         launchers = (
             STAGE1 / "unsloth_native" / "train_minicpm.py",
             STAGE1 / "unsloth_native" / "train_qwen.py",
+            STAGE1 / "unsloth_native" / "train_qwen9b.py",
             STAGE1 / "ling_native" / "train_ling.py",
         )
         for launcher in launchers:

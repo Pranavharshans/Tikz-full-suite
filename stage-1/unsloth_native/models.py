@@ -46,6 +46,12 @@ MODEL_SPECS = {
             "full": "configs/qwen3.5-4b-full.yaml",
         },
     ),
+    "qwen3.5-9b": NativeModelSpec(
+        key="qwen3.5-9b",
+        adapter="qwen3.5",
+        loader_name="FastVisionModel",
+        configs={"lora": "configs/qwen3.5-9b-lora.yaml"},
+    ),
     "lfm2.5-2.6b": NativeModelSpec(
         key="lfm2.5-2.6b",
         adapter="lfm25-2.6b",
@@ -57,6 +63,12 @@ MODEL_SPECS = {
         adapter="lfm25-8b-a1b",
         loader_name="FastLanguageModel",
         configs={"lora": "configs/lfm2.5-8b-a1b-lora.yaml"},
+    ),
+    "gemma4-12b": NativeModelSpec(
+        key="gemma4-12b",
+        adapter="gemma4-12b",
+        loader_name="FastVisionModel",
+        configs={"lora": "configs/gemma4-12b-lora.yaml"},
     ),
     "ling3-tiny": NativeModelSpec(
         key="ling3-tiny",
@@ -278,6 +290,15 @@ def load_native_model(spec: NativeModelSpec, config, prepared_model: dict, *,
             raise DataError("LoRA method selected without a LoRA configuration")
         adapters.validate_target_modules(
             adapters.module_short_names(model), lora.target_modules)
+        peft_kwargs = {}
+        if spec.key == "gemma4-12b":
+            # Unified Gemma has vision/audio modules with overlapping suffixes.
+            # Constrain adapters to the language transformer for Stage 1.
+            peft_kwargs = {
+                "finetune_vision_layers": False,
+                "finetune_audio_layers": False,
+                "finetune_language_layers": True,
+            }
         model = Loader.get_peft_model(
             model,
             r=lora.rank,
@@ -288,6 +309,7 @@ def load_native_model(spec: NativeModelSpec, config, prepared_model: dict, *,
             use_gradient_checkpointing=(
                 "unsloth" if config.training.gradient_checkpointing else False),
             random_state=config.seed,
+            **peft_kwargs,
         )
         adapters.verify_lora_trainables(model.named_parameters(), lora)
     for_training = getattr(Loader, "for_training", None)

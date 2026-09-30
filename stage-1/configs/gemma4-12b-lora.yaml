@@ -1,0 +1,41 @@
+# Text-only BF16 LoRA for the instruction-tuned Gemma 4 12B Unified.
+# Public Hub revision resolved 2026-09-30; GPU validation remains pending.
+inherit: common.yaml
+
+model:
+  id: unsloth/gemma-4-12b-it
+  revision: 55cdba0740a9765956f49501f689a66b098feda3
+  adapter: gemma4-12b
+  loader: unsloth-vision-model
+
+tokenizer:
+  chat_template_file: templates/gemma4-verbatim.jinja
+  chat_template_kwargs:
+    enable_thinking: false
+  pad_token: "<pad>"
+
+training:
+  method: lora
+  learning_rate: 1.0e-4
+
+lora:
+  rank: 64
+  alpha: 64
+  dropout: 0.0
+  bias: none
+  # v_proj exists in sliding attention; global attention shares K and V.
+  target_modules:
+    - q_proj
+    - k_proj
+    - v_proj
+    - o_proj
+    - gate_proj
+    - up_proj
+    - down_proj
+
+environment:
+  lock_file: locks/gemma4-12b.lock
+  python_version: "3.12"
+
+hardware:
+  profile: rtxpro6000-lora

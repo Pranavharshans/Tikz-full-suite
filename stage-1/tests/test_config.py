@@ -80,7 +80,7 @@ class ParsingTests(unittest.TestCase):
         self.assertNotIn("gate_proj", config.lora.target_modules)
         self.assertEqual(config_module.SUPPORTED_ADAPTERS,
                          ("qwen3.5", "minicpm5", "ling3", "lfm25-2.6b",
-                          "lfm25-8b-a1b"))
+                          "lfm25-8b-a1b", "gemma4-12b"))
 
     def test_split_fractions_must_sum_below_one(self):
         with self.assertRaisesRegex(ConfigError, "must be < 1"):
