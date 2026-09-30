@@ -46,6 +46,12 @@ MODEL_SPECS = {
             "full": "configs/qwen3.5-4b-full.yaml",
         },
     ),
+    "qwen3.5-9b": NativeModelSpec(
+        key="qwen3.5-9b",
+        adapter="qwen3.5",
+        loader_name="FastVisionModel",
+        configs={"lora": "configs/qwen3.5-9b-lora.yaml"},
+    ),
     "lfm2.5-2.6b": NativeModelSpec(
         key="lfm2.5-2.6b",
         adapter="lfm25-2.6b",
