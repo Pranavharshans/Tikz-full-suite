@@ -14,12 +14,13 @@ training:
   method: lora
   epochs: 2
   learning_rate: 1.0e-4
-  # The RTX PRO 6000 has enough headroom to double the micro-batch while
-  # preserving the audited effective batch of 16. This reduces accumulation
-  # overhead without changing the optimizer-step schedule or learning rate.
-  per_device_train_batch_size: 4
-  per_device_eval_batch_size: 4
-  gradient_accumulation_steps: 4
+  # Keep the smaller micro-batch for this variable-length, right-padded
+  # dataset. The measured 1,000-row smoke runtime was 469.2 s at 2x8 versus
+  # 616.4 s at 4x4 because the larger micro-batches performed more padding
+  # work. Both shapes have the same effective batch of 16 and validation loss.
+  per_device_train_batch_size: 2
+  per_device_eval_batch_size: 2
+  gradient_accumulation_steps: 8
   # Two epochs produce about 60 checkpoints at the audited dataset size.
   # Keeping 40 preserves the epoch-one candidate while retaining frequent
   # restart points for short Slurm backfill allocations.
