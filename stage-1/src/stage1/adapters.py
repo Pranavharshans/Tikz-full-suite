@@ -59,6 +59,14 @@ ADAPTERS = {
         template_kwargs={"enable_thinking": False},
         notes="Text-only LlamaForCausalLM; the text-only comparison baseline.",
     ),
+    "gemma4-12b": ModelAdapter(
+        name="gemma4-12b",
+        context_length=262144,
+        default_attn_implementation=None,
+        template_kwargs={"enable_thinking": False},
+        notes=("Gemma4UnifiedForConditionalGeneration; Stage 1 uses "
+               "FastVisionModel with text-only BF16 LoRA SFT."),
+    ),
     "ling3": ModelAdapter(
         name="ling3",
         context_length=131072,
