@@ -27,17 +27,36 @@ K/V; v_proj targets apply to sliding attention projections.
 - Stage 1 suite: 527 tests run, 92 skipped, no failures (435 passed).
 - Launcher --help, both shell syntax checks, git diff --check passed.
 
+## RTX PRO 6000 validation
+
+The pinned environment loaded and patched the full 12B checkpoint on one
+NVIDIA RTX PRO 6000 Blackwell Server Edition. Transformers 5.17 removed
+`warmup_ratio`; the native runner now preserves the configured ratio through
+the replacement `warmup_steps` float interface. The compatibility regression
+passes without weakening the runner's refusal of unknown training arguments.
+
+- `overfit-100`: **PASS**, 40 epochs and 280 optimizer steps; evaluation loss
+  0.01183, trainer runtime 1,832 seconds, and peak observed GPU memory 47.5 GB.
+- `smoke-1000`: **PASS**, one epoch and 63 optimizer steps; evaluation loss
+  0.556813, trainer loss 0.594786, 1,119,676 reported input tokens, and peak
+  observed GPU memory 64.8 GB.
+- Resume drill: **PASS** from smoke `checkpoint-50`; it completed step 63 with
+  evaluation loss 0.5568 and saved a complete final adapter.
+- Full-data gate: in progress in resumable four-hour allocations. Early
+  validation loss improved from 0.4786 at step 600 to 0.4604 at step 800 and
+  approximately 0.4321 later in the first allocation. Full completion is not
+  claimed here.
+
+Torch Inductor occasionally waits five minutes for compile-worker shutdown
+after final artifacts and metrics have already been written. Completed jobs
+still exit `0:0`; this cleanup warning has not invalidated a gate.
+
 ## Remaining validation
 
-No weights loaded, GPU run, training gate, memory-fit test, or Slurm submission.
-The GPU environment is a candidate, not a validated lock. Unsloth 2026.9.12
-metadata caps Transformers at 5.5.0 (before Unified support). The explicit
-installer first obtains its dependencies, then applies Transformers 5.17.0
-(within Unsloth Zoo 2026.9.8's Linux ceiling) and retains the pinned Unsloth
-wheel without dependency resolution. `pip check` will report that intentional
-metadata conflict. Require GPU import/load, forward/backward, adapter-family
-checks and bounded overfit before advancing. Token quarantine must also pass
-for the Gemma-specific prepared dataset; it was not tested on the full export.
+The full-data gate must reach all 5,918 optimizer steps, pass its acceptance
+record, and save its final adapter before the Gemma training result can be
+called complete. Compilation rate, rendered-image similarity, and qualitative
+evaluation remain separate post-training work.
 
 Sources: [checkpoint](https://huggingface.co/unsloth/gemma-4-12b-it),
 [Gemma guide](https://unsloth.ai/docs/models/gemma-4),

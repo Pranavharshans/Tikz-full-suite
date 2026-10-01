@@ -92,6 +92,12 @@ def _sft_arguments(SFTConfig, config, gate, run_dir: Path, *, has_eval: bool):
             raise DataError(
                 "Installed TRL SFTConfig cannot enforce overwrite_output_dir")
         values.pop("overwrite_output_dir", None)
+    # Transformers 5 removed warmup_ratio and folded its ratio semantics into
+    # warmup_steps: an integer is an exact step count, while a float in [0, 1)
+    # is interpreted as a fraction of the total training steps.  Preserve the
+    # configured schedule exactly when running against the new API.
+    if "warmup_ratio" not in parameters and "warmup_steps" in parameters:
+        values["warmup_steps"] = values.pop("warmup_ratio")
     unsupported = sorted(set(values) - set(parameters))
     for key in unsupported:
         # Refuse version drift instead of silently losing an optimization,
