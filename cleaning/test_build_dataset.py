@@ -197,6 +197,14 @@ class IdentityTests(unittest.TestCase):
             config.require_pinned()
         make_config().require_pinned()
 
+    def test_nonzero_production_slice_is_valid_and_changes_identity(self):
+        base = make_config()
+        sliced = mutate(base, dataset__row_start=100_000, dataset__row_limit=100_000)
+        sliced.validate()
+        self.assertNotEqual(sliced.identity_sha256(), base.identity_sha256())
+        final_slice = mutate(base, dataset__row_start=400_000, dataset__row_limit=28_000)
+        final_slice.validate()
+
     def test_identity_diff_reports_nested_fields(self):
         base = make_config()
         changed = mutate(base, inference__mtp=3, prompt=b.Prompt(
@@ -393,6 +401,19 @@ class FreezeTests(unittest.TestCase):
                                        b.sha256_bytes(TINY_PNG))
             self.assertNotIn(excluded, {entry["row_id"] for entry in entries})
 
+    def test_nonzero_slice_preserves_global_source_indices(self):
+        rows = [fake_row(i, tikz=f"\\draw ({i},0);") for i in range(10)]
+        with tempfile.TemporaryDirectory() as directory:
+            meta = b.freeze_source(iter(rows), work=directory, dataset_id="d",
+                                   revision="r" * 40, split="train",
+                                   limits=b.FreezeLimits(), row_start=4, row_limit=3,
+                                   write_images=False)
+            self.assertEqual((meta["row_start"], meta["row_limit"]), (4, 3))
+            entries = list(b.iter_manifest(directory))
+            self.assertEqual([entry["source_row_index"] for entry in entries], [4, 5, 6])
+            self.assertIn("(4,0)", entries[0]["tikz_code"])
+            self.assertEqual(meta["manifest_sha256"], b.sha256_file(b.manifest_path(directory)))
+
     def test_short_stream_is_a_hard_failure(self):
         rows = [fake_row(i) for i in range(5)]
         with tempfile.TemporaryDirectory() as directory:
@@ -439,7 +460,8 @@ class FreezeTests(unittest.TestCase):
             deps2 = FakePrepareDeps(rows)
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
-                self.assertEqual(b.cmd_prepare(prepare_args(work), deps2), 0)
+                self.assertEqual(
+                    b.cmd_prepare(prepare_args(work, "--row-limit", "6"), deps2), 0)
             self.assertIn("Reusing frozen manifest", output.getvalue())
             self.assertEqual(deps2.pulled, [])
             self.assertEqual(json.loads(b.manifest_meta_path(work).read_text()), first_meta)
@@ -447,14 +469,16 @@ class FreezeTests(unittest.TestCase):
             with self.assertRaisesRegex(b.ConfigError, "does not match frozen manifest"):
                 b.cmd_prepare(prepare_args(work, "--dataset-revision", "9" * 40), deps2)
 
-    def test_prepare_refuses_row_limit_without_fixture_mode(self):
-        rows = [fake_row(i) for i in range(3)]
+    def test_prepare_accepts_short_production_slice_with_two_replicas(self):
+        rows = [fake_row(i) for i in range(8)]
         with tempfile.TemporaryDirectory() as directory:
             args = b.build_parser().parse_args(
-                ["prepare", "--work", directory, "--row-limit", "3"])
+                ["prepare", "--work", directory, "--row-start", "3",
+                 "--row-limit", "3", "--no-download-model"])
             with mock.patch.dict("os.environ", {"SLURM_JOB_ID": "12345"}):
-                with self.assertRaisesRegex(b.ConfigError, "synthetic-fixture control"):
-                    b.cmd_prepare(args, FakePrepareDeps(rows))
+                self.assertEqual(b.cmd_prepare(args, FakePrepareDeps(rows)), 0)
+            meta = b.verify_manifest(directory)
+            self.assertEqual((meta["row_start"], meta["row_limit"]), (3, 3))
 
     def test_disk_estimate_and_guard(self):
         rows = [fake_row(i) for i in range(10)]
@@ -1224,6 +1248,11 @@ class RunArgumentTests(unittest.TestCase):
             with self.assertRaises(b.ConfigError, msg=str(extra)):
                 b.validate_run_args(self.parse(*extra))
 
+    def test_nonzero_slice_defaults_to_global_slice_bounds(self):
+        args = self.parse("--row-start", "100000", "--row-limit", "100000")
+        b.validate_run_args(args)
+        self.assertEqual((args.start_index, args.end_index), (100000, 199999))
+
     def test_module_import_does_not_require_heavy_dependencies(self):
         """Importing the module must not pull in pyarrow, PIL, datasets or vLLM."""
         program = (
@@ -1497,6 +1526,12 @@ class SlurmScriptTests(unittest.TestCase):
         self.assertIn("#SBATCH --gres=gpu:rtxpro6k:4", script)
         self.assertIn("--replicas 4", script)
         self.assertIn("--concurrency 128", script)
+        subprocess.run(["bash", "-n"], input=script, text=True, check=True)
+
+    def test_script_carries_nonzero_source_slice_through_prepare_and_run(self):
+        script = self.build("--row-start", "100000", "--row-limit", "100000")
+        self.assertGreaterEqual(script.count("--row-start 100000"), 2)
+        self.assertIn("--start-index 100000 --end-index 199999", script)
         subprocess.run(["bash", "-n"], input=script, text=True, check=True)
 
     def test_script_rejects_gpu_replica_mismatch(self):

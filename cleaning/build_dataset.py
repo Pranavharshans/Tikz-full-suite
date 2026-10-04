@@ -372,18 +372,18 @@ class RunConfig:
         if self.dataset.split != DATASET_SPLIT:
             raise ConfigError(f"Production split is {DATASET_SPLIT!r}, got {self.dataset.split!r}")
         self.inference.validate()
-        production = (self.dataset.row_start == ROW_START
-                      and self.dataset.row_limit == ROW_LIMIT
+        if self.dataset.row_start < 0:
+            raise ConfigError("Dataset row_start cannot be negative")
+        production = (1 <= self.dataset.row_limit <= ROW_LIMIT
                       and self.inference.replicas in (2, 4))
         # Synthetic tests historically use short manifests with two fake workers;
         # command-level guards below restrict real shortened runs to one replica.
-        pilot_or_fixture = (self.dataset.row_start == ROW_START
-                            and 1 <= self.dataset.row_limit <= 1000
+        pilot_or_fixture = (1 <= self.dataset.row_limit <= 1000
                             and self.inference.replicas in (1, 2))
         if not (production or pilot_or_fixture):
             raise ConfigError(
-                "Supported profiles are production (100,000 rows, two or four replicas) or "
-                "an isolated pilot (1-1,000 rows from index 0, one replica)")
+                "Supported profiles are production slices (1-100,000 rows, two or four "
+                "replicas) or an isolated pilot (1-1,000 rows, one replica)")
         self.validation.validate()
         if not self.prompt.text or self.prompt.sha256 != sha256_text(self.prompt.text):
             raise ConfigError("Prompt text does not match its recorded hash")
@@ -474,6 +474,7 @@ def config_from_args(args, *, manifest_meta=None, prompt: Prompt | None = None,
     model_revision = meta.get("model_revision") or args.model_revision or "UNRESOLVED"
     config = RunConfig(
         dataset=DatasetSource(dataset_id=args.dataset, revision=dataset_revision,
+                              row_start=int(meta.get("row_start", args.row_start)),
                               row_limit=int(meta.get("row_limit", args.row_limit))),
         model=ModelSource(model_id=args.model, revision=model_revision,
                           processor_revision=model_revision, path=meta.get("model_path", "")),
@@ -796,9 +797,10 @@ def verify_staged_freeze(manifest_tmp, stage_images, expected_rows: int) -> None
 
 def freeze_source(rows, *, work, dataset_id: str, revision: str, split: str,
                   limits: FreezeLimits, meta_extra: dict | None = None,
-                  row_limit: int = ROW_LIMIT, write_images: bool = True,
+                  row_start: int = ROW_START, row_limit: int = ROW_LIMIT,
+                  write_images: bool = True,
                   progress_every: int = 0) -> dict:
-    """Freeze exactly ``row_limit`` streamed rows and commit the manifest atomically.
+    """Freeze one exact streamed source slice and commit the manifest atomically.
 
     A partial freeze leaves no ``manifest.jsonl``/``manifest.meta.json`` at the
     top level; ``manifest.meta.json`` is written last and is the only marker
@@ -816,7 +818,8 @@ def freeze_source(rows, *, work, dataset_id: str, revision: str, split: str,
     written = 0
     try:
         with manifest_tmp.open("w", encoding="utf-8") as handle:
-            for index, row in enumerate(islice(rows, row_limit)):
+            for index, row in enumerate(
+                    islice(rows, row_start, row_start + row_limit), start=row_start):
                 entry = freeze_row(index, row, dataset_id=dataset_id, revision=revision,
                                    split=split, limits=limits,
                                    stage_images=stage_images if write_images else None)
@@ -856,7 +859,7 @@ def freeze_source(rows, *, work, dataset_id: str, revision: str, split: str,
             "dataset_id": dataset_id,
             "dataset_revision": revision,
             "split": split,
-            "row_start": 0,
+            "row_start": row_start,
             "row_limit": row_limit,
             "rows_frozen": written,
             "valid_rows": counts["valid"],
@@ -891,6 +894,11 @@ def verify_manifest(work, *, quick: bool = True) -> dict:
             f"manifest.meta.json is not valid JSON ({exc}); the freeze was interrupted") from exc
     if meta.get("schema_version") != MANIFEST_SCHEMA_VERSION:
         raise ManifestError(f"Manifest schema {meta.get('schema_version')!r} is not supported")
+    row_start = int(meta.get("row_start", 0))
+    row_limit = int(meta.get("row_limit", 0))
+    if row_start < 0 or row_limit < 1:
+        raise ManifestError(
+            f"Invalid frozen source slice row_start={row_start}, row_limit={row_limit}")
     path = manifest_path(work)
     if not path.is_file():
         raise ManifestError(f"manifest.jsonl missing under {work}")
@@ -904,9 +912,11 @@ def verify_manifest(work, *, quick: bool = True) -> dict:
                 continue
             entry = json.loads(line)
             index = entry.get("source_row_index")
-            if index != count:
+            expected_index = row_start + count
+            if index != expected_index:
                 raise ManifestError(
-                    f"Manifest row {count} has source_row_index {index}; indices must be contiguous from 0")
+                    f"Manifest row {count} has source_row_index {index}; indices must be "
+                    f"contiguous from {row_start}")
             if entry["row_id"] in seen_ids:
                 raise ManifestError(f"Duplicate stable id {entry['row_id']} at source row {index}")
             seen_ids.add(entry["row_id"])
@@ -975,6 +985,12 @@ def check_manifest_agreement(args, meta: dict) -> None:
     if args.model_revision and args.model_revision != meta.get("model_revision"):
         raise ConfigError(f"--model-revision {args.model_revision} does not match frozen "
                           f"manifest {meta.get('model_revision')}")
+    if args.row_start != int(meta.get("row_start", 0)):
+        raise ConfigError(f"--row-start {args.row_start} does not match frozen manifest "
+                          f"{meta.get('row_start', 0)}")
+    if args.row_limit != int(meta.get("row_limit", 0)):
+        raise ConfigError(f"--row-limit {args.row_limit} does not match frozen manifest "
+                          f"{meta.get('row_limit')}")
 
 
 class PrepareDeps:
@@ -1006,12 +1022,13 @@ def cmd_prepare(args, deps=None) -> int:
     require_slurm(args)
     deps = deps or PrepareDeps()
     work = Path(args.work).resolve()
+    row_start = args.row_start
     row_limit = args.row_limit
-    if row_limit != ROW_LIMIT and not args.allow_non_slurm and not (
-            args.replicas == 1 and 1 <= row_limit <= 1000):
+    if row_start < 0 or not 1 <= row_limit <= ROW_LIMIT:
         raise ConfigError(
-            "--row-limit is a synthetic-fixture control unless used as an isolated "
-            "1-1,000-row pilot with --replicas 1")
+            f"A source slice requires --row-start >= 0 and --row-limit in 1..{ROW_LIMIT}")
+    if not args.allow_non_slurm and args.replicas == 1 and row_limit > 1000:
+        raise ConfigError("The one-GPU topology is reserved for 1-1,000-row pilots")
     limits = FreezeLimits(max_tikz_chars=args.max_tikz_chars,
                           max_image_bytes=args.max_image_bytes,
                           estimate_rows=args.estimate_rows)
@@ -1049,7 +1066,8 @@ def cmd_prepare(args, deps=None) -> int:
     model_revision = deps.resolve_model_revision(args)
     print(f"Pinned dataset revision: {dataset_revision}")
     print(f"Pinned model revision:   {model_revision}")
-    sample = list(islice(deps.row_source(args, dataset_revision), limits.estimate_rows))
+    sample = list(islice(deps.row_source(args, dataset_revision), row_start,
+                         row_start + min(limits.estimate_rows, row_limit)))
     if len(sample) < min(limits.estimate_rows, row_limit):
         raise SystemExit(
             f"Dataset stream returned only {len(sample)} rows for the storage estimate; "
@@ -1071,11 +1089,12 @@ def cmd_prepare(args, deps=None) -> int:
         "storage": dict(estimate, required_bytes=required),
         "runner_sha256": sha256_file(Path(__file__).resolve()),
     }
-    print(f"Freezing source rows 0-{row_limit - 1} from {args.dataset}@{dataset_revision} ...")
+    print(f"Freezing source rows {row_start}-{row_start + row_limit - 1} "
+          f"from {args.dataset}@{dataset_revision} ...")
     meta = freeze_source(deps.row_source(args, dataset_revision), work=work,
                          dataset_id=args.dataset, revision=dataset_revision,
                          split=DATASET_SPLIT, limits=limits, meta_extra=meta_extra,
-                         row_limit=row_limit, progress_every=5000)
+                         row_start=row_start, row_limit=row_limit, progress_every=5000)
     print(f"Frozen manifest complete: {manifest_path(work)}")
     print(f"  rows={meta['rows_frozen']} valid={meta['valid_rows']} rejected={meta['rejected_rows']}")
     if meta["rejection_counts"]:
@@ -2636,6 +2655,7 @@ class ControllerLock:
 
 def run_pipeline(args, config, meta, deps, stop_flag=None) -> dict:
     """Wave-based controller: claim, run, ingest, reclaim, repeat."""
+    resolve_run_bounds(args)
     work = Path(args.work).resolve()
     stop_flag = stop_flag or StopFlag()
     lock = ControllerLock(work)
@@ -2731,11 +2751,21 @@ def _run_pipeline_locked(args, config, meta, deps, stop_flag, work) -> dict:
         ledger.close()
 
 
-def validate_run_args(args) -> None:
-    if not 0 <= args.start_index <= args.end_index <= ROW_LIMIT - 1:
+def resolve_run_bounds(args) -> None:
+    slice_start = args.row_start
+    slice_end = args.row_start + args.row_limit - 1
+    if args.start_index is None:
+        args.start_index = slice_start
+    if args.end_index is None:
+        args.end_index = slice_end
+    if not slice_start <= args.start_index <= args.end_index <= slice_end:
         raise ConfigError(
-            f"Chunk bounds must satisfy 0 <= start <= end <= {ROW_LIMIT - 1}; got "
-            f"{args.start_index}..{args.end_index}")
+            f"Chunk bounds must stay inside frozen source slice "
+            f"{slice_start}..{slice_end}; got {args.start_index}..{args.end_index}")
+
+
+def validate_run_args(args) -> None:
+    resolve_run_bounds(args)
     if args.max_rows_this_run is not None and args.max_rows_this_run < 1:
         raise ConfigError("--max-rows-this-run must be positive")
     if args.max_runtime_minutes is not None and args.max_runtime_minutes <= 0:
@@ -2763,8 +2793,6 @@ def cmd_run(args, deps=None) -> int:
     deps = deps or PipelineDeps()
     work = Path(args.work).resolve()
     meta = verify_manifest(work, quick=True)
-    if not args.allow_non_slurm and meta.get("row_limit") != ROW_LIMIT and args.replicas != 1:
-        raise ConfigError("A shortened manifest requires the one-GPU pilot topology")
     if not args.vllm_sif:
         raise ConfigError("run requires --vllm-sif (the engine container)")
     container = deps.container_sha256(args.vllm_sif, work)
@@ -3435,11 +3463,13 @@ def run_audit(work, *, quick: bool = False, export_dir=None) -> dict:
         extra = ledger_ids - set(index)
         report.check("ledger.row_set_matches_manifest", not missing and not extra,
                      f"missing={len(missing)} extra={len(extra)}")
+        slice_start = int(meta.get("row_start", 0))
+        slice_end = slice_start + int(meta["row_limit"]) - 1
         out_of_range = ledger.conn.execute(
-            "SELECT COUNT(*) FROM rows WHERE source_row_index < 0 OR source_row_index > ?",
-            (meta["row_limit"] - 1,)).fetchone()[0]
-        report.check("ledger.no_index_above_limit", out_of_range == 0,
-                     f"{out_of_range} rows outside 0..{meta['row_limit'] - 1}")
+            "SELECT COUNT(*) FROM rows WHERE source_row_index < ? OR source_row_index > ?",
+            (slice_start, slice_end)).fetchone()[0]
+        report.check("ledger.no_index_outside_slice", out_of_range == 0,
+                     f"{out_of_range} rows outside {slice_start}..{slice_end}")
         manifest_rejected = {entry["row_id"] for entry in iter_manifest(work)
                              if entry["status"] == "rejected"}
         rejected_states = {row["row_id"]: row["state"] for row in ledger.conn.execute(
@@ -3662,6 +3692,7 @@ def build_slurm_script(args) -> str:
         raise ConfigError("--vllm-sif is required when generating a Slurm script")
     if args.gpus != args.replicas:
         raise ConfigError("--gpus must equal --replicas (one TP1 replica per GPU)")
+    resolve_run_bounds(args)
     wall_minutes = parse_wall_time(args.wall_time)
     max_runtime = args.max_runtime_minutes
     if max_runtime is None:
@@ -3684,6 +3715,7 @@ def build_slurm_script(args) -> str:
 
     prepare_flags = ["prepare", "--work", work, "--model", args.model,
                      "--dataset", args.dataset, "--model-cache-dir", model_cache,
+                     "--row-start", str(args.row_start),
                      "--row-limit", str(args.row_limit), "--replicas", str(args.replicas)]
     if args.dataset_revision:
         prepare_flags += ["--dataset-revision", args.dataset_revision]
@@ -3693,7 +3725,8 @@ def build_slurm_script(args) -> str:
 
     run_flags = [
         "run", "--work", work, "--model", args.model, "--vllm-sif", vllm,
-        "--row-limit", str(args.row_limit), "--replicas", str(args.replicas),
+        "--row-start", str(args.row_start), "--row-limit", str(args.row_limit),
+        "--replicas", str(args.replicas),
         "--concurrency", str(args.concurrency), "--mtp", str(args.mtp),
         "--batch-token-budget", str(args.batch_token_budget),
         "--context", str(args.context),
@@ -3887,8 +3920,10 @@ def add_common_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--model-revision", default="",
                         help="Pinned model commit sha (resolved from the Hub when omitted)")
     parser.add_argument("--prompt-version", default=DEFAULT_PROMPT_VERSION)
+    parser.add_argument("--row-start", type=int, default=ROW_START,
+                        help="Zero-based first source row in this isolated work directory")
     parser.add_argument("--row-limit", type=int, default=ROW_LIMIT,
-                        help="Frozen source-row count (production: 100000; pilot: 1-1000)")
+                        help="Frozen source-row count (production slice: at most 100000)")
     parser.add_argument("--replicas", type=int, choices=(1, 2, 4), default=2,
                         help="Independent TP1 replicas (production: 2 or 4; pilot: 1)")
     parser.add_argument("--concurrency", type=int, default=64, help="Aggregate in-flight requests")
@@ -3916,7 +3951,7 @@ def build_parser() -> argparse.ArgumentParser:
     plan.set_defaults(handler=cmd_plan)
 
     prepare = subparsers.add_parser(
-        "prepare", help="Freeze exactly the first 100,000 source rows into a manifest")
+        "prepare", help="Freeze one exact source-row slice into a manifest")
     add_common_arguments(prepare)
     prepare.add_argument("--model-cache-dir", default="",
                          help="Hugging Face cache for the model snapshot (default: WORK/hf)")
@@ -3940,8 +3975,10 @@ def build_parser() -> argparse.ArgumentParser:
                      help="Bounded production chunk: stop claiming after this many rows")
     run.add_argument("--max-runtime-minutes", type=float, default=None,
                      help="Stop claiming and drain workers after this many minutes")
-    run.add_argument("--start-index", type=int, default=ROW_START)
-    run.add_argument("--end-index", type=int, default=ROW_LIMIT - 1)
+    run.add_argument("--start-index", type=int, default=None,
+                     help="Optional in-slice processing bound (default: slice start)")
+    run.add_argument("--end-index", type=int, default=None,
+                     help="Optional in-slice processing bound (default: slice end)")
     run.add_argument("--worker-restarts", type=int, default=2,
                      help="In-run restarts per worker before its rows are released")
     run.add_argument("--worker-timeout", type=float, default=1800,
@@ -4017,8 +4054,8 @@ def build_parser() -> argparse.ArgumentParser:
     slurm.add_argument("--max-rows-this-run", type=int, default=None)
     slurm.add_argument("--max-runtime-minutes", type=float, default=None,
                        help="Default: wall time minus 30 minutes")
-    slurm.add_argument("--start-index", type=int, default=ROW_START)
-    slurm.add_argument("--end-index", type=int, default=ROW_LIMIT - 1)
+    slurm.add_argument("--start-index", type=int, default=None)
+    slurm.add_argument("--end-index", type=int, default=None)
     slurm.add_argument("--max-transient-attempts", type=int, default=3)
     slurm.add_argument("--retry-backoff-base-seconds", type=float, default=30.0)
     slurm.add_argument("--retry-backoff-cap-seconds", type=float, default=600.0)
