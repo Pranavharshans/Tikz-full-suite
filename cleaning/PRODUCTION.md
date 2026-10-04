@@ -44,7 +44,7 @@ summarized after the table.
 | Stage | Purpose | Writes | Slurm guard |
 | --- | --- | --- | --- |
 | `plan` | Print resolved configuration and provisional run identity | nothing | none |
-| `prepare` | Freeze exactly the first 100,000 source rows into a manifest | `manifest.jsonl`, `manifest.meta.json`, `images/` | yes (no GPU count) |
+| `prepare` | Freeze one exact source slice (at most 100,000 rows) into a manifest | `manifest.jsonl`, `manifest.meta.json`, `images/` | yes (no GPU count) |
 | `run` | Multi-replica inference controller | `run.json`, `ledger.sqlite3`, `runtime/`, `ledger-backups/` | yes, exactly as many visible RTX PRO 6000 GPUs as configured replicas |
 | `status` | Human-readable progress report (read-only) | nothing | none |
 | `validate` | Re-validate every accepted instruction | `WORK/validation-report.json` | none |
@@ -185,7 +185,7 @@ them).
 
 ```
 WORK/
-  manifest.jsonl                 frozen 100,000-row manifest (one JSON object per line)
+  manifest.jsonl                 frozen source-slice manifest (one JSON object per line)
   manifest.meta.json             freeze metadata + hash; authoritative marker
   images/000000.png ...          images for valid rows (index-named)
   run.json                       run identity + provenance (written by the first run)
@@ -473,13 +473,17 @@ pinned revisions and the frozen manifest; if you pass a revision that does not
 match the frozen manifest, `prepare`/`run` refuse with
 `does not match the frozen manifest`.
 
-### 5.2 Exact first 100,000 rows
+### 5.2 Exact, non-overlapping source slices
 
 The source is streamed (`datasets` streaming mode, `png_image` decoded as raw
-bytes) and `islice`d to exactly `ROW_LIMIT = 100_000` rows starting at
-`ROW_START = 0`. There is no sampling, no shuffling and no replacement:
+bytes) and `islice`d to exactly `--row-limit` rows starting at `--row-start`.
+Each production work directory may contain at most 100,000 source rows. There
+is no sampling, no shuffling and no replacement:
 
-- `source_row_index` runs contiguously `0..99_999`.
+- `source_row_index` remains the global source index and runs contiguously from
+  `row_start` through `row_start + row_limit - 1`.
+- `row_start` and `row_limit` are part of the run identity. Reusing a work
+  directory with different slice bounds is refused.
 - If the stream ends early, the freeze is a hard failure and no manifest is
   committed.
 - Invalid rows are recorded **in place** as `status: "rejected"` with a
@@ -490,6 +494,20 @@ bytes) and `islice`d to exactly `ROW_LIMIT = 100_000` rows starting at
 - `manifest.meta.json` records `rows_frozen`, `valid_rows`, `rejected_rows`,
   `rejection_counts`, `freeze_limits` and `image_validation`
   (`"pillow"` when Pillow was importable, else `"signature"`).
+
+The completed first slice (`0..99,999`) must remain in its existing work
+directory. Clean later rows in separate work directories, for example:
+
+| Work suffix | `--row-start` | `--row-limit` | Source indices |
+| --- | ---: | ---: | --- |
+| `slice-100k` | 100000 | 100000 | 100000..199999 |
+| `slice-200k` | 200000 | 100000 | 200000..299999 |
+| `slice-300k` | 300000 | 100000 | 300000..399999 |
+| final slice | 400000 | exact remaining count | 400000..last row |
+
+Do not guess the final count: obtain the pinned train-split row count first,
+then set `--row-limit` to `total_rows - 400000`. Re-submit the same generated
+script to resume a slice; never change its work directory or slice bounds.
 
 ### 5.3 Stable row id
 
@@ -1340,11 +1358,40 @@ sqlite3 -header -column /shared/$USER/tikz-production/ledger.sqlite3 \
 python3 cleaning/build_dataset.py checkpoint --work /shared/$USER/tikz-production
 ```
 
-### 15.1 How to verify success
+### 15.1 Generate the next 100,000-row slice
+
+This only writes an sbatch file; inspect and submit it yourself. It preserves
+the validated caption-v2 settings used for the completed first slice.
+
+```bash
+ROOT=/home/atuin/v123be/v123be62/tikz-caption-benchmark
+
+python3 cleaning/build_dataset.py slurm-script \
+  --work "$ROOT/production-v2-slice-100000-199999" \
+  --vllm-sif "$ROOT/containers/vllm.sif" \
+  --model-cache-dir "$ROOT/benchmark-data-nvfp4/hf" \
+  --prepare-python "$ROOT/preparation-env/bin/python" \
+  --export-python "$ROOT/preparation-env/bin/python" \
+  --partition rtxpro6k --gpu-type rtxpro6k \
+  --gpus 2 --replicas 2 --cpus-per-task 32 \
+  --wall-time 02:00:00 --max-runtime-minutes 90 \
+  --row-start 100000 --row-limit 100000 \
+  --prompt-version caption-v2 --concurrency 64 --mtp 1 \
+  --batch-token-budget 16384 --context 32768 \
+  --max-output-tokens 512 --truncation-retry-tokens 768 \
+  --max-instruction-words 300 --max-instruction-chars 4000 \
+  --job-name tikz-caption-v2-slice-100k \
+  --log-prefix slurm-tikz-caption-v2-slice-100k \
+  > tikz-caption-v2-slice-100k.sbatch
+
+bash -n tikz-caption-v2-slice-100k.sbatch
+```
+
+### 15.2 How to verify success
 
 - `run` exits `0` (the generated script then prints `All rows are terminal.`).
-- `status` shows `complete` + `rejected` = 100,000 and `pending=running=
-  retryable=0`.
+- `status` shows `complete` + `rejected` = the slice's `row_limit` and
+  `pending=running=retryable=0`.
 - `validate` prints `Validation passed: <N> accepted rows match the policy and
   identity` and exits `0`.
 - `audit` prints `Audit: pass (0 violations, ...)` and exits `0`.

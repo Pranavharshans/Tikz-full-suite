@@ -9,8 +9,9 @@ Slurm allocation, and records results under the selected work directory.
 ## Production dataset pipeline
 
 `build_dataset.py` is the production dataset builder for this stage, separate from the
-benchmark and reusing only its audited helpers. It freezes the first 100,000
-DaTikZ-V4 rows into an atomic manifest, captions them with
+benchmark and reusing only its audited helpers. It freezes an exact, identity-pinned
+source slice of up to 100,000 DaTikZ-V4 rows (including nonzero `--row-start`
+values) into an atomic manifest, captions them with
 `nvidia/Qwen3.8-27B-NVFP4` through a resumable controller/worker workflow backed by a
 single-writer SQLite ledger, and exports deterministic atomic Parquet shards. See
 [PRODUCTION.md](PRODUCTION.md) for the architecture, state machine, retry policy,
