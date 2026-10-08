@@ -25,6 +25,42 @@ python3 cleaning/build_dataset.py slurm-script \
   --wall-time 12:00:00 > production.sbatch
 ```
 
+### Verified full-dataset result (2026-10-07)
+
+The production pipeline has completed the entire pinned DaTikZ-V4 training split:
+
+- Source: `nllg/DaTikZ-V4` at revision
+  `33734c83608211682be11001a1618856fc1979dd`.
+- Source coverage: all **427,753 rows**, indices `0..427752`, split into five
+  non-overlapping resumable slices of at most 100,000 rows.
+- Caption model: `nvidia/Qwen3.8-27B-NVFP4` at revision
+  `482ca0f3832238542f8f5295dde86b5f22711d80`.
+- Prompt: `caption-v2`, hash `3cd9267b40dc9331`.
+- Accepted and exported: **422,400 rows** (**98.75%**).
+- Rejected: **5,353 rows** (**1.25%**).
+
+| Source indices | Accepted | Rejected | Audit |
+| --- | ---: | ---: | --- |
+| `0..99999` | 98,450 | 1,550 | pass |
+| `100000..199999` | 98,713 | 1,287 | pass |
+| `200000..299999` | 98,732 | 1,268 | pass |
+| `300000..399999` | 99,065 | 935 | pass |
+| `400000..427752` | 27,440 | 313 | pass |
+| **Total** | **422,400** | **5,353** | **pass** |
+
+Each slice finished with no pending, running, or retryable rows. Its deterministic
+Parquet export matched the terminal ledger and passed the production audit. The
+combined Hugging Face-ready export contains **422,400 rows in 425 Parquet shards**
+with `png_image` encoded as a Hugging Face `Image` feature
+(`struct<bytes: binary, path: string>`).
+
+A separate global audit verified consistent schemas, valid PNG signatures,
+non-empty instructions and TikZ programs, **422,400 unique stable IDs**, and
+**422,400 unique `source_row_index` values** spanning `0..427752`. The 5,353
+excluded indices exactly match the rejected-row total. This documents the
+locally verified export; publication to the Hugging Face Hub must be verified
+independently after upload.
+
 ## Fixed experiment
 
 - Official FP8 checkpoint only; no precision sweep or TP1 runs.
